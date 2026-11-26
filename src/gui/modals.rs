@@ -10170,47 +10170,45 @@ impl ZaloGuiApp {
         }
         self.feed_loading_timeline = true;
         let mut friend_uids = Vec::new();
-        let mut shared_media_by_uid: HashMap<String, Vec<crate::feed::FeedMedia>> = HashMap::new();
+        let mut seen_uids = HashSet::new();
+        let mut known_contacts: HashMap<String, crate::feed::FeedProfileFallback> = HashMap::new();
+
+        let my_uid = crate::feed::normalize_feed_uid(&self.user_uin);
+        if !my_uid.is_empty() {
+            known_contacts.insert(
+                my_uid.clone(),
+                crate::feed::FeedProfileFallback {
+                    uid: my_uid.clone(),
+                    display_name: self.user_name.trim().to_string(),
+                    avatar_url: self.user_avatar.clone().unwrap_or_default(),
+                },
+            );
+        }
+
         for t in &self.threads {
-            if !t.is_group && !t.name.contains("Cloud của tôi") {
-                friend_uids.push(t.id.clone());
-                let mut photos = Vec::new();
-                for m in t.messages.iter().rev() {
-                    let is_photo = m.link_src.as_deref() == Some("Hình ảnh Zalo")
-                        || m.text.trim() == "[Hình ảnh]"
-                        || m.text.trim().starts_with("[Hình ảnh] ");
-                    if !is_photo {
-                        continue;
-                    }
-                    if let Some(thumb) = m
-                        .link_thumb
-                        .as_deref()
-                        .or(m.link_url.as_deref())
-                        .filter(|u| !u.is_empty())
-                    {
-                        let full = m.link_url.as_deref().unwrap_or(thumb).to_string();
-                        photos.push(crate::feed::FeedMedia {
-                            photo_id: m.id.clone(),
-                            media_type: "image".to_string(),
-                            url: full,
-                            thumbnail: thumb.to_string(),
-                            width: 640,
-                            height: 480,
-                        });
-                        if photos.len() >= 6 {
-                            break;
-                        }
-                    }
-                }
-                if !photos.is_empty() {
-                    shared_media_by_uid.insert(t.id.clone(), photos);
-                }
+            if t.is_group || t.name.contains("Cloud của tôi") {
+                continue;
             }
+            let norm_uid = crate::feed::normalize_feed_uid(&t.id);
+            if norm_uid.is_empty() {
+                continue;
+            }
+            if seen_uids.insert(norm_uid.clone()) {
+                friend_uids.push(norm_uid.clone());
+            }
+            known_contacts.insert(
+                norm_uid.clone(),
+                crate::feed::FeedProfileFallback {
+                    uid: norm_uid,
+                    display_name: t.name.trim().to_string(),
+                    avatar_url: t.avatar.clone().unwrap_or_default(),
+                },
+            );
         }
         if let Some(tx) = WORKER_TX.get() {
             let _ = tx.send(WorkerCmd::FetchTimelineFeed {
                 friend_uids,
-                shared_media_by_uid,
+                known_contacts,
             });
         }
     }
@@ -10461,18 +10459,29 @@ impl ZaloGuiApp {
                     Pos2::new(hdr_rect.left() + 24.0, hdr_rect.top() + 10.0),
                     Pos2::new(hdr_rect.right() - 24.0, hdr_rect.bottom() - 10.0),
                 );
+                if !self.dev_mode && self.feed_modal_tab == FeedModalTab::ProtocolDebug {
+                    self.feed_modal_tab = FeedModalTab::Profile;
+                }
                 ui.allocate_new_ui(egui::UiBuilder::new().max_rect(tab_inner), |ui| {
                     ui.horizontal_centered(|ui| {
                         ui.spacing_mut().item_spacing.x = 8.0;
-                        for (tab, icon, title) in [
+                        let mut tabs = vec![
                             (FeedModalTab::Profile, lucide::GLOBE, "Nhật Ký"),
-                            (FeedModalTab::Avatars, lucide::IMAGE, "Kho Ảnh Cá Nhân"),
                             (
-                                FeedModalTab::Packet50001,
-                                lucide::FILE_TEXT,
-                                "Giao thức Feed (Cmd 50001)",
+                                FeedModalTab::SharedChatMedia,
+                                lucide::IMAGE,
+                                "Ảnh chia sẻ trong chat",
                             ),
-                        ] {
+                            (FeedModalTab::Avatars, lucide::USER, "Kho Ảnh Cá Nhân"),
+                        ];
+                        if self.dev_mode {
+                            tabs.push((
+                                FeedModalTab::ProtocolDebug,
+                                lucide::FILE_TEXT,
+                                "Giao thức Feed (Cmd 1230)",
+                            ));
+                        }
+                        for (tab, icon, title) in tabs {
                             let active = self.feed_modal_tab == tab;
                             let btn = egui::Button::new(
                                 RichText::new(format!("{icon}  {title}"))
@@ -10491,7 +10500,7 @@ impl ZaloGuiApp {
                                 Stroke::new(1.0_f32, pal.border)
                             })
                             .rounding(Rounding::same(8.0))
-                            .min_size(Vec2::new(145.0, 34.0));
+                            .min_size(Vec2::new(136.0, 34.0));
                             if ui
                                 .add(btn)
                                 .on_hover_cursor(CursorIcon::PointingHand)
@@ -10535,10 +10544,15 @@ impl ZaloGuiApp {
                                     FeedModalTab::Profile => {
                                         self.render_feed_timeline_column(ui, pal, feed_col_w);
                                     }
+                                    FeedModalTab::SharedChatMedia => {
+                                        self.render_feed_shared_chat_media_column(
+                                            ui, pal, feed_col_w,
+                                        );
+                                    }
                                     FeedModalTab::Avatars => {
                                         self.render_feed_avatars_column(ui, pal, feed_col_w);
                                     }
-                                    FeedModalTab::Packet50001 => {
+                                    FeedModalTab::ProtocolDebug => {
                                         self.render_feed_packet_column(ui, pal, feed_col_w);
                                     }
                                 }
@@ -10559,14 +10573,19 @@ impl ZaloGuiApp {
                 .inner_margin(Margin::same(18.0))
                 .show(ui, |ui| {
                     ui.set_width(col_w - 36.0);
-                    if !prof.cover_url.is_empty() && !prof.cover_url.ends_with("/default") {
+                    if crate::feed::is_usable_social_image_url(&prof.cover_url) {
                         let ckey = format!("cov_{}", crate::crypto::md5_hex(&prof.cover_url));
                         self.request_sticker_image(ckey.clone(), prof.cover_url.clone());
                         if let Some(tex) = self.sticker_textures.get(&ckey) {
                             crate::gui::mark_texture_used(&ckey);
+                            let [tw, th] = tex.size();
                             let w = ui.available_width();
+                            let uv = feed_cover_uv(tw as f32, th as f32, w, 180.0);
                             let resp = ui.add(
-                                egui::Image::new((tex.id(), Vec2::new(w, 180.0)))
+                                egui::Image::new(tex)
+                                    .uv(uv)
+                                    .fit_to_exact_size(Vec2::new(w, 180.0))
+                                    .maintain_aspect_ratio(false)
                                     .rounding(Rounding::same(10.0))
                                     .sense(Sense::click()),
                             );
@@ -10654,6 +10673,11 @@ impl ZaloGuiApp {
         }
 
         // 2. Info Banner: Nguồn dữ liệu Nhật ký đồng bộ
+        let real_post_count = self
+            .feed_items
+            .iter()
+            .filter(|it| !it.is_profile_activity)
+            .count();
         egui::Frame::none()
             .fill(pal.bg_elevated)
             .stroke(Stroke::new(1.0_f32, pal.border))
@@ -10664,7 +10688,7 @@ impl ZaloGuiApp {
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new(format!(
-                            "{}  Dòng thời gian Nhật ký ({} bài đăng)",
+                            "{}  Dòng thời gian Nhật ký ({} mục)",
                             lucide::GLOBE,
                             self.feed_items.len()
                         ))
@@ -10674,32 +10698,34 @@ impl ZaloGuiApp {
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let btn = egui::Button::new(
-                            RichText::new(format!("{}  Kho ảnh cá nhân", lucide::IMAGE))
+                            RichText::new(format!("{}  Ảnh chia sẻ trong chat", lucide::IMAGE))
                                 .size(12.0)
                                 .color(pal.text_primary),
                         )
                         .fill(pal.bg_input)
                         .stroke(Stroke::new(1.0_f32, pal.border))
                         .rounding(Rounding::same(8.0))
-                        .min_size(Vec2::new(130.0, 28.0));
+                        .min_size(Vec2::new(150.0, 28.0));
                         if ui
                             .add(btn)
                             .on_hover_cursor(CursorIcon::PointingHand)
                             .clicked()
                         {
-                            self.feed_modal_tab = FeedModalTab::Avatars;
-                            if self.feed_avatars.is_empty() && !self.feed_loading_avatars {
-                                self.feed_loading_avatars = true;
-                                if let Some(tx) = WORKER_TX.get() {
-                                    let _ = tx.send(WorkerCmd::FetchMySocialAvatars {
-                                        page: 1,
-                                        count: 20,
-                                    });
-                                }
-                            }
+                            self.feed_modal_tab = FeedModalTab::SharedChatMedia;
                         }
                     });
                 });
+                if real_post_count == 0 && !self.feed_loading_timeline {
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "{}  Phiên Zalo Web/Desktop (zpw_type=30) chỉ trả về cập nhật ảnh đại diện, ảnh bìa & tiểu sử bạn bè; bài đăng tường đầy đủ cần nguồn Timeline di động/SQLite.",
+                            lucide::INFO
+                        ))
+                        .size(11.6)
+                        .color(pal.text_muted),
+                    );
+                }
             });
 
         ui.add_space(14.0);
@@ -10716,37 +10742,23 @@ impl ZaloGuiApp {
         let q_low = self.feed_search_query.trim().to_lowercase();
         let q_fold = fold_vn_search(&q_low);
         let target_filter = self.feed_target_uid.clone();
-        let mut clicked_image: Option<(String, String, String, String)> = None;
+        let mut clicked_viewer: Option<ImageViewerModal> = None;
+        let mut clicked_external_url: Option<String> = None;
         let mut select_uid: Option<String> = None;
 
         let items_len = self.feed_items.len();
         let mut rendered_count = 0;
         for idx in 0..items_len {
             let item = self.feed_items[idx].clone();
-            if !target_filter.is_empty() && item.author.uid != target_filter {
-                let matches_name = self
-                    .feed_profile
-                    .as_ref()
-                    .map(|p| {
-                        p.display_name
-                            .trim()
-                            .eq_ignore_ascii_case(item.author.display_name.trim())
-                            || p.zalo_name
-                                .trim()
-                                .eq_ignore_ascii_case(item.author.display_name.trim())
-                            || item
-                                .author
-                                .display_name
-                                .trim()
-                                .eq_ignore_ascii_case(p.display_name.trim())
-                    })
-                    .unwrap_or(false);
-                if !matches_name {
-                    continue;
-                }
+            if !crate::feed::filter_feed_item_for_target(&item, &target_filter) {
+                continue;
             }
             if !matches_vn_query(&item.author.display_name, &q_low, &q_fold)
                 && !matches_vn_query(&item.content, &q_low, &q_fold)
+                && !item
+                    .link_preview
+                    .as_ref()
+                    .is_some_and(|lp| matches_vn_query(&lp.title, &q_low, &q_fold))
             {
                 continue;
             }
@@ -10774,12 +10786,14 @@ impl ZaloGuiApp {
                             &self.sticker_textures,
                             &mut self.loading_stickers,
                         );
-                        if av_resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                        if av_resp.on_hover_cursor(CursorIcon::PointingHand).clicked()
+                            && !item.author.uid.is_empty()
+                        {
                             select_uid = Some(item.author.uid.clone());
                         }
                         ui.add_space(4.0);
                         ui.vertical(|ui| {
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 let name_resp = ui.add(
                                     egui::Label::new(
                                         RichText::new(&item.author.display_name)
@@ -10792,109 +10806,431 @@ impl ZaloGuiApp {
                                 if name_resp
                                     .on_hover_cursor(CursorIcon::PointingHand)
                                     .clicked()
+                                    && !item.author.uid.is_empty()
                                 {
                                     select_uid = Some(item.author.uid.clone());
                                 }
-                                if let Some(badge) = &item.status_badge {
+                                let badge_text = item
+                                    .status_badge
+                                    .as_deref()
+                                    .or_else(|| item.post_kind.badge_label());
+                                if let Some(badge) = badge_text {
                                     ui.label(
                                         RichText::new(format!("· {badge}"))
                                             .size(11.8)
                                             .color(pal.text_muted),
                                     );
                                 }
+                                if let Some(loc) = &item.location {
+                                    ui.label(
+                                        RichText::new(format!("· tại {loc}"))
+                                            .size(11.8)
+                                            .color(pal.text_muted),
+                                    );
+                                }
                             });
-                            ui.label(
-                                RichText::new(&item.date_str)
-                                    .size(11.8)
-                                    .color(pal.text_muted),
-                            );
+                            if !item.date_str.is_empty() {
+                                ui.label(
+                                    RichText::new(&item.date_str)
+                                        .size(11.8)
+                                        .color(pal.text_muted),
+                                );
+                            }
                         });
                     });
 
                     if !item.content.trim().is_empty() {
                         ui.add_space(12.0);
                         ui.with_layout(Layout::top_down(Align::LEFT), |ui| {
-                            ui.label(
-                                RichText::new(&item.content)
-                                    .size(14.2)
-                                    .color(pal.text_primary),
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&item.content)
+                                        .size(14.2)
+                                        .color(pal.text_primary),
+                                )
+                                .wrap(),
                             );
                         });
                     }
 
-                    // Media Collage Grid
+                    // Media Collage Grid (aspect-preserving contain for 1, center-crop for multi)
                     if !item.media_list.is_empty() {
                         ui.add_space(12.0);
                         let media_cnt = item.media_list.len();
                         let avail_w = ui.available_width();
                         if media_cnt == 1 {
                             let m = &item.media_list[0];
-                            let mkey = format!("fmed_{}", crate::crypto::md5_hex(&m.thumbnail));
-                            self.request_sticker_image(mkey.clone(), m.thumbnail.clone());
-                            let img_h = if m.width > 0 && m.height > 0 && avail_w.is_finite() {
-                                (avail_w * (m.height as f32 / m.width as f32)).clamp(200.0, 420.0)
+                            let fetch_url = if m.thumbnail.trim().is_empty() {
+                                &m.url
                             } else {
-                                280.0
+                                &m.thumbnail
                             };
-                            let (r, resp) =
-                                ui.allocate_exact_size(Vec2::new(avail_w, img_h), Sense::click());
-                            if let Some(tex) = self.sticker_textures.get(&mkey) {
+                            let mkey = format!("fmed_{}", crate::crypto::md5_hex(fetch_url));
+                            if crate::feed::is_usable_social_image_url(fetch_url) {
+                                self.request_sticker_image(mkey.clone(), fetch_url.clone());
+                            }
+                            let tex_opt = self.sticker_textures.get(&mkey).cloned();
+                            let (nat_w, nat_h) = if let Some(ref tex) = tex_opt {
                                 crate::gui::mark_texture_used(&mkey);
-                                ui.painter().image(
-                                    tex.id(),
-                                    r,
-                                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                                    Color32::WHITE,
-                                );
+                                let [tw, th] = tex.size();
+                                (tw as f32, th as f32)
                             } else {
-                                ui.painter()
-                                    .rect_filled(r, Rounding::same(10.0), pal.bg_input);
-                            }
-                            if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
-                                clicked_image = Some((
-                                    mkey,
-                                    m.url.clone(),
-                                    item.content.clone(),
-                                    item.author.display_name.clone(),
-                                ));
-                            }
-                        } else {
-                            let cell_w = ((avail_w - 12.0) / 3.0).max(96.0);
-                            ui.horizontal_wrapped(|ui| {
-                                ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
-                                for m in item.media_list.iter().take(6) {
-                                    let mkey =
-                                        format!("fmed_{}", crate::crypto::md5_hex(&m.thumbnail));
-                                    self.request_sticker_image(mkey.clone(), m.thumbnail.clone());
-                                    let (r, resp) = ui.allocate_exact_size(
-                                        Vec2::new(cell_w, cell_w),
-                                        Sense::click(),
+                                (m.width as f32, m.height as f32)
+                            };
+                            let layout =
+                                compute_feed_single_image_layout(nat_w, nat_h, avail_w, 440.0);
+                            let mut resp_opt: Option<(Rect, egui::Response)> = None;
+                            ui.horizontal(|ui| {
+                                let pad = ((avail_w - layout.size.x) * 0.5).max(0.0);
+                                if pad > 0.0 {
+                                    ui.add_space(pad);
+                                }
+                                if let Some(ref tex) = tex_opt {
+                                    let resp = ui.add(
+                                        egui::Image::new(tex)
+                                            .uv(layout.uv)
+                                            .fit_to_exact_size(layout.size)
+                                            .maintain_aspect_ratio(false)
+                                            .rounding(Rounding::same(10.0))
+                                            .sense(Sense::click()),
                                     );
-                                    if let Some(tex) = self.sticker_textures.get(&mkey) {
-                                        crate::gui::mark_texture_used(&mkey);
-                                        ui.painter().image(
-                                            tex.id(),
-                                            r,
-                                            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                    resp_opt = Some((resp.rect, resp));
+                                } else {
+                                    let (r, resp) =
+                                        ui.allocate_exact_size(layout.size, Sense::click());
+                                    ui.painter().rect_filled(
+                                        r,
+                                        Rounding::same(10.0),
+                                        pal.bg_input,
+                                    );
+                                    draw_icon_image(
+                                        ui.painter(),
+                                        r.center(),
+                                        26.0,
+                                        pal.text_muted,
+                                    );
+                                    resp_opt = Some((r, resp));
+                                }
+                            });
+
+                            if let Some((r, resp)) = resp_opt {
+                                if m.media_type == "video" {
+                                    let play_c = r.center();
+                                    ui.painter().circle_filled(
+                                        play_c,
+                                        24.0,
+                                        Color32::from_rgba_unmultiplied(15, 23, 42, 185),
+                                    );
+                                    ui.painter().add(egui::Shape::convex_polygon(
+                                        vec![
+                                            Pos2::new(play_c.x - 6.0, play_c.y - 10.0),
+                                            Pos2::new(play_c.x - 6.0, play_c.y + 10.0),
+                                            Pos2::new(play_c.x + 11.0, play_c.y),
+                                        ],
+                                        Color32::WHITE,
+                                        Stroke::NONE,
+                                    ));
+                                    if let Some(secs) = m.duration_secs {
+                                        let dur_label = format_feed_duration(secs);
+                                        let badge_r = Rect::from_min_size(
+                                            Pos2::new(r.right() - 56.0, r.bottom() - 28.0),
+                                            Vec2::new(48.0, 20.0),
+                                        );
+                                        ui.painter().rect_filled(
+                                            badge_r,
+                                            Rounding::same(6.0),
+                                            Color32::from_rgba_unmultiplied(15, 23, 42, 200),
+                                        );
+                                        ui.painter().text(
+                                            badge_r.center(),
+                                            egui::Align2::CENTER_CENTER,
+                                            dur_label,
+                                            FontId::proportional(11.0),
                                             Color32::WHITE,
                                         );
+                                    }
+                                }
+                                if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                                    if m.media_type == "video" {
+                                        if !m.url.is_empty() {
+                                            clicked_external_url = Some(m.url.clone());
+                                        }
                                     } else {
+                                        let hd = self.request_hd_texture(&m.url);
+                                        clicked_viewer = Some(ImageViewerModal {
+                                            tex_key: mkey,
+                                            hd_tex_key: hd,
+                                            full_url: m.url.clone(),
+                                            title: item.content.clone(),
+                                            sender: item.author.display_name.clone(),
+                                            time: item.date_str.clone(),
+                                            zoom: 1.0,
+                                            pan: Vec2::ZERO,
+                                            gallery: Vec::new(),
+                                            gallery_index: 0,
+                                        });
+                                    }
+                                }
+                            }
+                        } else {
+                            let cols = if media_cnt == 2 || media_cnt == 4 {
+                                2usize
+                            } else {
+                                3usize
+                            };
+                            let cell_w =
+                                ((avail_w - 6.0 * (cols as f32 - 1.0)) / cols as f32).max(96.0);
+                            let mut gallery = Vec::with_capacity(media_cnt);
+                            for gm in &item.media_list {
+                                let gthumb = if gm.thumbnail.trim().is_empty() {
+                                    gm.url.clone()
+                                } else {
+                                    gm.thumbnail.clone()
+                                };
+                                gallery.push(GalleryPhoto {
+                                    tex_key: format!("fmed_{}", crate::crypto::md5_hex(&gthumb)),
+                                    thumb_url: gthumb,
+                                    full_url: gm.url.clone(),
+                                    title: item.content.clone(),
+                                    sender: item.author.display_name.clone(),
+                                    time: item.date_str.clone(),
+                                });
+                            }
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                                let shown_cnt = media_cnt.min(6);
+                                for (m_idx, m) in item.media_list.iter().take(6).enumerate() {
+                                    let fetch_url = if m.thumbnail.trim().is_empty() {
+                                        &m.url
+                                    } else {
+                                        &m.thumbnail
+                                    };
+                                    let mkey =
+                                        format!("fmed_{}", crate::crypto::md5_hex(fetch_url));
+                                    if crate::feed::is_usable_social_image_url(fetch_url) {
+                                        self.request_sticker_image(
+                                            mkey.clone(),
+                                            fetch_url.clone(),
+                                        );
+                                    }
+                                    let (r, resp) = if let Some(tex) =
+                                        self.sticker_textures.get(&mkey)
+                                    {
+                                        crate::gui::mark_texture_used(&mkey);
+                                        let [tw, th] = tex.size();
+                                        let uv = feed_cover_uv(
+                                            tw as f32,
+                                            th as f32,
+                                            cell_w,
+                                            cell_w,
+                                        );
+                                        let resp = ui.add(
+                                            egui::Image::new(tex)
+                                                .uv(uv)
+                                                .fit_to_exact_size(Vec2::splat(cell_w))
+                                                .maintain_aspect_ratio(false)
+                                                .rounding(Rounding::same(8.0))
+                                                .sense(Sense::click()),
+                                        );
+                                        (resp.rect, resp)
+                                    } else {
+                                        let (r, resp) = ui.allocate_exact_size(
+                                            Vec2::splat(cell_w),
+                                            Sense::click(),
+                                        );
                                         ui.painter().rect_filled(
                                             r,
                                             Rounding::same(8.0),
                                             pal.bg_input,
                                         );
+                                        draw_icon_image(
+                                            ui.painter(),
+                                            r.center(),
+                                            20.0,
+                                            pal.text_muted,
+                                        );
+                                        (r, resp)
+                                    };
+                                    if m_idx + 1 == shown_cnt && media_cnt > 6 {
+                                        ui.painter().rect_filled(
+                                            r,
+                                            Rounding::same(8.0),
+                                            Color32::from_rgba_unmultiplied(15, 23, 42, 165),
+                                        );
+                                        ui.painter().text(
+                                            r.center(),
+                                            egui::Align2::CENTER_CENTER,
+                                            format!("+{}", media_cnt - 6),
+                                            FontId::proportional(20.0),
+                                            Color32::WHITE,
+                                        );
                                     }
                                     if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
-                                        clicked_image = Some((
-                                            mkey,
-                                            m.url.clone(),
-                                            item.content.clone(),
-                                            item.author.display_name.clone(),
-                                        ));
+                                        if m.media_type == "video" && !m.url.is_empty() {
+                                            clicked_external_url = Some(m.url.clone());
+                                        } else {
+                                            let hd = self.request_hd_texture(&m.url);
+                                            clicked_viewer = Some(ImageViewerModal {
+                                                tex_key: mkey,
+                                                hd_tex_key: hd,
+                                                full_url: m.url.clone(),
+                                                title: item.content.clone(),
+                                                sender: item.author.display_name.clone(),
+                                                time: item.date_str.clone(),
+                                                zoom: 1.0,
+                                                pan: Vec2::ZERO,
+                                                gallery: gallery.clone(),
+                                                gallery_index: m_idx,
+                                            });
+                                        }
                                     }
                                 }
                             });
+                        }
+                    }
+
+                    // Link Preview Card
+                    if let Some(lp) = &item.link_preview {
+                        ui.add_space(10.0);
+                        let link_frame = egui::Frame::none()
+                            .fill(pal.bg_input)
+                            .stroke(Stroke::new(1.0_f32, pal.border))
+                            .rounding(Rounding::same(10.0))
+                            .inner_margin(Margin::same(10.0))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.horizontal(|ui| {
+                                    if crate::feed::is_usable_social_image_url(&lp.thumbnail) {
+                                        let lkey = format!(
+                                            "flnk_{}",
+                                            crate::crypto::md5_hex(&lp.thumbnail)
+                                        );
+                                        self.request_sticker_image(
+                                            lkey.clone(),
+                                            lp.thumbnail.clone(),
+                                        );
+                                        if let Some(tex) = self.sticker_textures.get(&lkey) {
+                                            crate::gui::mark_texture_used(&lkey);
+                                            let [tw, th] = tex.size();
+                                            let uv = feed_cover_uv(
+                                                tw as f32,
+                                                th as f32,
+                                                84.0,
+                                                84.0,
+                                            );
+                                            ui.add(
+                                                egui::Image::new(tex)
+                                                    .uv(uv)
+                                                    .fit_to_exact_size(Vec2::splat(84.0))
+                                                    .maintain_aspect_ratio(false)
+                                                    .rounding(Rounding::same(8.0)),
+                                            );
+                                        } else {
+                                            let (r, _) = ui.allocate_exact_size(
+                                                Vec2::splat(84.0),
+                                                Sense::hover(),
+                                            );
+                                            ui.painter().rect_filled(
+                                                r,
+                                                Rounding::same(8.0),
+                                                pal.bg_elevated,
+                                            );
+                                        }
+                                        ui.add_space(8.0);
+                                    }
+                                    ui.vertical(|ui| {
+                                        if !lp.domain.is_empty() {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "{}  {}",
+                                                    lucide::LINK,
+                                                    lp.domain
+                                                ))
+                                                .size(11.3)
+                                                .color(pal.primary_hover),
+                                            );
+                                        }
+                                        if !lp.title.is_empty() {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(&lp.title)
+                                                        .size(13.2)
+                                                        .color(pal.text_primary)
+                                                        .strong(),
+                                                )
+                                                .wrap(),
+                                            );
+                                        }
+                                        if !lp.description.is_empty() {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(&lp.description)
+                                                        .size(12.0)
+                                                        .color(pal.text_secondary),
+                                                )
+                                                .wrap(),
+                                            );
+                                        }
+                                    });
+                                });
+                            });
+                        if !lp.url.is_empty()
+                            && link_frame
+                                .response
+                                .interact(Sense::click())
+                                .on_hover_cursor(CursorIcon::PointingHand)
+                                .clicked()
+                        {
+                            clicked_external_url = Some(lp.url.clone());
+                        }
+                    }
+
+                    // Shared / Reposted Post Card
+                    if let Some(sp) = &item.shared_post {
+                        ui.add_space(10.0);
+                        let sp_resp = egui::Frame::none()
+                            .fill(pal.bg_input)
+                            .stroke(Stroke::new(1.0_f32, pal.border))
+                            .rounding(Rounding::same(10.0))
+                            .inner_margin(Margin::symmetric(12.0, 10.0))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{}  {}",
+                                        lucide::SHARE_2,
+                                        sp.author_name
+                                    ))
+                                    .size(12.5)
+                                    .color(pal.primary_hover)
+                                    .strong(),
+                                );
+                                if !sp.content.trim().is_empty() {
+                                    ui.add_space(4.0);
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&sp.content)
+                                                .size(13.0)
+                                                .color(pal.text_secondary),
+                                        )
+                                        .wrap(),
+                                    );
+                                }
+                            });
+                        let bar_r = Rect::from_min_size(
+                            sp_resp.response.rect.left_top(),
+                            Vec2::new(3.5, sp_resp.response.rect.height()),
+                        );
+                        ui.painter()
+                            .rect_filled(bar_r, Rounding::same(2.0), pal.primary);
+                        if !sp.link_url.is_empty()
+                            && sp_resp
+                                .response
+                                .interact(Sense::click())
+                                .on_hover_cursor(CursorIcon::PointingHand)
+                                .clicked()
+                        {
+                            clicked_external_url = Some(sp.link_url.clone());
                         }
                     }
 
@@ -10955,6 +11291,40 @@ impl ZaloGuiApp {
                                 });
                             });
                     });
+
+                    if !item.comments.is_empty() {
+                        ui.add_space(8.0);
+                        egui::Frame::none()
+                            .fill(pal.bg_input)
+                            .rounding(Rounding::same(8.0))
+                            .inner_margin(Margin::symmetric(10.0, 8.0))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                for c in item.comments.iter().take(3) {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 6.0;
+                                        ui.label(
+                                            RichText::new(&c.author_name)
+                                                .size(12.2)
+                                                .color(pal.text_primary)
+                                                .strong(),
+                                        );
+                                        ui.label(
+                                            RichText::new(&c.content)
+                                                .size(12.2)
+                                                .color(pal.text_secondary),
+                                        );
+                                        if !c.timestamp_str.is_empty() {
+                                            ui.label(
+                                                RichText::new(format!("· {}", c.timestamp_str))
+                                                    .size(11.0)
+                                                    .color(pal.text_muted),
+                                            );
+                                        }
+                                    });
+                                }
+                            });
+                    }
                 });
 
             ui.add_space(14.0);
@@ -11001,30 +11371,214 @@ impl ZaloGuiApp {
         }
 
         if let Some(uid) = select_uid {
-            self.feed_target_uid = uid.clone();
+            let norm = crate::feed::normalize_feed_uid(&uid);
+            self.feed_target_uid = norm.clone();
             if let Some(p) = self
                 .feed_friend_profiles
                 .iter()
-                .find(|p| p.uid == uid)
+                .find(|p| crate::feed::normalize_feed_uid(&p.uid) == norm)
                 .cloned()
             {
                 self.feed_profile = Some(p);
             }
         }
-        if let Some((tkey, full_u, title, sender)) = clicked_image {
-            let hd = self.request_hd_texture(&full_u);
-            self.image_viewer = Some(ImageViewerModal {
-                tex_key: tkey,
-                hd_tex_key: hd,
-                full_url: full_u,
-                title,
-                sender,
-                time: String::new(),
-                zoom: 1.0,
-                pan: Vec2::ZERO,
-                gallery: Vec::new(),
-                gallery_index: 0,
+        if let Some(viewer) = clicked_viewer {
+            self.image_viewer = Some(viewer);
+        }
+        if let Some(ext_url) = clicked_external_url {
+            if let Err(e) = open_external_url(&ext_url) {
+                self.show_toast(format!("Không mở được liên kết: {e}"));
+            }
+        }
+    }
+
+    fn render_feed_shared_chat_media_column(
+        &mut self,
+        ui: &mut egui::Ui,
+        pal: &ThemePalette,
+        col_w: f32,
+    ) {
+        let q_low = self.feed_search_query.trim().to_lowercase();
+        let q_fold = fold_vn_search(&q_low);
+        let cards = collect_shared_chat_media(
+            &self.threads,
+            &self.user_uin,
+            &self.user_name,
+            self.user_avatar.as_deref(),
+            &self.feed_friend_profiles,
+            &self.feed_target_uid,
+            &q_low,
+            &q_fold,
+        );
+
+        egui::Frame::none()
+            .fill(pal.bg_elevated)
+            .stroke(Stroke::new(1.0_f32, pal.border))
+            .rounding(Rounding::same(12.0))
+            .inner_margin(Margin::symmetric(16.0, 12.0))
+            .show(ui, |ui| {
+                ui.set_width(col_w - 32.0);
+                ui.label(
+                    RichText::new(format!(
+                        "{}  Ảnh chia sẻ trong chat 1-1 ({} ảnh)",
+                        lucide::IMAGE,
+                        cards.len()
+                    ))
+                    .size(13.2)
+                    .color(pal.text_primary)
+                    .strong(),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "Tách riêng khỏi Nhật ký công khai — hiển thị đúng người gửi (Bạn hoặc bạn bè) theo từng tin nhắn.",
+                    )
+                    .size(11.6)
+                    .color(pal.text_muted),
+                );
             });
+        ui.add_space(14.0);
+
+        if cards.is_empty() {
+            egui::Frame::none()
+                .fill(pal.bg_elevated)
+                .stroke(Stroke::new(1.0_f32, pal.border))
+                .rounding(Rounding::same(14.0))
+                .inner_margin(Margin::symmetric(24.0, 28.0))
+                .show(ui, |ui| {
+                    ui.set_width(col_w - 48.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            RichText::new("Chưa có ảnh chia sẻ nào khớp bộ lọc hiện tại")
+                                .size(14.0)
+                                .color(pal.text_secondary),
+                        );
+                    });
+                });
+            return;
+        }
+
+        let mut clicked_viewer: Option<ImageViewerModal> = None;
+        for card in &cards {
+            let time_str = crate::feed::format_vn_timestamp_ms(card.ts);
+            egui::Frame::none()
+                .fill(pal.bg_elevated)
+                .stroke(Stroke::new(1.0_f32, pal.border))
+                .rounding(Rounding::same(14.0))
+                .inner_margin(Margin::same(16.0))
+                .show(ui, |ui| {
+                    ui.set_width(col_w - 32.0);
+                    ui.horizontal(|ui| {
+                        let (av_r, _) = ui.allocate_exact_size(Vec2::splat(38.0), Sense::hover());
+                        paint_user_avatar(
+                            ui.painter(),
+                            av_r.center(),
+                            19.0,
+                            &card.sender_name,
+                            false,
+                            Some(&card.sender_avatar),
+                            &self.sticker_textures,
+                            &mut self.loading_stickers,
+                        );
+                        ui.add_space(6.0);
+                        ui.vertical(|ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(
+                                    RichText::new(&card.sender_name)
+                                        .size(14.0)
+                                        .color(pal.primary_hover)
+                                        .strong(),
+                                );
+                                ui.label(
+                                    RichText::new(format!("· {}", card.context_label))
+                                        .size(11.8)
+                                        .color(pal.text_muted),
+                                );
+                            });
+                            if !time_str.is_empty() {
+                                ui.label(
+                                    RichText::new(&time_str)
+                                        .size(11.5)
+                                        .color(pal.text_muted),
+                                );
+                            }
+                        });
+                    });
+
+                    if !card.caption.is_empty() {
+                        ui.add_space(8.0);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&card.caption)
+                                    .size(13.5)
+                                    .color(pal.text_primary),
+                            )
+                            .wrap(),
+                        );
+                    }
+
+                    ui.add_space(10.0);
+                    let avail_w = ui.available_width();
+                    let mkey = format!("fchat_{}", crate::crypto::md5_hex(&card.thumb_url));
+                    self.request_sticker_image(mkey.clone(), card.thumb_url.clone());
+                    let tex_opt = self.sticker_textures.get(&mkey).cloned();
+                    let (nat_w, nat_h) = if let Some(ref tex) = tex_opt {
+                        crate::gui::mark_texture_used(&mkey);
+                        let [tw, th] = tex.size();
+                        (tw as f32, th as f32)
+                    } else {
+                        (card.width as f32, card.height as f32)
+                    };
+                    let layout = compute_feed_single_image_layout(nat_w, nat_h, avail_w, 420.0);
+                    let mut clicked = false;
+                    ui.horizontal(|ui| {
+                        let pad = ((avail_w - layout.size.x) * 0.5).max(0.0);
+                        if pad > 0.0 {
+                            ui.add_space(pad);
+                        }
+                        if let Some(ref tex) = tex_opt {
+                            let resp = ui.add(
+                                egui::Image::new(tex)
+                                    .uv(layout.uv)
+                                    .fit_to_exact_size(layout.size)
+                                    .maintain_aspect_ratio(false)
+                                    .rounding(Rounding::same(10.0))
+                                    .sense(Sense::click()),
+                            );
+                            clicked = resp.on_hover_cursor(CursorIcon::PointingHand).clicked();
+                        } else {
+                            let (r, resp) = ui.allocate_exact_size(layout.size, Sense::click());
+                            ui.painter()
+                                .rect_filled(r, Rounding::same(10.0), pal.bg_input);
+                            draw_icon_image(ui.painter(), r.center(), 24.0, pal.text_muted);
+                            clicked = resp.on_hover_cursor(CursorIcon::PointingHand).clicked();
+                        }
+                    });
+                    if clicked {
+                        let hd = self.request_hd_texture(&card.full_url);
+                        clicked_viewer = Some(ImageViewerModal {
+                            tex_key: mkey,
+                            hd_tex_key: hd,
+                            full_url: card.full_url.clone(),
+                            title: if card.caption.is_empty() {
+                                card.context_label.clone()
+                            } else {
+                                card.caption.clone()
+                            },
+                            sender: card.sender_name.clone(),
+                            time: time_str,
+                            zoom: 1.0,
+                            pan: Vec2::ZERO,
+                            gallery: Vec::new(),
+                            gallery_index: 0,
+                        });
+                    }
+                });
+            ui.add_space(12.0);
+        }
+
+        if let Some(viewer) = clicked_viewer {
+            self.image_viewer = Some(viewer);
         }
     }
 
@@ -11065,19 +11619,25 @@ impl ZaloGuiApp {
                     for item in &avatars_snap {
                         let tkey = format!("fava_{}", crate::crypto::md5_hex(&item.thumbnail));
                         self.request_sticker_image(tkey.clone(), item.thumbnail.clone());
-                        let (r, resp) = ui.allocate_exact_size(Vec2::splat(130.0), Sense::click());
-                        if let Some(tex) = self.sticker_textures.get(&tkey) {
+                        let resp = if let Some(tex) = self.sticker_textures.get(&tkey) {
                             crate::gui::mark_texture_used(&tkey);
-                            ui.painter().image(
-                                tex.id(),
-                                r,
-                                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                                Color32::WHITE,
-                            );
+                            let [tw, th] = tex.size();
+                            let uv = feed_cover_uv(tw as f32, th as f32, 130.0, 130.0);
+                            ui.add(
+                                egui::Image::new(tex)
+                                    .uv(uv)
+                                    .fit_to_exact_size(Vec2::splat(130.0))
+                                    .maintain_aspect_ratio(false)
+                                    .rounding(Rounding::same(8.0))
+                                    .sense(Sense::click()),
+                            )
                         } else {
+                            let (r, resp) =
+                                ui.allocate_exact_size(Vec2::splat(130.0), Sense::click());
                             ui.painter()
                                 .rect_filled(r, Rounding::same(8.0), pal.bg_input);
-                        }
+                            resp
+                        };
                         if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                             let hd = self.request_hd_texture(&item.url);
                             self.image_viewer = Some(ImageViewerModal {
@@ -11106,6 +11666,20 @@ impl ZaloGuiApp {
             .inner_margin(Margin::same(16.0))
             .show(ui, |ui| {
                 ui.set_width(col_w - 32.0);
+                ui.label(
+                    RichText::new("Giao thức Feed — CMD_FEED_TIMELINE = 1230 (subcmd 6)")
+                        .size(14.0)
+                        .color(pal.text_primary)
+                        .strong(),
+                );
+                ui.label(
+                    RichText::new(
+                        "Lưu ý dev: 50001 là mã lỗi client ERR_FEED_NO_NETWORK (mất mạng), không phải lệnh Feed.",
+                    )
+                    .size(11.6)
+                    .color(pal.text_muted),
+                );
+                ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     ui.label("Owner UID:");
                     ui.add_sized(
@@ -11144,10 +11718,246 @@ impl ZaloGuiApp {
                     .clicked()
                 {
                     ui.ctx().copy_text(hex_str);
-                    self.show_toast("Đã sao chép gói tin Command 50001 vào clipboard");
+                    self.show_toast("Đã sao chép gói tin CMD_FEED_TIMELINE (1230) vào clipboard");
                 }
             });
     }
+}
+
+/// Center-crop UV sub-rectangle preserving native aspect ratio inside a fixed `box_w`×`box_h` slot.
+fn feed_cover_uv(tex_w: f32, tex_h: f32, box_w: f32, box_h: f32) -> Rect {
+    if tex_w <= 0.0 || tex_h <= 0.0 || box_w <= 0.0 || box_h <= 0.0 {
+        return Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+    }
+    let tex_aspect = tex_w / tex_h;
+    let box_aspect = box_w / box_h;
+    if tex_aspect > box_aspect {
+        let span = (box_aspect / tex_aspect).clamp(0.0, 1.0);
+        let start = (1.0 - span) * 0.5;
+        Rect::from_min_max(Pos2::new(start, 0.0), Pos2::new(start + span, 1.0))
+    } else {
+        let span = (tex_aspect / box_aspect).clamp(0.0, 1.0);
+        let start = (1.0 - span) * 0.5;
+        Rect::from_min_max(Pos2::new(0.0, start), Pos2::new(1.0, start + span))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FeedImageLayout {
+    size: Vec2,
+    uv: Rect,
+}
+
+/// Compute aspect-preserving target rect & UV for a single feed image or placeholder.
+/// Extreme aspect ratios clamp to `min_side` with center-crop UV so pixels are never stretched.
+fn compute_feed_single_image_layout(
+    nat_w: f32,
+    nat_h: f32,
+    max_w: f32,
+    max_h: f32,
+) -> FeedImageLayout {
+    let full_uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+    if nat_w <= 0.0 || nat_h <= 0.0 || !nat_w.is_finite() || !nat_h.is_finite() {
+        let pw = if max_w.is_finite() {
+            max_w.clamp(160.0, 420.0)
+        } else {
+            320.0
+        };
+        let ph = 240.0_f32.min(max_h.max(120.0));
+        return FeedImageLayout {
+            size: Vec2::new(pw, ph),
+            uv: full_uv,
+        };
+    }
+
+    let bound_w = if max_w.is_finite() && max_w > 0.0 {
+        max_w
+    } else {
+        420.0
+    };
+    let bound_h = if max_h.is_finite() && max_h > 0.0 {
+        max_h
+    } else {
+        440.0
+    };
+    let scale = (bound_w / nat_w).min(bound_h / nat_h).min(1.5);
+    let mut w = (nat_w * scale).round().max(1.0);
+    let mut h = (nat_h * scale).round().max(1.0);
+
+    let min_side = 96.0_f32.min(bound_w).min(bound_h);
+    if w < min_side || h < min_side {
+        w = w.clamp(min_side, bound_w);
+        h = h.clamp(min_side, bound_h);
+        return FeedImageLayout {
+            size: Vec2::new(w, h),
+            uv: feed_cover_uv(nat_w, nat_h, w, h),
+        };
+    }
+
+    FeedImageLayout {
+        size: Vec2::new(w, h),
+        uv: full_uv,
+    }
+}
+
+fn format_feed_duration(secs: u32) -> String {
+    let m = secs / 60;
+    let s = secs % 60;
+    format!("{m}:{s:02}")
+}
+
+#[derive(Debug, Clone)]
+struct SharedChatPhotoCard {
+    msg_id: String,
+    #[allow(dead_code)]
+    thread_uid: String,
+    #[allow(dead_code)]
+    sender_uid: String,
+    sender_name: String,
+    sender_avatar: String,
+    context_label: String,
+    caption: String,
+    thumb_url: String,
+    full_url: String,
+    width: u32,
+    height: u32,
+    ts: i64,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_shared_chat_media(
+    threads: &[Thread],
+    my_uid: &str,
+    my_name: &str,
+    my_avatar: Option<&str>,
+    profiles: &[crate::feed::SocialUserProfile],
+    target_uid_filter: &str,
+    q_low: &str,
+    q_fold: &str,
+) -> Vec<SharedChatPhotoCard> {
+    let norm_target = crate::feed::normalize_feed_uid(target_uid_filter);
+    let norm_my_uid = crate::feed::normalize_feed_uid(my_uid);
+    let self_name = if crate::feed::is_raw_uid_label(my_name, &norm_my_uid) {
+        "Bạn".to_string()
+    } else {
+        my_name.trim().to_string()
+    };
+    let self_ava = my_avatar
+        .map(str::trim)
+        .filter(|u| crate::feed::is_usable_social_image_url(u))
+        .unwrap_or("")
+        .to_string();
+
+    let mut cards = Vec::new();
+    for t in threads {
+        if t.is_group || t.name.contains("Cloud của tôi") {
+            continue;
+        }
+        let peer_uid = crate::feed::normalize_feed_uid(&t.id);
+        if !norm_target.is_empty() && peer_uid != norm_target {
+            continue;
+        }
+
+        let matched_prof = profiles
+            .iter()
+            .find(|p| crate::feed::normalize_feed_uid(&p.uid) == peer_uid);
+        let peer_name = if !crate::feed::is_raw_uid_label(&t.name, &peer_uid) {
+            t.name.trim().to_string()
+        } else if let Some(p) = matched_prof
+            .filter(|p| !crate::feed::is_raw_uid_label(&p.display_name, &peer_uid))
+        {
+            p.display_name.trim().to_string()
+        } else {
+            "Bạn bè".to_string()
+        };
+        let peer_ava = t
+            .avatar
+            .as_deref()
+            .filter(|u| crate::feed::is_usable_social_image_url(u))
+            .or_else(|| {
+                matched_prof
+                    .map(|p| p.avatar_url.as_str())
+                    .filter(|u| crate::feed::is_usable_social_image_url(u))
+            })
+            .unwrap_or("")
+            .to_string();
+
+        for m in t.messages.iter().rev() {
+            let trimmed = m.text.trim();
+            let is_photo = m.link_src.as_deref() == Some("Hình ảnh Zalo")
+                || trimmed == "[Hình ảnh]"
+                || trimmed.starts_with("[Hình ảnh] ");
+            if !is_photo {
+                continue;
+            }
+            let Some(thumb) = m
+                .link_thumb
+                .as_deref()
+                .or(m.link_url.as_deref())
+                .map(str::trim)
+                .filter(|u| !u.is_empty())
+            else {
+                continue;
+            };
+            let full = m
+                .link_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|u| !u.is_empty())
+                .unwrap_or(thumb)
+                .to_string();
+
+            let caption = trimmed
+                .strip_prefix("[Hình ảnh]")
+                .map(str::trim)
+                .unwrap_or("")
+                .to_string();
+
+            let (sender_uid, sender_name, sender_avatar, context_label) = if m.is_outgoing {
+                (
+                    norm_my_uid.clone(),
+                    self_name.clone(),
+                    self_ava.clone(),
+                    format!("Bạn đã gửi trong chat với {peer_name}"),
+                )
+            } else {
+                (
+                    peer_uid.clone(),
+                    peer_name.clone(),
+                    peer_ava.clone(),
+                    format!("{peer_name} đã gửi cho bạn"),
+                )
+            };
+
+            if !q_low.is_empty()
+                && !matches_vn_query(&sender_name, q_low, q_fold)
+                && !matches_vn_query(&peer_name, q_low, q_fold)
+                && !matches_vn_query(&caption, q_low, q_fold)
+            {
+                continue;
+            }
+
+            let (width, height) = crate::gui::messages::extract_wire_photo_dims(m).unwrap_or((0, 0));
+            cards.push(SharedChatPhotoCard {
+                msg_id: m.id.clone(),
+                thread_uid: peer_uid.clone(),
+                sender_uid,
+                sender_name,
+                sender_avatar,
+                context_label,
+                caption,
+                thumb_url: thumb.to_string(),
+                full_url: full,
+                width,
+                height,
+                ts: m.ts,
+            });
+        }
+    }
+
+    cards.sort_by(|a, b| b.ts.cmp(&a.ts).then_with(|| b.msg_id.cmp(&a.msg_id)));
+    cards.truncate(120);
+    cards
 }
 
 /// Extract up to 6 concise changelog bullet lines from a GitHub Release body,
@@ -11472,5 +12282,109 @@ mod tests {
         let raw = "Hẹn giờ gửi tin nhắn ([#38](https://phamduchieu.site/)), REST API ([#35](https://phamduchieu.site/))";
         let cleaned = extract_markdown_links_inline(raw);
         assert_eq!(cleaned, "Hẹn giờ gửi tin nhắn (#38), REST API (#35)");
+    }
+
+    #[test]
+    fn feed_cover_uv_center_crops_portrait_landscape_ultrawide_and_square() {
+        // Portrait (1:2) inside square (1:1) -> crops top & bottom symmetrically (y in [0.25, 0.75])
+        let p = feed_cover_uv(500.0, 1000.0, 100.0, 100.0);
+        assert!((p.min.x - 0.0).abs() < 1e-5 && (p.max.x - 1.0).abs() < 1e-5);
+        assert!((p.min.y - 0.25).abs() < 1e-5 && (p.max.y - 0.75).abs() < 1e-5);
+
+        // Landscape (2:1) inside square (1:1) -> crops left & right symmetrically (x in [0.25, 0.75])
+        let l = feed_cover_uv(1000.0, 500.0, 100.0, 100.0);
+        assert!((l.min.x - 0.25).abs() < 1e-5 && (l.max.x - 0.75).abs() < 1e-5);
+        assert!((l.min.y - 0.0).abs() < 1e-5 && (l.max.y - 1.0).abs() < 1e-5);
+
+        // Ultrawide (4:1) inside 2:1 cover banner -> crops horizontally to 0.5 span
+        let uw = feed_cover_uv(2000.0, 500.0, 600.0, 300.0);
+        assert!((uw.min.x - 0.25).abs() < 1e-5 && (uw.max.x - 0.75).abs() < 1e-5);
+
+        // Square inside square -> full UV
+        let sq = feed_cover_uv(400.0, 400.0, 130.0, 130.0);
+        assert!((sq.min.x - 0.0).abs() < 1e-5 && (sq.max.x - 1.0).abs() < 1e-5);
+        assert!((sq.min.y - 0.0).abs() < 1e-5 && (sq.max.y - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn compute_feed_single_image_layout_preserves_native_aspect_ratio() {
+        // Landscape 1600x900 inside 600x440 -> width=600, height=338, full UV (16:9 preserved)
+        let land = compute_feed_single_image_layout(1600.0, 900.0, 600.0, 440.0);
+        assert!((land.size.x - 600.0).abs() < 1.0);
+        assert!((land.size.y - 338.0).abs() <= 1.0);
+        assert!((land.uv.width() - 1.0).abs() < 1e-5);
+        assert!((land.uv.height() - 1.0).abs() < 1e-5);
+
+        // Portrait 900x1600 inside 600x440 -> height=440, width=248, full UV (9:16 preserved)
+        let port = compute_feed_single_image_layout(900.0, 1600.0, 600.0, 440.0);
+        assert!((port.size.y - 440.0).abs() < 1.0);
+        assert!((port.size.x - 248.0).abs() <= 1.0);
+        assert!((port.uv.width() - 1.0).abs() < 1e-5);
+
+        // Extreme tall receipt 200x4000 -> clamps width >= 96 and center-crops UV vertically (no stretch)
+        let tall = compute_feed_single_image_layout(200.0, 4000.0, 600.0, 440.0);
+        assert!(tall.size.x >= 96.0);
+        assert!(tall.uv.height() < 1.0);
+    }
+
+    #[test]
+    fn collect_shared_chat_media_attributes_outgoing_to_self_and_incoming_to_friend() {
+        let msg_out = ChatMessage {
+            id: "m1".to_string(),
+            is_outgoing: true,
+            ts: 1700000002000,
+            text: "[Hình ảnh] Hóa đơn chuyển khoản".to_string(),
+            link_src: Some("Hình ảnh Zalo".to_string()),
+            link_thumb: Some("https://img.example/receipt.jpg".to_string()),
+            link_url: Some("https://img.example/receipt_hd.jpg".to_string()),
+            ..Default::default()
+        };
+
+        let msg_in = ChatMessage {
+            id: "m2".to_string(),
+            is_outgoing: false,
+            ts: 1700000001000,
+            text: "[Hình ảnh]".to_string(),
+            link_src: Some("Hình ảnh Zalo".to_string()),
+            link_thumb: Some("https://img.example/cat.jpg".to_string()),
+            ..Default::default()
+        };
+
+        let thread = Thread {
+            presentation: crate::chat::SidebarPresentation::default(),
+            id: "686454123".to_string(),
+            name: "Minh Anh".to_string(),
+            preview: String::new(),
+            time: String::new(),
+            avatar: Some("https://ava.example/minhanh.jpg".to_string()),
+            is_group: false,
+            messages: vec![msg_in, msg_out],
+            unread: crate::unread::UnreadState::default(),
+            vanish: None,
+        };
+
+        let cards = collect_shared_chat_media(
+            &[thread],
+            "999000111",
+            "Hiếu",
+            Some("https://ava.example/hieu.jpg"),
+            &[],
+            "686454123",
+            "",
+            "",
+        );
+        assert_eq!(cards.len(), 2);
+        // Sorted newest first: outgoing photo is attributed to self ("Hiếu"), NOT "Minh Anh"
+        assert_eq!(cards[0].msg_id, "m1");
+        assert_eq!(cards[0].sender_uid, "999000111");
+        assert_eq!(cards[0].sender_name, "Hiếu");
+        assert!(cards[0].context_label.contains("Minh Anh"));
+        assert_eq!(cards[0].caption, "Hóa đơn chuyển khoản");
+
+        // Incoming photo is attributed to friend "Minh Anh"
+        assert_eq!(cards[1].msg_id, "m2");
+        assert_eq!(cards[1].sender_uid, "686454123");
+        assert_eq!(cards[1].sender_name, "Minh Anh");
+        assert_eq!(cards[1].sender_avatar, "https://ava.example/minhanh.jpg");
     }
 }

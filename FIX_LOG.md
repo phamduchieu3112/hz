@@ -143,3 +143,46 @@ Tracking completed fixes from `bug_analysis_report.md` (branch `clean-release`, 
    - Open an active group thread (`Nhóm ...`) in `hz.exe --gui --dev`, send a message to the group from a mobile device → verify the message arrives promptly in the active chat view and updates the sidebar preview/unread badge (even for threads ranked past position 64).
    - Open the right Info Drawer and click `"Đồng bộ"` → verify recent messages refresh cleanly and it does **not** falsely display `"Đã hiển thị toàn bộ lịch sử tin nhắn của cuộc trò chuyện này"` when older history exists or on a transient network error.
    - Scroll to the top of the group and click `"Tải thêm tin nhắn cũ"` → verify older pages load cleanly and `"Đã hiển thị toàn bộ lịch sử..."` only appears once the server actually reaches the start of history.
+
+
+---
+
+## Batch 4 — Wall / Friends' Timeline Fix (`2026-11-26`)
+
+### Completed Items
+
+| Bug ID | Upstream Issue(s) | Chosen Option | Status | Summary |
+| :--- | :--- | :--- | :---: | :--- |
+| **HZ-16** | `#156` | **Option A** (Native image aspect/crop + strict UID attribution + contact name/avatar resolution + standard post parsing + separate chat-media & `--dev` protocol tab) | **Fixed** | Preserved native aspect ratios across all Feed image renderers via `compute_feed_single_image_layout` and `feed_cover_uv` (`egui::Image::new(tex).uv(...)` with `maintain_aspect_ratio(false)` for single photos, cover banners, 2/3-column album grids, link thumbnails, and personal avatars); removed DM photo fabrication from `"Nhật Ký"` and moved 1-1 shared photos into a dedicated `"Ảnh chia sẻ trong chat"` tab (`collect_shared_chat_media`) with accurate `is_outgoing` sender attribution (`"Bạn"` vs friend name) and real message timestamps; added `normalize_feed_uid` (`_0` pversion suffix stripping), `is_raw_uid_label`, `is_usable_social_image_url`, `resolve_feed_author`, and `filter_feed_item_for_target`, removed the `.take(120)` batch cap (raised to `1000` in chunks of `40` resilient to per-chunk errors), passed `known_contacts` (`FeedProfileFallback`) from `self.threads` + self profile, and offloaded SQLite timeline reads onto `tokio::task::spawn_blocking`; extended `FeedItem` / `parse_feed_item_json` / `parse_timeline_feed_value` to parse & render standard timeline post types (`Text`, `Photo`, `Album`, `Video` with duration/play overlay, `Link` preview cards, `SharedPost` cards, `location`, and inline `comments`); gated the protocol inspector tab behind `self.dev_mode` and corrected the mislabeled `ERR_FEED_NO_NETWORK = 50001` vs `CMD_FEED_TIMELINE = 1230` label. |
+
+### Modified Files
+- `src/feed.rs` — Added `FeedProfileFallback`, `FeedPostKind`, `FeedLinkPreview`, `FeedSharedPost`, `FeedMedia::duration_secs`, `FeedItem` extended fields, `normalize_feed_uid`, `is_raw_uid_label`, `is_usable_social_image_url`, `resolve_feed_author`, `filter_feed_item_for_target`, `parse_timeline_feed_value`; fixed `SocialUserProfile::from_json`, `get_friend_social_profiles_batch`, `fetch_timeline_feed` (removed DM fabrication, added `known_contacts` enrichment + `spawn_blocking` SQLite load + missing UID resolution), and `parse_feed_item_json` across standard post types + 5 new unit tests.
+- `src/gui.rs` — Replaced `FeedModalTab::Packet50001` with `FeedModalTab::SharedChatMedia` and `FeedModalTab::ProtocolDebug`; synchronized `self.feed_profile` on `GuiEvent::SocialTimelineLoaded` when a target UID is already selected.
+- `src/gui/worker.rs` — Updated `WorkerCmd::FetchTimelineFeed` to pass `known_contacts: HashMap<String, FeedProfileFallback>` instead of DM `shared_media_by_uid`.
+- `src/gui/modals.rs` — Added `feed_cover_uv`, `compute_feed_single_image_layout`, `SharedChatPhotoCard`, and `collect_shared_chat_media`; updated `trigger_feed_timeline_load`, `render_feed_page` (dev-gated `CMD_FEED_TIMELINE = 1230` tab), `render_feed_timeline_column` (aspect-accurate single/album/cover images, video overlay, link/shared-post/comment cards, strict UID filtering, honest desktop-protocol note), `render_feed_shared_chat_media_column`, `render_feed_avatars_column`, and `render_feed_packet_column` + 3 new unit tests.
+
+### Verification Results
+- `cargo check --all-targets`: **PASS** (0 errors, 0 new warnings)
+- `cargo clippy --all-targets -j 2`: **PASS** (0 errors, 0 new warnings)
+- `cargo test -j 2`: **PASS** — **546 passed; 0 failed; 1 ignored** (16.14s)
+  - New tests passing (8 added in Batch 4):
+    - `feed::tests::normalize_feed_uid_strips_pversion_suffix_and_preserves_plain_ids`
+    - `feed::tests::social_profile_from_json_normalizes_pversion_key_and_filters_default_urls`
+    - `feed::tests::resolve_feed_author_never_reattributes_nonempty_uid_by_display_name`
+    - `feed::tests::filter_feed_item_for_target_matches_strictly_by_normalized_uid`
+    - `feed::tests::parse_timeline_feed_supports_standard_post_types`
+    - `gui::modals::tests::feed_cover_uv_center_crops_portrait_landscape_ultrawide_and_square`
+    - `gui::modals::tests::compute_feed_single_image_layout_preserves_native_aspect_ratio`
+    - `gui::modals::tests::collect_shared_chat_media_attributes_outgoing_to_self_and_incoming_to_friend`
+
+### Windows 10/11 `--gui` Manual QA Steps
+1. **Image Aspect Ratio & Crop (`#156`):**
+   - Launch `hz.exe --gui` and open **Tường nhà / Nhật ký bạn bè** from the left rail.
+   - Inspect single portrait/landscape/ultrawide photos, friend cover banners, 2–6+ photo album grids, and **Kho Ảnh Cá Nhân** (`130×130` tiles) → verify crisp aspect-accurate framing with zero horizontal/vertical stretching or squishing, and click images to confirm `ImageViewerModal` opens cleanly.
+2. **Author Attribution, Display Names & Avatars (`#156`):**
+   - Verify no raw numeric UIDs (`686454...`) or digit-initial fallback avatars appear on feed cards or the left friends list for known contacts.
+   - Click a friend in the left sidebar or click `"Xem hồ sơ & Nhật ký"` from a chat Info Drawer → verify strict per-UID filtering (no posts from another user with the same display name).
+   - Open the **`Ảnh chia sẻ trong chat`** tab → verify outgoing 1-1 photos (e.g., sent receipts) are attributed to **your own name/avatar** (`"Bạn đã gửi trong chat với ..."`), never attributed to the friend.
+3. **Standard Timeline Post Types & Protocol Tab (`#156`):**
+   - With a test SQLite DB containing `timeline_feed_1` / `user_feed` posts (`ZALO_TIMELINE_DB`), verify text-only posts, single photos, multi-photo albums, video cards (play badge + duration + click to open URL), link preview cards, shared/reposted cards, locations, and inline comments all render cleanly without blocking the UI thread.
+   - Confirm `"Giao thức Feed (Cmd 1230)"` is hidden in normal `hz.exe --gui` mode and visible only in `hz.exe --gui --dev` with the corrected `CMD_FEED_TIMELINE = 1230` / `ERR_FEED_NO_NETWORK = 50001` explanation.

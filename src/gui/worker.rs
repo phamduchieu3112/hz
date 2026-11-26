@@ -768,7 +768,7 @@ pub enum WorkerCmd {
     },
     FetchTimelineFeed {
         friend_uids: Vec<String>,
-        shared_media_by_uid: std::collections::HashMap<String, Vec<crate::feed::FeedMedia>>,
+        known_contacts: std::collections::HashMap<String, crate::feed::FeedProfileFallback>,
     },
     SyncPhoneMessages {
         threads: Vec<Thread>,
@@ -5227,7 +5227,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                         }
                         WorkerCmd::FetchTimelineFeed {
                             friend_uids,
-                            shared_media_by_uid,
+                            known_contacts,
                         } => {
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
@@ -5235,7 +5235,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             tokio::spawn(async move {
                                 let s = session_clone.lock().await.clone();
                                 let res = s
-                                    .fetch_timeline_feed(&friend_uids, &shared_media_by_uid)
+                                    .fetch_timeline_feed(&friend_uids, &known_contacts)
                                     .await
                                     .map_err(|e| e.to_string());
                                 let _ = gui_tx_clone.send(GuiEvent::SocialTimelineLoaded(res));

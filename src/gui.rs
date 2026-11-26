@@ -1140,8 +1140,9 @@ pub(crate) struct VideoPlayerModal {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FeedModalTab {
     Profile,
+    SharedChatMedia,
     Avatars,
-    Packet50001,
+    ProtocolDebug,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContactsSubTab {
@@ -4699,6 +4700,15 @@ impl ZaloGuiApp {
                         Ok((profiles, items)) => {
                             self.feed_friend_profiles = profiles;
                             self.feed_items = items;
+                            if !self.feed_target_uid.is_empty() && self.feed_profile.is_none() {
+                                let target =
+                                    crate::feed::normalize_feed_uid(&self.feed_target_uid);
+                                self.feed_profile = self
+                                    .feed_friend_profiles
+                                    .iter()
+                                    .find(|p| crate::feed::normalize_feed_uid(&p.uid) == target)
+                                    .cloned();
+                            }
                         }
                         Err(e) => {
                             self.feed_profile_error = Some(e);
