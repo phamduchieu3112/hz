@@ -5,7 +5,7 @@ edition = "2021"
 authors = ["Phạm Đức Hiếu <phamduchieu.robotics@gmail.com>"]
 description = "Hz (Hiếu's Zalo) - Native Rust Zalo Desktop Client"
 homepage = "https://phamduchieu.site/"
-repository = ""
+repository = "https://github.com/phamduchieu3112/hz"
 license = "MIT OR Apache-2.0"
 default-run = "hz"
 
