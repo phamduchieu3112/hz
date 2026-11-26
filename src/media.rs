@@ -345,10 +345,36 @@ pub fn resolve_output_device() -> Result<(cpal::Device, String), String> {
         .map_err(|e| format!("hz-audio-enumerator timeout: {e}"))?
 }
 
-/// Check whether `ffmpeg` is installed and reachable in `PATH` (cached after first probe).
+/// Resolve the `ffmpeg` executable path, preferring a bundled sibling next to the current
+/// executable (`<exe_dir>/ffmpeg.exe` on Windows, `<exe_dir>/ffmpeg` on Unix) before falling
+/// back to `PATH`.
+pub(crate) fn resolve_ffmpeg_executable_for_exe(
+    exe_path: Option<&std::path::Path>,
+) -> std::path::PathBuf {
+    let bin_name = if cfg!(target_os = "windows") {
+        "ffmpeg.exe"
+    } else {
+        "ffmpeg"
+    };
+    if let Some(dir) = exe_path.and_then(|p| p.parent()) {
+        let bundled = dir.join(bin_name);
+        if bundled.is_file() {
+            return bundled;
+        }
+    }
+    std::path::PathBuf::from("ffmpeg")
+}
+
+/// Locate the `ffmpeg` binary: checks `<current_exe_dir>/ffmpeg.exe` first, then falls back to `PATH`.
+pub fn ffmpeg_executable() -> std::path::PathBuf {
+    let cur = std::env::current_exe().ok();
+    resolve_ffmpeg_executable_for_exe(cur.as_deref())
+}
+
+/// Check whether `ffmpeg` is installed next to the executable or reachable in `PATH` (cached after first probe).
 pub fn is_ffmpeg_available() -> bool {
     static FFMPEG_OK: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        let mut cmd = std::process::Command::new("ffmpeg");
+        let mut cmd = std::process::Command::new(ffmpeg_executable());
         cmd.arg("-version")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -526,7 +552,7 @@ fn enumerate_ffmpeg_cameras() -> Vec<String> {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
-        let mut cmd = std::process::Command::new("ffmpeg");
+        let mut cmd = std::process::Command::new(ffmpeg_executable());
         cmd.args([
             "-hide_banner",
             "-list_devices",
@@ -581,7 +607,7 @@ fn enumerate_ffmpeg_cameras() -> Vec<String> {
     }
     #[cfg(target_os = "macos")]
     {
-        let mut cmd = std::process::Command::new("ffmpeg");
+        let mut cmd = std::process::Command::new(ffmpeg_executable());
         cmd.args([
             "-hide_banner",
             "-f",
@@ -1674,7 +1700,7 @@ fn spawn_camera_capture_thread(
                 current_dev = desired.clone();
                 stream_acc.clear();
 
-                let mut cmd = Command::new("ffmpeg");
+                let mut cmd = Command::new(ffmpeg_executable());
                 cmd.args(["-hide_banner", "-loglevel", "error"]);
                 #[cfg(target_os = "windows")]
                 cmd.args([
@@ -2141,7 +2167,7 @@ fn run_local_preview_decoder(
     const PREV_H: usize = 180;
     const PREV_BYTES: usize = PREV_W * PREV_H * 4;
 
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = Command::new(ffmpeg_executable());
     cmd.args([
         "-hide_banner",
         "-loglevel",
@@ -4145,7 +4171,7 @@ fn run_h264_ffmpeg_decoder(
     const FRAME_BYTES: usize = VID_W * VID_H * 4;
 
     fn spawn_ffmpeg_h264_child(tex_key: &str) -> Option<Child> {
-        let mut cmd = Command::new("ffmpeg");
+        let mut cmd = Command::new(ffmpeg_executable());
         cmd.args([
             "-hide_banner",
             "-loglevel",
@@ -5313,5 +5339,31 @@ mod tests {
         let neg = soft_limit(-3.0);
         assert!(pos > 0.85 && pos < 1.0, "pos={pos}");
         assert!(neg < -0.85 && neg > -1.0, "neg={neg}");
+    }
+
+    #[test]
+    fn ffmpeg_executable_prefers_bundled_sibling_before_path_fallback() {
+        let tmp = std::env::temp_dir().join(format!("hz_ffmpeg_probe_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let fake_exe = tmp.join("hz.exe");
+        let bin_name = if cfg!(target_os = "windows") {
+            "ffmpeg.exe"
+        } else {
+            "ffmpeg"
+        };
+        // Without sibling binary -> falls back to PATH ("ffmpeg")
+        assert_eq!(
+            resolve_ffmpeg_executable_for_exe(Some(&fake_exe)),
+            std::path::PathBuf::from("ffmpeg")
+        );
+
+        // With sibling binary -> returns sibling path first
+        let bundled = tmp.join(bin_name);
+        std::fs::write(&bundled, b"stub").unwrap();
+        assert_eq!(resolve_ffmpeg_executable_for_exe(Some(&fake_exe)), bundled);
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

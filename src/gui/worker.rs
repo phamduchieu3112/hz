@@ -5691,7 +5691,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
     }
 }
 
-const GITHUB_REPO: &str = "";
+const GITHUB_REPO: &str = "phamduchieu3112/hz";
 
 pub(crate) async fn fetch_github_latest_release() -> Result<UpdateCheckResult, String> {
     let current_ver = env!("CARGO_PKG_VERSION").to_string();
@@ -6245,7 +6245,7 @@ fn decode_image_with_fallback(
 
 /// Transcode stdin media bytes to PNG via `ffmpeg` without flashing a console window on Windows.
 fn transcode_pipe_to_png_with_ffmpeg(bytes: &[u8], vf: Option<&str>) -> Option<Vec<u8>> {
-    let mut cmd = std::process::Command::new("ffmpeg");
+    let mut cmd = std::process::Command::new(crate::media::ffmpeg_executable());
     cmd.args(["-hide_banner", "-loglevel", "error", "-i", "pipe:0", "-vframes", "1"]);
     if let Some(filter) = vf {
         cmd.args(["-vf", filter]);

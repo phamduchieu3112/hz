@@ -1,6 +1,6 @@
 [package]
 name = "hz"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 authors = ["Phạm Đức Hiếu <phamduchieu.robotics@gmail.com>"]
 description = "Hz (Hiếu's Zalo) - Native Rust Zalo Desktop Client"

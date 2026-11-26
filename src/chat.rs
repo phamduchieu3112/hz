@@ -3261,7 +3261,7 @@ fn generate_video_thumbnail_jpeg(
     height: u32,
 ) -> Option<Vec<u8>> {
     for ss in ["00:00:00.5", "0"] {
-        let mut cmd = std::process::Command::new("ffmpeg");
+        let mut cmd = std::process::Command::new(crate::media::ffmpeg_executable());
         cmd.args(["-y", "-ss", ss, "-i"])
             .arg(video_path)
             .args([

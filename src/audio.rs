@@ -523,7 +523,7 @@ pub fn encode_mono_aac_16k(
     }
     let dir = voice_temp_dir(tag)?;
     let path = dir.join(format!("hz_voice_{tag}.aac"));
-    let spawn_r = std::process::Command::new("ffmpeg")
+    let spawn_r = std::process::Command::new(crate::media::ffmpeg_executable())
         .args([
             "-y", "-loglevel", "error",
             "-f", "f32le", "-ar", "16000", "-ac", "1", "-i", "pipe:0",

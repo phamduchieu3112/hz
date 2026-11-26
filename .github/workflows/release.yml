@@ -1,0 +1,101 @@
+name: Release Windows Installer
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    env:
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry & build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Extract version from Cargo.toml
+        id: meta
+        shell: pwsh
+        run: |
+          $toml = Get-Content Cargo.toml -Raw
+          if ($toml -match '(?m)^version\s*=\s*"([^"]+)"') {
+            $ver = $Matches[1]
+          } else {
+            throw "Could not parse version from Cargo.toml"
+          }
+          "version=$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Verify tests
+        shell: pwsh
+        run: cargo test -j 2
+
+      - name: Build release binary (with +crt-static fallback)
+        shell: pwsh
+        run: |
+          $env:RUSTFLAGS = "-C target-feature=+crt-static"
+          cargo build --release --bin hz
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "+crt-static failed; falling back to dynamic CRT"
+            Remove-Item Env:\RUSTFLAGS -ErrorAction SilentlyContinue
+            cargo build --release --bin hz
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+      - name: Locate or install FFmpeg
+        id: ffmpeg
+        shell: pwsh
+        run: |
+          $ff = (Get-Command ffmpeg.exe -ErrorAction SilentlyContinue).Source
+          if (-not $ff) {
+            choco install ffmpeg -y --no-progress
+            $ff = (Get-Command ffmpeg.exe -ErrorAction SilentlyContinue).Source
+          }
+          if ($ff) {
+            $item = Get-Item $ff
+            if ($item.Target) { $ff = $item.Target }
+            "path=$ff" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
+
+      - name: Build Inno Setup installer
+        shell: pwsh
+        run: |
+          $ver = "${{ steps.meta.outputs.version }}"
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+          }
+          $args = @("/DMyAppVersion=$ver")
+          if ("${{ steps.ffmpeg.outputs.path }}") {
+            $args += "/DFfmpegPath=${{ steps.ffmpeg.outputs.path }}"
+          }
+          $args += "installer\hz.iss"
+          & $iscc @args
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Generate SHA256SUMS.txt
+        shell: pwsh
+        run: |
+          $ver = "${{ steps.meta.outputs.version }}"
+          $installer = "dist\Hz-Setup-v$ver.exe"
+          $hash = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  Hz-Setup-v$ver.exe" | Out-File -Encoding ascii -NoNewline "dist\SHA256SUMS.txt"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Hz (Hiếu's Zalo) v${{ steps.meta.outputs.version }}"
+          body_path: RELEASE_NOTES.md
+          files: |
+            dist/Hz-Setup-v${{ steps.meta.outputs.version }}.exe
+            dist/SHA256SUMS.txt

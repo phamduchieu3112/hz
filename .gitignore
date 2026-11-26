@@ -82,6 +82,9 @@ skills-lock.json
 src.bak*
 *.zip
 .env
+.tmp_issues/
+MASTER_BUG_ANALYSIS_PROMPT.md
+bug_analysis_report.md
 
 # Python bytecode
 __pycache__/
