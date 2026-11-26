@@ -1583,6 +1583,34 @@ pub fn merge_thread_into(
             {
                 existing_msg.id = msg.id.clone();
             }
+            if (existing_msg.client_message_id.is_empty() || existing_msg.client_message_id == "0")
+                && !msg.client_message_id.is_empty()
+                && msg.client_message_id != "0"
+            {
+                existing_msg.client_message_id = msg.client_message_id.clone();
+            }
+            if existing_msg.board_topic_id.is_empty() && !msg.board_topic_id.is_empty() {
+                existing_msg.board_topic_id = msg.board_topic_id.clone();
+            }
+            if existing_msg.wire_ref.server_id.is_none() && msg.wire_ref.server_id.is_some() {
+                existing_msg.wire_ref.server_id = msg.wire_ref.server_id.clone();
+            }
+            if existing_msg.wire_ref.client_id.is_none() && msg.wire_ref.client_id.is_some() {
+                existing_msg.wire_ref.client_id = msg.wire_ref.client_id.clone();
+            }
+            if existing_msg.wire_ref.sender.is_none() && msg.wire_ref.sender.is_some() {
+                existing_msg.wire_ref.sender = msg.wire_ref.sender.clone();
+            }
+            if !existing_msg.wire_ref.fields.contains_key("mentions") {
+                if let Some(wm) = msg.wire_ref.fields.get("mentions") {
+                    existing_msg.wire_ref.fields.insert("mentions".into(), wm.clone());
+                }
+            }
+            if existing_msg.resolved_mention_uids.is_empty()
+                && !msg.resolved_mention_uids.is_empty()
+            {
+                existing_msg.resolved_mention_uids = msg.resolved_mention_uids.clone();
+            }
             let is_undo_msg = msg.text.trim() == "[Tin nhắn đã thu hồi]";
             if msg.ts > 0 && existing_msg.ts != msg.ts && (!is_undo_msg || existing_msg.ts == 0) {
                 existing_msg.ts = msg.ts;
@@ -2305,6 +2333,419 @@ pub async fn send_group_message(s: &Session, grid: &str, text: &str) -> Result<V
     send_group_message_with_client_id(s, grid, text, next_client_message_id()).await
 }
 
+/// Strip leading group thread prefixes (`group_`, `g_`, `G_`, `g`, `G`) consistently.
+pub fn clean_group_id(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    let stripped = if let Some(rest) = trimmed.strip_prefix("group_") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("g_").or_else(|| trimmed.strip_prefix("G_")) {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix('g').or_else(|| trimmed.strip_prefix('G')) {
+        rest
+    } else {
+        trimmed
+    };
+    stripped.trim()
+}
+
+/// Wire-level `@mention` descriptor serialized inside Zalo's `mentionInfo` / `mentions` array.
+/// `pos` and `len` are measured in UTF-16 code units matching Zalo Web/Mobile indexing.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WireMention {
+    pub uid: String,
+    pub pos: usize,
+    pub len: usize,
+    pub r#type: u8,
+}
+
+/// Composer-tracked `@mention` span before final UTF-16 offset calculation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutgoingMention {
+    pub uid: String,
+    pub display_name: String,
+    pub is_all: bool,
+}
+
+fn utf8_range_to_utf16(text: &str, start_byte: usize, end_byte: usize) -> Option<(usize, usize)> {
+    if start_byte > end_byte || end_byte > text.len() {
+        return None;
+    }
+    if !text.is_char_boundary(start_byte) || !text.is_char_boundary(end_byte) {
+        return None;
+    }
+    let pos = text[..start_byte].encode_utf16().count();
+    let len = text[start_byte..end_byte].encode_utf16().count();
+    (len > 0).then_some((pos, len))
+}
+
+fn utf16_range_to_utf8(text: &str, pos_u16: usize, len_u16: usize) -> Option<(usize, usize)> {
+    if len_u16 == 0 {
+        return None;
+    }
+    let end_u16 = pos_u16.checked_add(len_u16)?;
+    let mut cur_u16 = 0usize;
+    let mut start_byte: Option<usize> = None;
+    let mut end_byte: Option<usize> = None;
+    for (byte_idx, ch) in text.char_indices() {
+        if cur_u16 == pos_u16 {
+            start_byte = Some(byte_idx);
+        }
+        cur_u16 += ch.len_utf16();
+        if cur_u16 == end_u16 {
+            end_byte = Some(byte_idx + ch.len_utf8());
+            break;
+        }
+        if cur_u16 > end_u16 {
+            return None;
+        }
+    }
+    if start_byte.is_none() && pos_u16 == 0 && text.is_empty() {
+        return None;
+    }
+    match (start_byte, end_byte) {
+        (Some(s), Some(e)) if s < e && text[s..e].starts_with('@') => Some((s, e)),
+        (Some(s), Some(e)) if s < e => Some((s, e)),
+        _ => None,
+    }
+}
+
+fn has_mention_boundary_before(text: &str, at_byte: usize) -> bool {
+    if at_byte == 0 {
+        return true;
+    }
+    text[..at_byte]
+        .chars()
+        .next_back()
+        .is_some_and(|c| !c.is_alphanumeric() && c != '_' && c != '.')
+}
+
+fn has_mention_boundary_after(text: &str, end_byte: usize) -> bool {
+    if end_byte >= text.len() {
+        return true;
+    }
+    text[end_byte..]
+        .chars()
+        .next()
+        .is_some_and(|c| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    ',' | '.' | '!' | '?' | ':' | ';' | ')' | ']' | '}' | '>' | '"' | '\'' | '`'
+                )
+        })
+}
+
+fn ranges_overlap(used: &[(usize, usize)], start: usize, end: usize) -> bool {
+    used.iter().any(|&(s, e)| start < e && end > s)
+}
+
+/// Build Zalo wire `WireMention` entries (UTF-16 `pos`/`len`) from composer-tracked
+/// `OutgoingMention` items (Option A), falling back to scanning `@All`/`@<member>` against
+/// `group_members` `(uid, display_name)` for any remaining `@...` tokens (Option B).
+pub fn build_wire_mentions(
+    text: &str,
+    pending: &[OutgoingMention],
+    group_members: &[(String, String)],
+) -> Vec<WireMention> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let mut matched: Vec<(usize, usize, String, u8)> = Vec::new();
+    let mut used_ranges: Vec<(usize, usize)> = Vec::new();
+
+    // 1. Primary: match composer-picked mentions in order of appearance.
+    for item in pending {
+        let is_all = item.is_all || item.uid == "-1";
+        let candidate_tags: Vec<String> = if is_all {
+            vec![
+                "@All".to_string(),
+                "@all".to_string(),
+                "@ALL".to_string(),
+                "@Tất cả".to_string(),
+                "@tất cả".to_string(),
+            ]
+        } else if !item.display_name.trim().is_empty() {
+            vec![format!("@{}", item.display_name.trim())]
+        } else {
+            continue;
+        };
+
+        let mut found_span: Option<(usize, usize)> = None;
+        for tag in &candidate_tags {
+            let mut search_from = 0usize;
+            while let Some(rel) = text[search_from..].find(tag.as_str()) {
+                let start = search_from + rel;
+                let end = start + tag.len();
+                if has_mention_boundary_before(text, start)
+                    && has_mention_boundary_after(text, end)
+                    && !ranges_overlap(&used_ranges, start, end)
+                {
+                    found_span = Some((start, end));
+                    break;
+                }
+                search_from = start + 1;
+            }
+            if found_span.is_some() {
+                break;
+            }
+        }
+        if let Some((start, end)) = found_span {
+            let uid = if is_all {
+                "-1".to_string()
+            } else {
+                item.uid.clone()
+            };
+            let mtype = if is_all { 1 } else { 0 };
+            used_ranges.push((start, end));
+            matched.push((start, end, uid, mtype));
+        }
+    }
+
+    // 2. Fallback: scan unclaimed `@All` / `@Tất cả` and longest-first group member names.
+    for (all_tag, _) in [
+        ("@All", 1u8),
+        ("@all", 1u8),
+        ("@ALL", 1u8),
+        ("@Tất cả", 1u8),
+        ("@tất cả", 1u8),
+    ] {
+        let mut search_from = 0usize;
+        while let Some(rel) = text[search_from..].find(all_tag) {
+            let start = search_from + rel;
+            let end = start + all_tag.len();
+            if has_mention_boundary_before(text, start)
+                && has_mention_boundary_after(text, end)
+                && !ranges_overlap(&used_ranges, start, end)
+            {
+                used_ranges.push((start, end));
+                matched.push((start, end, "-1".to_string(), 1));
+            }
+            search_from = start + 1;
+        }
+    }
+
+    let mut sorted_members: Vec<(&str, &str)> = group_members
+        .iter()
+        .filter(|(uid, name)| !uid.trim().is_empty() && !name.trim().is_empty())
+        .map(|(uid, name)| (uid.as_str(), name.trim()))
+        .collect();
+    sorted_members.sort_by_key(|m| std::cmp::Reverse(m.1.len()));
+
+    for (uid, name) in sorted_members {
+        let needle = format!("@{name}");
+        let mut search_from = 0usize;
+        while let Some(rel) = text[search_from..].find(needle.as_str()) {
+            let start = search_from + rel;
+            let end = start + needle.len();
+            if has_mention_boundary_before(text, start)
+                && has_mention_boundary_after(text, end)
+                && !ranges_overlap(&used_ranges, start, end)
+            {
+                let mtype = if uid == "-1" { 1 } else { 0 };
+                used_ranges.push((start, end));
+                matched.push((start, end, uid.to_string(), mtype));
+            }
+            search_from = start + 1;
+        }
+    }
+
+    matched.sort_by_key(|m| m.0);
+    matched
+        .into_iter()
+        .filter_map(|(start, end, uid, mtype)| {
+            let (pos, len) = utf8_range_to_utf16(text, start, end)?;
+            Some(WireMention {
+                uid,
+                pos,
+                len,
+                r#type: mtype,
+            })
+        })
+        .collect()
+}
+
+/// Serialize `WireMention` slices into Zalo's JSON string `mentionInfo`.
+pub fn serialize_mention_info(mentions: &[WireMention]) -> String {
+    serde_json::to_string(mentions).unwrap_or_else(|_| "[]".to_string())
+}
+
+fn realign_mentions_to_clean_text(
+    orig_text: &str,
+    clean_text: &str,
+    mentions: &[WireMention],
+) -> Vec<WireMention> {
+    if mentions.is_empty() || orig_text == clean_text {
+        return mentions.to_vec();
+    }
+    let mut used: Vec<(usize, usize)> = Vec::new();
+    let mut out = Vec::with_capacity(mentions.len());
+    for m in mentions {
+        let Some((s, e)) = utf16_range_to_utf8(orig_text, m.pos, m.len) else {
+            continue;
+        };
+        let token = &orig_text[s..e];
+        let mut search_from = 0usize;
+        while let Some(rel) = clean_text[search_from..].find(token) {
+            let cs = search_from + rel;
+            let ce = cs + token.len();
+            if !ranges_overlap(&used, cs, ce) {
+                if let Some((pos, len)) = utf8_range_to_utf16(clean_text, cs, ce) {
+                    used.push((cs, ce));
+                    out.push(WireMention {
+                        uid: m.uid.clone(),
+                        pos,
+                        len,
+                        r#type: m.r#type,
+                    });
+                }
+                break;
+            }
+            search_from = cs + 1;
+        }
+    }
+    out.sort_by_key(|m| m.pos);
+    out
+}
+
+/// Build the group message payload + target endpoint (`/api/group/mention` when mentions are
+/// present, `/api/group/sendmsg` otherwise).
+pub(crate) fn build_group_mention_payload(
+    grid: &str,
+    text: &str,
+    mentions: &[WireMention],
+    client_id: u64,
+    imei: &str,
+) -> (Value, &'static str) {
+    let clean_grid = clean_group_id(grid);
+    let (clean_text, text_props_opt) = extract_zalo_rtf_text_properties(text);
+    let aligned_mentions = realign_mentions_to_clean_text(text, &clean_text, mentions);
+    let mut body = obj(&[
+        ("grid", json!(clean_grid)),
+        ("message", json!(clean_text)),
+        ("clientId", json!(client_id)),
+        ("imei", json!(imei)),
+        ("visibility", json!(0)),
+    ]);
+    if let (Some(tp), Some(map)) = (text_props_opt, body.as_object_mut()) {
+        map.insert("textProperties".into(), json!(tp));
+    }
+    let endpoint = if aligned_mentions.is_empty() {
+        "/api/group/sendmsg"
+    } else {
+        if let Some(map) = body.as_object_mut() {
+            map.insert(
+                "mentionInfo".into(),
+                json!(serialize_mention_info(&aligned_mentions)),
+            );
+        }
+        "/api/group/mention"
+    };
+    (body, endpoint)
+}
+
+fn parse_wire_mentions_array(raw: &Value) -> Vec<Value> {
+    match raw {
+        Value::Array(arr) => arr.clone(),
+        Value::String(s) if s.trim().starts_with('[') => {
+            serde_json::from_str::<Vec<Value>>(s.trim()).unwrap_or_default()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Extract UTF-8 byte spans `(start, end)` in `msg.text` from Zalo wire `mentions` /
+/// `mentionsList` metadata so the GUI highlights multi-word and lowercase Vietnamese tags accurately.
+pub fn extract_wire_mention_spans(msg: &ChatMessage) -> Vec<(usize, usize)> {
+    extract_wire_mention_spans_for_text(msg, &msg.text)
+}
+
+/// Extract UTF-8 byte spans `(start, end)` mapped onto `display_text` (handling emoticon
+/// substitution or stripped `[Đã thu hồi] ` prefix).
+pub fn extract_wire_mention_spans_for_text(
+    msg: &ChatMessage,
+    display_text: &str,
+) -> Vec<(usize, usize)> {
+    let raw_items = msg
+        .wire_ref
+        .fields
+        .get("mentions")
+        .or_else(|| msg.wire_ref.fields.get("mentionInfo"))
+        .or_else(|| {
+            msg.history_source
+                .as_ref()
+                .and_then(|s| s.pointer("/meta/mentionsList"))
+        })
+        .map(parse_wire_mentions_array)
+        .unwrap_or_default();
+    if raw_items.is_empty() || msg.text.is_empty() || display_text.is_empty() {
+        return Vec::new();
+    }
+
+    let mut raw_spans: Vec<(usize, usize)> = Vec::new();
+    for item in raw_items {
+        let Some(pos) = item.get("pos").and_then(Value::as_u64).map(|n| n as usize) else {
+            continue;
+        };
+        let Some(len) = item.get("len").and_then(Value::as_u64).map(|n| n as usize) else {
+            continue;
+        };
+        if let Some(span) = utf16_range_to_utf8(&msg.text, pos, len) {
+            raw_spans.push(span);
+        }
+    }
+    raw_spans.sort_by_key(|s| s.0);
+    raw_spans.dedup();
+    if display_text == msg.text {
+        return raw_spans;
+    }
+    let mut mapped: Vec<(usize, usize)> = Vec::new();
+    for (s, e) in raw_spans {
+        let token = &msg.text[s..e];
+        let mut search_from = 0usize;
+        while let Some(rel) = display_text[search_from..].find(token) {
+            let ds = search_from + rel;
+            let de = ds + token.len();
+            if !ranges_overlap(&mapped, ds, de) {
+                mapped.push((ds, de));
+                break;
+            }
+            search_from = ds + 1;
+        }
+    }
+    mapped.sort_by_key(|s| s.0);
+    mapped
+}
+
+fn extract_resolved_mention_uids_from_wire(
+    text: &str,
+    it: &Value,
+) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    let Some(raw) = it.get("mentions").or_else(|| it.get("mentionInfo")) else {
+        return out;
+    };
+    for item in parse_wire_mentions_array(raw) {
+        let uid = item
+            .get("uid")
+            .and_then(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .or_else(|| v.as_i64().map(|n| n.to_string()))
+            })
+            .unwrap_or_default();
+        let pos = item.get("pos").and_then(Value::as_u64).map(|n| n as usize);
+        let len = item.get("len").and_then(Value::as_u64).map(|n| n as usize);
+        if !uid.is_empty() {
+            if let (Some(p), Some(l)) = (pos, len) {
+                if let Some((s, e)) = utf16_range_to_utf8(text, p, l) {
+                    out.insert(text[s..e].to_string(), uid);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Preserve the request client ID for reconciliation with a later server echo.
 pub(crate) async fn send_group_message_with_client_id(
     s: &Session,
@@ -2312,30 +2753,24 @@ pub(crate) async fn send_group_message_with_client_id(
     text: &str,
     now: u64,
 ) -> Result<Value> {
+    send_group_message_with_mentions(s, grid, text, &[], now).await
+}
+
+/// Send a group message, routing through `/api/group/mention` with `mentionInfo` whenever
+/// `mentions` is non-empty so official Zalo clients highlight tags and deliver mention pushes.
+pub(crate) async fn send_group_message_with_mentions(
+    s: &Session,
+    grid: &str,
+    text: &str,
+    mentions: &[WireMention],
+    now: u64,
+) -> Result<Value> {
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
-    let clean_grid = grid
-        .trim_start_matches("group_")
-        .trim_start_matches('g')
-        .trim_start_matches('G');
-    let (clean_text, text_props_opt) = extract_zalo_rtf_text_properties(text);
-    let mut body = obj(&[
-        ("grid", json!(clean_grid)),
-        ("message", json!(clean_text)),
-        ("clientId", json!(now)),
-        ("imei", json!(s.imei)),
-        ("visibility", json!(0)),
-    ]);
-    if let (Some(tp), Some(map)) = (text_props_opt, body.as_object_mut()) {
-        map.insert("textProperties".into(), json!(tp));
-    }
+    let (body, endpoint) = build_group_mention_payload(grid, text, mentions, now, &s.imei);
     let params = s.encoded_params(&body)?;
-    let url = format!(
-        "{}/api/group/sendmsg?{}",
-        s.domains.group,
-        s.common_params()
-    );
+    let url = format!("{}{endpoint}?{}", s.domains.group, s.common_params());
     let form = format!("params={params}");
     let resp = s.post_form(&url, form).await?;
     let resp = s.maybe_decrypt(resp, s.session_key_bytes()).await;
@@ -2372,6 +2807,85 @@ fn md5_hex_bytes(bytes: &[u8]) -> String {
         let _ = write!(acc, "{b:02x}");
         acc
     })
+}
+
+fn sha256_hex_bytes(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    let out = h.finalize();
+    out.iter().fold(String::with_capacity(64), |mut acc, b| {
+        use std::fmt::Write;
+        let _ = write!(acc, "{b:02x}");
+        acc
+    })
+}
+
+/// Mark the `file_done` WS/control listener active once the worker WS loop starts.
+pub fn mark_file_done_listener_active() {
+    FILE_DONE_LISTENER_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Resolve upload chunk size within Zalo's supported range `[256 KiB, 2 MiB]`.
+pub(crate) fn resolve_upload_chunk_size(server_hint: Option<usize>) -> usize {
+    const DEFAULT_CHUNK: usize = 1_048_576;
+    const MIN_CHUNK: usize = 262_144;
+    const MAX_CHUNK: usize = 2_097_152;
+    server_hint
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_CHUNK)
+        .clamp(MIN_CHUNK, MAX_CHUNK)
+}
+
+/// Build and validate the `asyncfile/msg` payload, rejecting missing `fileId` or empty `fileUrl`
+/// so recipients never receive an unreadable empty-URL file shell.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_asyncfile_msg_payload(
+    clean_target: &str,
+    is_group: bool,
+    file_id: &str,
+    file_url: &str,
+    file_name: &str,
+    ext: &str,
+    total_size: u64,
+    client_file_id: Value,
+    checksum_md5: &str,
+    checksum_sha256: &str,
+    is_video: bool,
+    imei: &str,
+) -> Result<Value> {
+    let clean_fid = file_id.trim();
+    if clean_fid.is_empty() || clean_fid == "-1" {
+        anyhow::bail!("Không nhận được fileId hợp lệ từ máy chủ Zalo");
+    }
+    let clean_url = file_url.trim();
+    if clean_url.is_empty() {
+        anyhow::bail!(
+            "Máy chủ Zalo chưa trả về URL tập tin (hết thời gian chờ file_done) — vui lòng thử gửi lại"
+        );
+    }
+    let mut msg_obj = serde_json::Map::new();
+    msg_obj.insert("fileId".into(), json!(clean_fid));
+    msg_obj.insert("checksum".into(), json!(checksum_md5));
+    msg_obj.insert("checksumSha".into(), json!(checksum_sha256));
+    msg_obj.insert("extension".into(), json!(ext));
+    msg_obj.insert("totalSize".into(), json!(total_size));
+    msg_obj.insert("fileName".into(), json!(file_name));
+    msg_obj.insert("clientId".into(), client_file_id);
+    msg_obj.insert("fType".into(), json!(if is_video { 2 } else { 1 }));
+    msg_obj.insert("fileCount".into(), json!(0));
+    msg_obj.insert("fdata".into(), json!("{}"));
+    if is_group {
+        msg_obj.insert("grid".into(), json!(clean_target));
+        msg_obj.insert("visibility".into(), json!(0));
+    } else {
+        msg_obj.insert("toid".into(), json!(clean_target));
+    }
+    msg_obj.insert("fileUrl".into(), json!(clean_url));
+    msg_obj.insert("imei".into(), json!(imei));
+    msg_obj.insert("zsource".into(), json!(-1));
+    msg_obj.insert("ttl".into(), json!(0));
+    Ok(Value::Object(msg_obj))
 }
 
 /// How long `send_attachment` waits for the `file_done` control event of an async file upload.
@@ -2425,7 +2939,15 @@ pub fn extract_file_done_controls(data_node: &Value) -> Vec<(String, String)> {
 
     let mut out = Vec::new();
     for item in candidates {
-        let c = item.get("content").unwrap_or(item);
+        let parsed_content: Value;
+        let c = match item.get("content") {
+            Some(Value::String(s)) => {
+                parsed_content = serde_json::from_str::<Value>(s).unwrap_or(Value::Null);
+                &parsed_content
+            }
+            Some(other) => other,
+            None => item,
+        };
         if c.get("act_type").and_then(Value::as_str) != Some("file_done") {
             continue;
         }
@@ -2440,11 +2962,14 @@ pub fn extract_file_done_controls(data_node: &Value) -> Vec<(String, String)> {
         let Some(file_id) = c
             .get("fileId")
             .or_else(|| d.get("fileId"))
+            .or_else(|| item.get("fileId"))
             .and_then(file_id_key)
         else {
             continue;
         };
-        let Some(url) = pick_str(d, &["url", "fileUrl"]) else {
+        let Some(url) = pick_str(d, &["url", "fileUrl", "href", "normalUrl"])
+            .or_else(|| pick_str(c, &["url", "fileUrl", "href", "normalUrl"]))
+        else {
             continue;
         };
         out.push((file_id, url));
@@ -2944,7 +3469,7 @@ pub async fn send_attachment_in_layout(
     };
     let client_id = next_client_message_id();
     let total_size = file_bytes.len() as u64;
-    let chunk_size: usize = 1_048_576; // 1 MiB chunks
+    let chunk_size: usize = resolve_upload_chunk_size(None);
     let total_chunks = file_bytes.len().div_ceil(chunk_size).max(1);
     let target_type = if is_group { 11 } else { 2 };
 
@@ -3190,6 +3715,7 @@ pub async fn send_attachment_in_layout(
         _ => "application/octet-stream",
     };
     let checksum = md5_hex_bytes(&file_bytes);
+    let checksum_sha = sha256_hex_bytes(&file_bytes);
     let upload_ep = if is_group {
         "/api/group/asyncfile/upload"
     } else {
@@ -3234,13 +3760,16 @@ pub async fn send_attachment_in_layout(
     }
 
     let data_node = last_up_dec.get("data").unwrap_or(&last_up_dec);
-    let file_id = pick_str(data_node, &["fileId", "clientFileId"]).filter(|id| id != "-1");
+    let file_id = pick_str(data_node, &["fileId"]).filter(|id| id != "-1");
     let client_file_id = data_node
         .get("clientFileId")
         .cloned()
         .unwrap_or_else(|| json!(client_id));
     let mut file_url = pick_str(data_node, &["fileUrl", "url", "normalUrl"]).unwrap_or_default();
-    if file_url.is_empty() && FILE_DONE_LISTENER_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+    if file_url.is_empty()
+        && (FILE_DONE_LISTENER_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+            || crate::socket::is_ws_outbound_connected())
+    {
         if let Some(fid) = file_id.as_deref() {
             match wait_for_file_done(fid, FILE_DONE_TIMEOUT).await {
                 Some(url) => file_url = url,
@@ -3349,28 +3878,21 @@ pub async fn send_attachment_in_layout(
         } else {
             "/api/message/asyncfile/msg"
         };
-        let mut msg_obj = serde_json::Map::new();
-        msg_obj.insert("fileId".into(), json!(fid));
-        msg_obj.insert("checksum".into(), json!(checksum));
-        msg_obj.insert("checksumSha".into(), json!(""));
-        msg_obj.insert("extention".into(), json!(ext));
-        msg_obj.insert("extension".into(), json!(ext));
-        msg_obj.insert("totalSize".into(), json!(total_size));
-        msg_obj.insert("fileName".into(), json!(file_name));
-        msg_obj.insert("clientId".into(), client_file_id);
-        msg_obj.insert("fType".into(), json!(if is_video { 2 } else { 1 }));
-        msg_obj.insert("fileCount".into(), json!(0));
-        msg_obj.insert("fdata".into(), json!("{}"));
-        if is_group {
-            msg_obj.insert("grid".into(), json!(clean_target));
-        } else {
-            msg_obj.insert("toid".into(), json!(clean_target));
-        }
-        msg_obj.insert("fileUrl".into(), json!(file_url));
-        msg_obj.insert("zsource".into(), json!(-1));
-        msg_obj.insert("ttl".into(), json!(0));
-
-        let params = s.encoded_params(&Value::Object(msg_obj))?;
+        let body = build_asyncfile_msg_payload(
+            clean_target,
+            is_group,
+            &fid,
+            &file_url,
+            &file_name,
+            &ext,
+            total_size,
+            client_file_id,
+            &checksum,
+            &checksum_sha,
+            is_video,
+            &s.imei,
+        )?;
+        let params = s.encoded_params(&body)?;
         let url = format!("{file_host}{msg_ep}?{}", s.common_params());
         let r = s.post_form(&url, format!("params={params}")).await?;
         s.maybe_decrypt(r, s.session_key_bytes()).await
@@ -3424,6 +3946,11 @@ pub async fn send_attachment_in_layout(
         is_outgoing: true,
         ts: client_id as i64,
         delivery: crate::message_model::DeliveryState::ServerAccepted,
+        kind: if is_video {
+            crate::message_model::MessageKind::Video
+        } else {
+            crate::message_model::MessageKind::File
+        },
         link_url: if final_url.is_empty() {
             None
         } else {
@@ -3537,7 +4064,10 @@ pub async fn send_voice_message(
         .and_then(|d| pick_str(d, &["fileUrl", "url", "normalUrl", "href"]))
         .unwrap_or_default()
         .is_empty();
-    if need_url && FILE_DONE_LISTENER_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+    if need_url
+        && (FILE_DONE_LISTENER_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+            || crate::socket::is_ws_outbound_connected())
+    {
         let fid = send_resp
             .get("data")
             .and_then(|d| pick_str(d, &["fileId"]).filter(|id| id != "-1"))
@@ -4088,6 +4618,19 @@ pub async fn send_link_message_with_client_id(
     is_group: bool,
     now: u64,
 ) -> Result<Value> {
+    send_link_message_with_mentions(s, to_id, text, meta, is_group, &[], now).await
+}
+
+/// Send a rich link message with optional group `@mention` metadata (`mentionInfo`).
+pub async fn send_link_message_with_mentions(
+    s: &Session,
+    to_id: &str,
+    text: &str,
+    meta: &LinkMetadata,
+    is_group: bool,
+    mentions: &[WireMention],
+    now: u64,
+) -> Result<Value> {
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
@@ -4113,10 +4656,12 @@ pub async fn send_link_message_with_client_id(
 
     let res: Result<Value> = async {
         if is_group {
-            let clean_grid = to_id
-                .trim_start_matches("group_")
-                .trim_start_matches('g')
-                .trim_start_matches('G');
+            let clean_grid = clean_group_id(to_id);
+            let mention_info = if mentions.is_empty() {
+                "[]".to_string()
+            } else {
+                serialize_mention_info(&realign_mentions_to_clean_text(text, msg_str, mentions))
+            };
             let body = obj(&[
                 ("grid", json!(clean_grid)),
                 ("msg", json!(msg_str)),
@@ -4128,7 +4673,7 @@ pub async fn send_link_message_with_client_id(
                 ("type", json!(0)),
                 ("media", json!(media_json)),
                 ("clientId", json!(now)),
-                ("mentionInfo", json!("[]")),
+                ("mentionInfo", json!(mention_info)),
                 ("language", json!("vi")),
                 ("ttl", json!(0)),
                 ("imei", json!(s.imei)),
@@ -4201,7 +4746,9 @@ pub async fn send_link_message_with_client_id(
                 format!("{msg_str}\n{}", meta.url)
             };
             if is_group {
-                send_group_message_with_client_id(s, to_id, &fallback_text, now).await
+                let fb_mentions =
+                    realign_mentions_to_clean_text(text, &fallback_text, mentions);
+                send_group_message_with_mentions(s, to_id, &fallback_text, &fb_mentions, now).await
             } else {
                 send_message_with_client_id(s, to_id, &fallback_text, now).await
             }
@@ -5018,6 +5565,19 @@ pub(crate) async fn send_quote_message_with_client_id(
     is_group: bool,
     now: u64,
 ) -> Result<Value> {
+    send_quote_message_with_mentions(s, to_id, text, quoted, is_group, &[], now).await
+}
+
+/// Send a reply/quote message with optional group `@mention` metadata (`mentionInfo`).
+pub(crate) async fn send_quote_message_with_mentions(
+    s: &Session,
+    to_id: &str,
+    text: &str,
+    quoted: &ChatMessage,
+    is_group: bool,
+    mentions: &[WireMention],
+    now: u64,
+) -> Result<Value> {
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
@@ -5051,16 +5611,14 @@ pub(crate) async fn send_quote_message_with_client_id(
             anyhow::bail!("quoted message has no server id");
         }
         if is_group {
-            let clean_grid = to_id
-                .trim_start_matches("group_")
-                .trim_start_matches('g')
-                .trim_start_matches('G');
+            let clean_grid = clean_group_id(to_id);
             let qmsg_text = if quoted.text.trim().is_empty() {
                 format_message_quote_preview(quoted)
             } else {
                 quoted.text.clone()
             };
             let (clean_text, text_props_opt) = extract_zalo_rtf_text_properties(text);
+            let aligned_mentions = realign_mentions_to_clean_text(text, &clean_text, mentions);
             let mut body = obj(&[
                 ("grid", json!(clean_grid)),
                 ("message", json!(clean_text)),
@@ -5077,6 +5635,14 @@ pub(crate) async fn send_quote_message_with_client_id(
                 ("imei", json!(s.imei)),
                 ("zsource", json!(101)),
             ]);
+            if !aligned_mentions.is_empty() {
+                if let Some(map) = body.as_object_mut() {
+                    map.insert(
+                        "mentionInfo".into(),
+                        json!(serialize_mention_info(&aligned_mentions)),
+                    );
+                }
+            }
             if let (Some(tp), Some(map)) = (text_props_opt, body.as_object_mut()) {
                 map.insert("textProperties".into(), json!(tp));
             }
@@ -5155,7 +5721,7 @@ pub(crate) async fn send_quote_message_with_client_id(
                 &format!("quote failed, sending without reply link: {err}"),
             );
             if is_group {
-                send_group_message_with_client_id(s, to_id, text, now).await
+                send_group_message_with_mentions(s, to_id, text, mentions, now).await
             } else {
                 send_message_with_client_id(s, to_id, text, now).await
             }
@@ -5352,6 +5918,142 @@ pub fn forward_content_for_message(msg: &ChatMessage) -> String {
     }
 }
 
+/// Returns `true` when `msg` is a Zalo file attachment that must be forwarded as a real file
+/// (or re-uploaded cleanly) rather than as plain text containing an expiring `/renewMedia` link.
+pub(crate) fn is_forwardable_file_message(msg: &ChatMessage) -> bool {
+    if msg.sticker_id.is_some_and(|id| id > 0) {
+        return false;
+    }
+    let has_url = msg
+        .link_url
+        .as_deref()
+        .is_some_and(|u| !u.trim().is_empty());
+    if !has_url {
+        return false;
+    }
+    let is_renew_media = msg
+        .link_url
+        .as_deref()
+        .is_some_and(|u| u.to_ascii_lowercase().contains("/renewmedia"));
+    let is_photo = msg.kind == crate::message_model::MessageKind::Photo
+        || msg.link_src.as_deref() == Some("Hình ảnh Zalo")
+        || msg.link_url.as_deref().is_some_and(is_zalo_photo_cdn_url);
+    let is_video = is_forwardable_video_message(msg);
+    if is_photo || is_video {
+        return false;
+    }
+    msg.kind == crate::message_model::MessageKind::File
+        || msg.link_src.as_deref() == Some("Tập tin Zalo")
+        || is_renew_media
+}
+
+/// Returns `true` when `msg` is a Zalo video attachment.
+pub(crate) fn is_forwardable_video_message(msg: &ChatMessage) -> bool {
+    if msg.sticker_id.is_some_and(|id| id > 0) {
+        return false;
+    }
+    let Some(url) = msg.link_url.as_deref().filter(|u| !u.trim().is_empty()) else {
+        return false;
+    };
+    let lower = url.to_ascii_lowercase();
+    msg.kind == crate::message_model::MessageKind::Video
+        || msg.link_src.as_deref() == Some("Video Zalo")
+        || lower.ends_with(".mp4")
+        || lower.ends_with(".mov")
+        || lower.ends_with(".webm")
+        || lower.contains("/video/")
+        || lower.contains("videomedia")
+        || lower.contains(".dlmd.me")
+}
+
+/// Download a received file or video (with authenticated session HTTP client) and re-upload it
+/// via [`send_attachment_in_layout`] so recipients receive a fresh, readable attachment.
+async fn forward_file_or_video_via_reupload(
+    s: &Session,
+    target_id: &str,
+    target_is_group: bool,
+    msg: &ChatMessage,
+    now: u64,
+) -> Result<(Value, ChatMessage)> {
+    const MAX_FORWARD_FILE_BYTES: usize = 100 * 1024 * 1024;
+    let url = msg
+        .link_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Tin nhắn không có URL tập tin hợp lệ để chuyển tiếp"))?;
+    if !is_safe_external_image_url(url) {
+        anyhow::bail!("URL tập tin không hợp lệ hoặc không an toàn để chuyển tiếp");
+    }
+    let resp = s
+        .http
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("Không thể tải tập tin gốc để chuyển tiếp: {e}"))?;
+    if !resp.status().is_success() {
+        anyhow::bail!(
+            "Không thể tải tập tin gốc (HTTP {}, liên kết có thể đã hết hạn)",
+            resp.status()
+        );
+    }
+    if let Some(len) = resp.content_length() {
+        if len as usize > MAX_FORWARD_FILE_BYTES {
+            anyhow::bail!("Tập tin vượt quá giới hạn chuyển tiếp 100 MB");
+        }
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| anyhow::anyhow!("Lỗi đọc dữ liệu tập tin khi chuyển tiếp: {e}"))?;
+    if bytes.is_empty() {
+        anyhow::bail!("Tập tin tải về rỗng (0 byte), không thể chuyển tiếp");
+    }
+    if bytes.len() > MAX_FORWARD_FILE_BYTES {
+        anyhow::bail!("Tập tin vượt quá giới hạn chuyển tiếp 100 MB");
+    }
+
+    let resolved_name = resolve_attachment_file_name(msg.link_title.as_deref(), &msg.text, url);
+    let temp_dir = std::env::temp_dir().join(format!("hz_fwd_{now}_{}", std::process::id()));
+    std::fs::create_dir_all(&temp_dir)?;
+    let temp_path = temp_dir.join(&resolved_name);
+    let write_res = std::fs::write(&temp_path, &bytes);
+    if let Err(e) = write_res {
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        return Err(e.into());
+    }
+
+    let clean_text = msg
+        .text
+        .strip_prefix("[Đã thu hồi] ")
+        .unwrap_or(&msg.text)
+        .trim();
+    let caption = if clean_text.is_empty()
+        || clean_text.starts_with("[Tập tin]")
+        || clean_text.starts_with("[File]")
+        || clean_text.starts_with("[Video]")
+        || clean_text == "[Chia sẻ]"
+        || clean_text == resolved_name
+    {
+        ""
+    } else {
+        clean_text
+    };
+
+    let res = send_attachment_in_layout(
+        s,
+        target_id,
+        target_is_group,
+        &temp_path,
+        caption,
+        true,
+        None,
+    )
+    .await;
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    res
+}
+
 /// Preserve the request client ID for reconciliation with a later server echo.
 pub async fn forward_message_with_client_id(
     s: &Session,
@@ -5360,11 +6062,25 @@ pub async fn forward_message_with_client_id(
     msg: &ChatMessage,
     now: u64,
 ) -> Result<Value> {
+    let (resp, _) =
+        forward_message_detailed_with_client_id(s, target_id, target_is_group, msg, now).await?;
+    Ok(resp)
+}
+
+/// Forward a message and optionally return the constructed outgoing `ChatMessage` when a media/file
+/// upload produced a real CDN attachment.
+pub async fn forward_message_detailed_with_client_id(
+    s: &Session,
+    target_id: &str,
+    target_is_group: bool,
+    msg: &ChatMessage,
+    now: u64,
+) -> Result<(Value, Option<ChatMessage>)> {
     if let Some(sid) = msg.sticker_id {
         if sid > 0 {
             let cid = msg.sticker_cate_id.unwrap_or(0);
             let stype = msg.sticker_type.unwrap_or(7);
-            return send_sticker_with_client_id(
+            let resp = send_sticker_with_client_id(
                 s,
                 target_id,
                 sid,
@@ -5373,7 +6089,8 @@ pub async fn forward_message_with_client_id(
                 target_is_group,
                 now,
             )
-            .await;
+            .await?;
+            return Ok((resp, None));
         }
     }
     // Clean text if message was previously marked as recalled
@@ -5383,10 +6100,12 @@ pub async fn forward_message_with_client_id(
         &msg.text
     };
 
-    // Prioritize rich-link card forwarding before photo CDN downloads
+    // Prioritize rich-link card forwarding before photo/file downloads
     let is_rich_link = (msg.kind == crate::message_model::MessageKind::Link
         || msg.kind == crate::message_model::MessageKind::WebContent)
         && msg.link_url.is_some()
+        && !is_forwardable_file_message(msg)
+        && !is_forwardable_video_message(msg)
         && (msg.link_title.is_some() || msg.link_thumb.is_some() || msg.link_desc.is_some());
 
     if is_rich_link {
@@ -5409,8 +6128,16 @@ pub async fn forward_message_with_client_id(
         if let Ok(resp) =
             send_link_message_with_client_id(s, target_id, text, &meta, target_is_group, now).await
         {
-            return Ok(resp);
+            return Ok((resp, None));
         }
+    }
+
+    // Forward file or video via authenticated download + re-upload so recipients can open/read it
+    // instead of receiving an expiring private `/renewMedia` link as plain text.
+    if is_forwardable_file_message(msg) || is_forwardable_video_message(msg) {
+        let (resp, cm) =
+            forward_file_or_video_via_reupload(s, target_id, target_is_group, msg, now).await?;
+        return Ok((resp, Some(cm)));
     }
 
     // Forward photo if message contains a photo CDN URL
@@ -5433,8 +6160,8 @@ pub async fn forward_message_with_client_id(
                             send_attachment(s, target_id, target_is_group, &temp_path, caption)
                                 .await;
                         let _ = std::fs::remove_file(&temp_path);
-                        if let Ok((resp_v, _)) = res {
-                            return Ok(resp_v);
+                        if let Ok((resp_v, cm)) = res {
+                            return Ok((resp_v, Some(cm)));
                         }
                     }
                 }
@@ -5443,11 +6170,12 @@ pub async fn forward_message_with_client_id(
     }
 
     let forward_text = forward_content_for_message(msg);
-    if target_is_group {
-        send_group_message_with_client_id(s, target_id, &forward_text, now).await
+    let resp = if target_is_group {
+        send_group_message_with_client_id(s, target_id, &forward_text, now).await?
     } else {
-        send_message_with_client_id(s, target_id, &forward_text, now).await
-    }
+        send_message_with_client_id(s, target_id, &forward_text, now).await?
+    };
+    Ok((resp, None))
 }
 
 /// Convert Zalo reaction icon code to visual emoji.
@@ -5761,6 +6489,33 @@ pub async fn delete_message_for_me(
     }
 }
 
+/// Resolve the authoritative Zalo server message ID required to recall a message.
+pub fn resolve_recall_server_id(msg: &ChatMessage) -> Option<String> {
+    server_message_id(msg).filter(|id| {
+        let trimmed = id.trim();
+        !trimmed.is_empty()
+            && trimmed != "0"
+            && !trimmed.starts_with("out_")
+            && !trimmed.starts_with("local_")
+    })
+}
+
+/// Zalo allows recalling one's own message within 24 hours of sending.
+pub fn can_recall_message(msg: &ChatMessage, now_ms: u64) -> bool {
+    if !msg.is_outgoing
+        || msg.text.trim() == "[Tin nhắn đã thu hồi]"
+        || msg.text.starts_with("[Đã thu hồi]")
+        || msg.text.trim() == VANISH_EXPIRED_TEXT
+    {
+        return false;
+    }
+    const RECALL_WINDOW_MS: u64 = 24 * 60 * 60 * 1000;
+    if msg.ts <= 0 {
+        return true;
+    }
+    now_ms.saturating_sub(msg.ts as u64) <= RECALL_WINDOW_MS
+}
+
 pub(crate) fn build_recall_payload(
     to_id: &str,
     is_group: bool,
@@ -5768,31 +6523,22 @@ pub(crate) fn build_recall_payload(
     client_id: u64,
     imei: &str,
 ) -> Result<Value> {
-    let msg_id = msg.id.trim();
-    if msg_id.is_empty() || msg_id.starts_with("out_") || msg_id.starts_with("local_") {
+    let Some(msg_id) = resolve_recall_server_id(msg) else {
         anyhow::bail!("tin nhắn chưa có mã máy chủ");
-    }
-    let cli_id = if !msg.client_message_id.trim().is_empty() && msg.client_message_id.trim() != "0"
-    {
-        msg.client_message_id.trim().to_string()
-    } else if let Some(h_cli) = msg
-        .history_source
-        .as_ref()
-        .and_then(|v| pick_str(v, &["cliMsgId", "clientId", "client_message_id"]))
-        .filter(|s| !s.trim().is_empty() && s.trim() != "0")
-    {
-        h_cli
-    } else if msg.ts > 0 {
-        msg.ts.to_string()
-    } else {
-        client_id.to_string()
     };
+    let cli_id = client_message_id(msg)
+        .or_else(|| wire_identity(msg.wire_ref.client_id.as_ref()))
+        .or_else(|| {
+            msg.history_source
+                .as_ref()
+                .and_then(|v| pick_str(v, &["cliMsgId", "clientId", "client_message_id"]))
+                .filter(|s| !s.trim().is_empty() && s.trim() != "0")
+        })
+        .or_else(|| (msg.ts > 0).then(|| msg.ts.to_string()))
+        .unwrap_or_else(|| client_id.to_string());
 
     if is_group {
-        let clean_grid = to_id
-            .trim_start_matches("group_")
-            .trim_start_matches('g')
-            .trim_start_matches('G');
+        let clean_grid = clean_group_id(to_id);
         Ok(obj(&[
             ("msgId", json!(msg_id)),
             ("grid", json!(clean_grid)),
@@ -8548,6 +9294,8 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
         crate::message_model::MessageKind::Text
     };
 
+    let resolved_mention_uids = extract_resolved_mention_uids_from_wire(&content, it);
+
     Some(ChatMessage {
         kind: msg_kind,
         id: msg_id,
@@ -8585,6 +9333,7 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
             None
         },
         history_source,
+        resolved_mention_uids,
 
         ..Default::default()
     })
@@ -9616,39 +10365,73 @@ fn board_reject_nonzero(resp: Value) -> Result<Value> {
     Ok(resp)
 }
 
+fn wire_msg_type_for_pin(msg: &ChatMessage) -> String {
+    if let Some(t) = msg
+        .wire_ref
+        .original_type
+        .as_ref()
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+    {
+        return t.trim().to_string();
+    }
+    match msg.kind {
+        crate::message_model::MessageKind::Sticker => "chat.sticker",
+        crate::message_model::MessageKind::Photo => "chat.photo",
+        crate::message_model::MessageKind::Video => "chat.video.msg",
+        crate::message_model::MessageKind::Voice => "chat.voice",
+        crate::message_model::MessageKind::File => "share.file",
+        crate::message_model::MessageKind::Link => "chat.link",
+        _ => "webchat",
+    }
+    .to_string()
+}
+
 /// Topic `params` object for a pinned message, using the field names Zalo reads back
 /// (`params.global_msg_id`, `params.client_msg_id`, `params.senderUid`, `params.msg_type`,
 /// `params.title` — `getTopicDataFromMessage` in `compact-app-pc.js`).
-fn message_topic_params(msg: &ChatMessage, thread_id: &str) -> Value {
-    let title = if msg.sticker_id.is_some() {
-        "[Nhãn dán]".to_string()
+pub(crate) fn message_topic_params(msg: &ChatMessage, thread_id: &str, my_uid: &str) -> Value {
+    let raw_title = if msg.text.trim().is_empty() || msg.sticker_id.is_some() {
+        format_message_quote_preview(msg)
     } else {
-        let trimmed = msg.text.trim();
-        let mut s: String = trimmed.chars().take(120).collect();
-        if trimmed.chars().count() > 120 {
-            s.push('…');
-        }
-        if s.is_empty() {
-            "[Tin nhắn]".to_string()
-        } else {
-            s
-        }
+        msg.text.trim().to_string()
     };
+    let mut title: String = raw_title.chars().take(120).collect();
+    if raw_title.chars().count() > 120 {
+        title.push('…');
+    }
+    if title.is_empty() {
+        title = "[Tin nhắn]".to_string();
+    }
     let sender = if msg.is_outgoing {
-        "0".to_string()
+        let trimmed = my_uid.trim();
+        if trimmed.is_empty() {
+            "0".to_string()
+        } else {
+            trimmed.to_string()
+        }
     } else {
         sidebar_sender_id(msg).unwrap_or_else(|| thread_id.to_string())
     };
+    let global_id = server_message_id(msg).unwrap_or_else(|| msg.id.clone());
+    let cli_id = client_message_id(msg).unwrap_or_else(|| msg.client_message_id.clone());
     json!({
-        "global_msg_id": msg.id,
-        "client_msg_id": msg.client_message_id,
+        "global_msg_id": global_id,
+        "client_msg_id": cli_id,
         "senderUid": sender,
+        "msg_type": wire_msg_type_for_pin(msg),
         "title": title,
         "createTime": msg.ts,
     })
 }
 
-fn board_topic_body(grid: &str, thread_id: &str, msg: &ChatMessage, imei: &str) -> Value {
+fn board_topic_body(
+    grid: &str,
+    thread_id: &str,
+    msg: &ChatMessage,
+    my_uid: &str,
+    imei: &str,
+) -> Value {
     json!({
         "grid": grid,
         "type": MSG_TOPIC,
@@ -9656,7 +10439,7 @@ fn board_topic_body(grid: &str, thread_id: &str, msg: &ChatMessage, imei: &str) 
         "emoji": "",
         "startTime": -1,
         "duration": -1,
-        "params": message_topic_params(msg, thread_id).to_string(),
+        "params": message_topic_params(msg, thread_id, my_uid).to_string(),
         "needPin": true,
         "pinAct": 1,
         "repeat": 0,
@@ -9676,15 +10459,16 @@ pub async fn pin_message(
     is_group: bool,
     msg: &ChatMessage,
 ) -> Result<Value> {
-    if s.login.is_none() {
+    let Some(login) = s.login.as_ref() else {
         anyhow::bail!("chưa đăng nhập");
-    }
+    };
+    let my_uid = login.uin.as_str();
     let grid = board_grid(thread_id);
     let body = if is_group {
-        board_topic_body(&grid, thread_id, msg, &s.imei)
+        board_topic_body(&grid, thread_id, msg, my_uid, &s.imei)
     } else {
         // 1-1 uses the friend board: same topic fields, keyed by the peer uid.
-        let mut v = board_topic_body(&grid, thread_id, msg, &s.imei);
+        let mut v = board_topic_body(&grid, thread_id, msg, my_uid, &s.imei);
         if let Some(obj) = v.as_object_mut() {
             obj.remove("grid");
             obj.insert("uid".into(), json!(grid));
@@ -9823,6 +10607,113 @@ pub fn parse_board_topics(resp: &Value) -> Vec<BoardTopic> {
             collect_msg_ids(&params, &mut msg_ids);
         }
         out.push(BoardTopic { id, msg_ids });
+    }
+    out
+}
+
+/// Real-time pin/unpin board control notification from WebSocket `cmd 601` / `lp_control`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoardPinControlEvent {
+    pub thread_id: String,
+    pub is_group: bool,
+    pub topic_id: String,
+    pub msg_ids: Vec<String>,
+    pub pinned: bool,
+}
+
+/// Extract pin/unpin board control events (`pin_message`, `pin_topic`, `add_topic`, `create_topic`,
+/// `unpin_topic`, `unpin_message`, `delete_topic`, `remove_topic`) from WS/LP control payloads.
+pub fn extract_board_pin_controls(data_node: &Value) -> Vec<BoardPinControlEvent> {
+    let mut candidates: Vec<&Value> = Vec::new();
+    if let Some(arr) = data_node.get("controls").and_then(Value::as_array) {
+        candidates.extend(arr.iter());
+    } else if let Some(arr) = data_node.as_array() {
+        for item in arr {
+            if let Some(sub) = item.get("controls").and_then(Value::as_array) {
+                candidates.extend(sub.iter());
+            } else {
+                candidates.push(item);
+            }
+        }
+    } else {
+        candidates.push(data_node);
+    }
+
+    let mut out = Vec::new();
+    for item in candidates {
+        let parsed_c: Value;
+        let c = match item.get("content") {
+            Some(Value::String(s)) => {
+                parsed_c = serde_json::from_str::<Value>(s).unwrap_or(Value::Null);
+                &parsed_c
+            }
+            Some(other) => other,
+            None => item,
+        };
+        let act = c
+            .get("act_type")
+            .or_else(|| c.get("act"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let pinned = match act {
+            "pin_message" | "pin_topic" | "add_topic" | "create_topic" => true,
+            "unpin_topic" | "unpin_message" | "delete_topic" | "remove_topic" => false,
+            _ => continue,
+        };
+        let parsed_d: Value;
+        let d = match c.get("data") {
+            Some(Value::String(s)) => {
+                parsed_d = serde_json::from_str::<Value>(s).unwrap_or(Value::Null);
+                &parsed_d
+            }
+            Some(other) => other,
+            None => c,
+        };
+
+        let group_id = pick_str(d, &["groupId", "grid"])
+            .or_else(|| pick_str(c, &["groupId", "grid"]));
+        let peer_id = pick_str(d, &["uid", "toUid", "friendId", "fromUid"])
+            .or_else(|| pick_str(c, &["uid", "toUid", "friendId", "fromUid"]));
+        let (thread_id, is_group) = if let Some(gid) = group_id {
+            let clean = clean_group_id(&gid);
+            if clean.is_empty() {
+                continue;
+            }
+            (format!("group_{clean}"), true)
+        } else if let Some(uid) = peer_id {
+            if uid.is_empty() || uid == "0" {
+                continue;
+            }
+            (uid, false)
+        } else {
+            continue;
+        };
+
+        let topic_id = pick_str(d, &["topicId", "id"])
+            .or_else(|| d.pointer("/topic/id").and_then(file_id_key))
+            .or_else(|| pick_str(c, &["topicId", "id"]))
+            .unwrap_or_default();
+
+        let mut msg_ids = Vec::new();
+        collect_msg_ids(d, &mut msg_ids);
+        collect_msg_ids(c, &mut msg_ids);
+        for parent in [d, d.get("topic").unwrap_or(&Value::Null), c] {
+            if let Some(params) = parent.get("params") {
+                let parsed_p = match params {
+                    Value::String(txt) => serde_json::from_str::<Value>(txt).unwrap_or(Value::Null),
+                    other => other.clone(),
+                };
+                collect_msg_ids(&parsed_p, &mut msg_ids);
+            }
+        }
+
+        out.push(BoardPinControlEvent {
+            thread_id,
+            is_group,
+            topic_id,
+            msg_ids,
+            pinned,
+        });
     }
     out
 }
@@ -11424,6 +12315,63 @@ pub async fn set_hidden_conversation(
     Ok(s.maybe_decrypt(resp, s.session_key_bytes()).await)
 }
 
+/// Build the payload for deleting a conversation (`deleteconver`).
+pub(crate) fn build_delete_conversation_payload(
+    thread_id: &str,
+    is_group: bool,
+    owner_id: &str,
+    last_cli_msg_id: &str,
+    last_global_msg_id: &str,
+    imei: &str,
+) -> Result<Value> {
+    let clean = if is_group {
+        clean_group_id(thread_id)
+    } else {
+        thread_id.trim()
+    };
+    if clean.is_empty() {
+        anyhow::bail!("thread ID không hợp lệ");
+    }
+    let fallback_ts = format!("{}", crate::login::unix_now() * 1000);
+    let cli_id = if last_cli_msg_id.trim().is_empty() || last_cli_msg_id.trim() == "0" {
+        fallback_ts.as_str()
+    } else {
+        last_cli_msg_id.trim()
+    };
+    let global_id = if last_global_msg_id.trim().is_empty() || last_global_msg_id.trim() == "0" {
+        cli_id
+    } else {
+        last_global_msg_id.trim()
+    };
+    let owner = if owner_id.trim().is_empty() {
+        clean
+    } else {
+        owner_id.trim()
+    };
+    let conver = json!({
+        "ownerId": owner,
+        "cliMsgId": cli_id,
+        "globalMsgId": global_id,
+    });
+    if is_group {
+        Ok(json!({
+            "grid": clean,
+            "cliMsgId": cli_id,
+            "conver": conver,
+            "onlyMe": 1,
+            "imei": imei
+        }))
+    } else {
+        Ok(json!({
+            "toid": clean,
+            "cliMsgId": cli_id,
+            "conver": conver,
+            "onlyMe": 1,
+            "imei": imei
+        }))
+    }
+}
+
 /// Delete conversation history for me (`deleteOneOneConversationV2` / `deleteGroupConversationV2` @ `compact-app-pc.js:14374881`, cmd `11778` / `11835`).
 pub async fn delete_conversation(
     s: &Session,
@@ -11431,52 +12379,71 @@ pub async fn delete_conversation(
     is_group: bool,
     last_cli_msg_id: &str,
 ) -> Result<Value> {
+    delete_conversation_with_meta(s, thread_id, is_group, "", last_cli_msg_id, "").await
+}
+
+/// Delete conversation history with full `conver` metadata (`ownerId`, `cliMsgId`, `globalMsgId`),
+/// failing explicitly when the server returns a non-zero `error_code`.
+pub async fn delete_conversation_with_meta(
+    s: &Session,
+    thread_id: &str,
+    is_group: bool,
+    owner_id: &str,
+    last_cli_msg_id: &str,
+    last_global_msg_id: &str,
+) -> Result<Value> {
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
-    let clean = thread_id
-        .trim_start_matches("group_")
-        .trim_start_matches('g')
-        .trim_start_matches('G')
-        .trim();
-    let cli_id = if last_cli_msg_id.is_empty() {
-        format!("{}", crate::login::unix_now() * 1000)
-    } else {
-        last_cli_msg_id.to_string()
-    };
-    if is_group {
-        let body = json!({
-            "grid": clean,
-            "cliMsgId": cli_id,
-            "conver": {},
-            "onlyMe": 1,
-            "imei": s.imei
-        });
-        let params = s.encoded_params(&body)?;
-        let url = format!(
+    let body = build_delete_conversation_payload(
+        thread_id,
+        is_group,
+        owner_id,
+        last_cli_msg_id,
+        last_global_msg_id,
+        &s.imei,
+    )?;
+    let params = s.encoded_params(&body)?;
+    let url = if is_group {
+        format!(
             "{}/api/group/deleteconver?{}",
             s.domains.group,
             s.common_params()
-        );
-        let resp = s.post_form(&url, format!("params={params}")).await?;
-        Ok(s.maybe_decrypt(resp, s.session_key_bytes()).await)
+        )
     } else {
-        let body = json!({
-            "toid": clean,
-            "cliMsgId": cli_id,
-            "conver": {},
-            "onlyMe": 1,
-            "imei": s.imei
-        });
-        let params = s.encoded_params(&body)?;
-        let url = format!(
+        format!(
             "{}/api/message/deleteconver?{}",
             s.domains.chat,
             s.common_params()
-        );
-        let resp = s.post_form(&url, format!("params={params}")).await?;
-        Ok(s.maybe_decrypt(resp, s.session_key_bytes()).await)
+        )
+    };
+    let resp = s.post_form(&url, format!("params={params}")).await?;
+    let dec = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+    if let Some(code) = dec.get("error_code").and_then(Value::as_i64) {
+        if code != 0 {
+            let msg = dec
+                .get("error_message")
+                .and_then(Value::as_str)
+                .filter(|m| !m.trim().is_empty())
+                .unwrap_or("Không thể xóa cuộc trò chuyện");
+            anyhow::bail!("{msg} (mã {code})");
+        }
     }
+    Ok(dec)
+}
+
+/// Build the payload for leaving a group (`/api/group/leave`).
+pub(crate) fn build_leave_group_payload(grid: &str, silent: bool, imei: &str) -> Result<Value> {
+    let clean = clean_group_id(grid);
+    if clean.is_empty() {
+        anyhow::bail!("group ID không hợp lệ");
+    }
+    Ok(json!({
+        "grids": [clean],
+        "imei": imei,
+        "silent": if silent { 1 } else { 0 },
+        "language": "vi"
+    }))
 }
 
 /// Leave a Zalo group: `POST {domains.group}/api/group/leave?{common}` (commandId 11189).
@@ -11485,20 +12452,7 @@ pub async fn leave_group(s: &Session, grid: &str, silent: bool) -> Result<Value>
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
-    let clean = grid
-        .trim()
-        .trim_start_matches("g_")
-        .trim_start_matches("group_")
-        .trim();
-    if clean.is_empty() {
-        anyhow::bail!("group ID không hợp lệ");
-    }
-    let body = json!({
-        "grids": [clean],
-        "imei": s.imei,
-        "silent": if silent { 1 } else { 0 },
-        "language": "vi"
-    });
+    let body = build_leave_group_payload(grid, silent, &s.imei)?;
     let params = s.encoded_params(&body)?;
     let url = format!(
         "{}/api/group/leave?{}",
@@ -11513,6 +12467,45 @@ pub async fn leave_group(s: &Session, grid: &str, silent: bool) -> Result<Value>
                 .get("error_message")
                 .and_then(Value::as_str)
                 .unwrap_or("Không thể rời nhóm");
+            anyhow::bail!("{msg} (mã {code})");
+        }
+    }
+    Ok(resp)
+}
+
+/// Build the payload for disbanding/deleting a group as the group creator (`/api/group/disperse`).
+pub(crate) fn build_disperse_group_payload(grid: &str, imei: &str) -> Result<Value> {
+    let clean = clean_group_id(grid);
+    if clean.is_empty() {
+        anyhow::bail!("group ID không hợp lệ");
+    }
+    Ok(json!({
+        "grid": clean,
+        "imei": imei,
+    }))
+}
+
+/// Disband / permanently delete a Zalo group as the group creator (`POST {domains.group}/api/group/disperse`).
+pub async fn disperse_group(s: &Session, grid: &str) -> Result<Value> {
+    if s.login.is_none() {
+        anyhow::bail!("chưa đăng nhập");
+    }
+    let body = build_disperse_group_payload(grid, &s.imei)?;
+    let params = s.encoded_params(&body)?;
+    let url = format!(
+        "{}/api/group/disperse?{}",
+        s.domains.group,
+        s.common_params()
+    );
+    let resp = s.post_form(&url, format!("params={params}")).await?;
+    let resp = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+    if let Some(code) = resp.get("error_code").and_then(Value::as_i64) {
+        if code != 0 {
+            let msg = resp
+                .get("error_message")
+                .and_then(Value::as_str)
+                .filter(|m| !m.trim().is_empty())
+                .unwrap_or("Không thể giải tán nhóm");
             anyhow::bail!("{msg} (mã {code})");
         }
     }
@@ -14274,5 +15267,273 @@ mod send_identity_tests {
         let parsed = parse_chat_message(&wire).expect("should parse quoted photo reply");
         assert_eq!(parsed.reply_to_sender.as_deref(), Some("Anh Khoa"));
         assert_eq!(parsed.reply_to_text.as_deref(), Some("[Hình ảnh]"));
+    }
+
+    #[test]
+    fn hz05_file_done_stringified_json_and_asyncfile_payload_validation() {
+        let ctrl = json!({
+            "controls": [
+                {
+                    "content": "{\"act_type\":\"file_done\",\"fileId\":998877,\"data\":\"{\\\"url\\\":\\\"https://f16-zpc.zdn.vn/files/report.pdf\\\"}\"}"
+                }
+            ]
+        });
+        let parsed = extract_file_done_controls(&ctrl);
+        assert_eq!(
+            parsed,
+            vec![(
+                "998877".to_string(),
+                "https://f16-zpc.zdn.vn/files/report.pdf".to_string()
+            )]
+        );
+
+        // Reject empty fileUrl and placeholder fileId "-1"
+        assert!(build_asyncfile_msg_payload(
+            "123456",
+            true,
+            "998877",
+            "",
+            "report.pdf",
+            "pdf",
+            1024,
+            json!(555),
+            "md5hex",
+            "sha256hex",
+            false,
+            "pc-imei",
+        )
+        .is_err());
+        assert!(build_asyncfile_msg_payload(
+            "123456",
+            false,
+            "-1",
+            "https://f16-zpc.zdn.vn/files/report.pdf",
+            "report.pdf",
+            "pdf",
+            1024,
+            json!(555),
+            "md5hex",
+            "sha256hex",
+            false,
+            "pc-imei",
+        )
+        .is_err());
+
+        let ok_group = build_asyncfile_msg_payload(
+            "123456",
+            true,
+            "998877",
+            "https://f16-zpc.zdn.vn/files/report.pdf",
+            "report.pdf",
+            "pdf",
+            2048,
+            json!(555),
+            "md5hex",
+            "sha256hex",
+            false,
+            "pc-imei",
+        )
+        .expect("valid group asyncfile payload");
+        assert_eq!(ok_group["grid"], "123456");
+        assert_eq!(ok_group["visibility"], 0);
+        assert_eq!(ok_group["extension"], "pdf");
+        assert!(ok_group.get("extention").is_none());
+        assert_eq!(ok_group["checksum"], "md5hex");
+        assert_eq!(ok_group["checksumSha"], "sha256hex");
+        assert_eq!(ok_group["imei"], "pc-imei");
+        assert_eq!(ok_group["fileUrl"], "https://f16-zpc.zdn.vn/files/report.pdf");
+
+        let file_msg = ChatMessage {
+            kind: crate::message_model::MessageKind::File,
+            link_url: Some("https://f16-zpc.zdn.vn/renewMedia?p=abc".into()),
+            link_src: Some("Tập tin Zalo".into()),
+            ..Default::default()
+        };
+        assert!(is_forwardable_file_message(&file_msg));
+
+        let photo_msg = ChatMessage {
+            kind: crate::message_model::MessageKind::Photo,
+            link_url: Some("https://photo-stal-zmp.zdn.vn/jpg/1/2.jpg".into()),
+            link_src: Some("Hình ảnh Zalo".into()),
+            ..Default::default()
+        };
+        assert!(!is_forwardable_file_message(&photo_msg));
+    }
+
+    #[test]
+    fn hz11_build_wire_mentions_utf16_offsets_and_group_payload() {
+        // Surrogate-pair emoji "😊" takes 2 UTF-16 code units.
+        let text = "Chào 😊 @Phạm Đức Hiếu và @All nhé";
+        let pending = vec![
+            OutgoingMention {
+                uid: "1001".into(),
+                display_name: "Phạm Đức Hiếu".into(),
+                is_all: false,
+            },
+            OutgoingMention {
+                uid: "-1".into(),
+                display_name: "All".into(),
+                is_all: true,
+            },
+            OutgoingMention {
+                uid: "9999".into(),
+                display_name: "Đã Xoá".into(),
+                is_all: false,
+            },
+        ];
+        let mentions = build_wire_mentions(text, &pending, &[]);
+        assert_eq!(mentions.len(), 2);
+        assert_eq!(
+            mentions[0],
+            WireMention {
+                uid: "1001".into(),
+                pos: "Chào 😊 ".encode_utf16().count(),
+                len: "@Phạm Đức Hiếu".encode_utf16().count(),
+                r#type: 0,
+            }
+        );
+        assert_eq!(
+            mentions[1],
+            WireMention {
+                uid: "-1".into(),
+                pos: "Chào 😊 @Phạm Đức Hiếu và ".encode_utf16().count(),
+                len: "@All".encode_utf16().count(),
+                r#type: 1,
+            }
+        );
+
+        // Fallback member scan when pending is empty
+        let members = vec![("2002".to_string(), "Nguyễn văn an".to_string())];
+        let scanned = build_wire_mentions("Nhờ @Nguyễn văn an kiểm tra", &[], &members);
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(scanned[0].uid, "2002");
+        assert_eq!(scanned[0].pos, 4);
+        assert_eq!(scanned[0].len, "@Nguyễn văn an".encode_utf16().count());
+
+        let (body, ep) =
+            build_group_mention_payload("group_777", text, &mentions, 12345, "pc-imei");
+        assert_eq!(ep, "/api/group/mention");
+        assert_eq!(body["grid"], "777");
+        let parsed_info: Vec<WireMention> =
+            serde_json::from_str(body["mentionInfo"].as_str().unwrap()).unwrap();
+        assert_eq!(parsed_info, mentions);
+
+        let (_plain_body, plain_ep) =
+            build_group_mention_payload("g777", "Hello", &[], 12345, "pc-imei");
+        assert_eq!(plain_ep, "/api/group/sendmsg");
+
+        // Extract wire mention spans back into UTF-8 byte indices
+        let mut msg = ChatMessage {
+            text: "Nhờ @Nguyễn văn an kiểm tra".into(),
+            ..Default::default()
+        };
+        msg.wire_ref
+            .fields
+            .insert("mentions".into(), serde_json::to_value(&scanned).unwrap());
+        let spans = extract_wire_mention_spans(&msg);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(&msg.text[spans[0].0..spans[0].1], "@Nguyễn văn an");
+    }
+
+    #[test]
+    fn hz12_message_topic_params_and_ws_pin_controls() {
+        let mut msg = ChatMessage {
+            id: "1700000001".into(),
+            client_message_id: "1700000001".into(),
+            sender: "Tôi".into(),
+            text: "".into(),
+            kind: crate::message_model::MessageKind::Photo,
+            is_outgoing: true,
+            ts: 1700000001000,
+            ..Default::default()
+        };
+        msg.wire_ref.server_id = Some(json!("888899990001"));
+        msg.wire_ref.client_id = Some(json!("1700000001"));
+        let params = message_topic_params(&msg, "group_42", "555000111");
+        assert_eq!(params["global_msg_id"], "888899990001");
+        assert_eq!(params["client_msg_id"], "1700000001");
+        assert_eq!(params["senderUid"], "555000111");
+        assert_eq!(params["msg_type"], "chat.photo");
+        assert_eq!(params["title"], "[Hình ảnh]");
+
+        let ws_pin = json!({
+            "controls": [
+                {
+                    "content": "{\"act_type\":\"pin_message\",\"data\":{\"groupId\":\"42\",\"topicId\":\"t_99\",\"params\":\"{\\\"global_msg_id\\\":\\\"888899990001\\\"}\"}}"
+                },
+                {
+                    "content": {
+                        "act_type": "unpin_topic",
+                        "data": { "uid": "1002", "topicId": "t_100" }
+                    }
+                }
+            ]
+        });
+        let evs = extract_board_pin_controls(&ws_pin);
+        assert_eq!(evs.len(), 2);
+        assert_eq!(evs[0].thread_id, "group_42");
+        assert!(evs[0].is_group);
+        assert!(evs[0].pinned);
+        assert_eq!(evs[0].topic_id, "t_99");
+        assert_eq!(evs[0].msg_ids, vec!["888899990001".to_string()]);
+        assert_eq!(evs[1].thread_id, "1002");
+        assert!(!evs[1].is_group);
+        assert!(!evs[1].pinned);
+        assert_eq!(evs[1].topic_id, "t_100");
+    }
+
+    #[test]
+    fn hz10_recall_resolves_wire_server_id_and_enforces_24h_limit() {
+        let mut msg = ChatMessage {
+            id: "1795000001".into(),
+            client_message_id: "1795000001".into(),
+            is_outgoing: true,
+            ts: 1_795_000_001_000,
+            ..Default::default()
+        };
+        msg.wire_ref.server_id = Some(json!("8518773499999"));
+        msg.wire_ref.client_id = Some(json!("1795000001"));
+        let payload = build_recall_payload("g324715395", true, &msg, 1_795_000_100_000, "pc-imei")
+            .expect("should resolve server id from wire_ref");
+        assert_eq!(payload["msgId"], "8518773499999");
+        assert_eq!(payload["cliMsgIdUndo"], "1795000001");
+        assert_eq!(payload["grid"], "324715395");
+
+        assert!(can_recall_message(&msg, 1_795_000_001_000 + 3_600_000));
+        assert!(!can_recall_message(
+            &msg,
+            1_795_000_001_000 + 25 * 3_600_000
+        ));
+    }
+
+    #[test]
+    fn hz13_group_id_normalization_disperse_leave_and_delete_conver_payloads() {
+        assert_eq!(clean_group_id("group_12345"), "12345");
+        assert_eq!(clean_group_id("g_12345"), "12345");
+        assert_eq!(clean_group_id("g12345"), "12345");
+        assert_eq!(clean_group_id("G12345"), "12345");
+
+        let disp = build_disperse_group_payload("g987654", "pc-imei").unwrap();
+        assert_eq!(disp["grid"], "987654");
+        assert_eq!(disp["imei"], "pc-imei");
+
+        let leave = build_leave_group_payload("g987654", true, "pc-imei").unwrap();
+        assert_eq!(leave["grids"], json!(["987654"]));
+        assert_eq!(leave["silent"], 1);
+
+        let del = build_delete_conversation_payload(
+            "group_987654",
+            true,
+            "owner_1",
+            "1700001",
+            "8500001",
+            "pc-imei",
+        )
+        .unwrap();
+        assert_eq!(del["grid"], "987654");
+        assert_eq!(del["cliMsgId"], "1700001");
+        assert_eq!(del["conver"]["ownerId"], "owner_1");
+        assert_eq!(del["conver"]["cliMsgId"], "1700001");
+        assert_eq!(del["conver"]["globalMsgId"], "8500001");
     }
 }

@@ -534,12 +534,14 @@ pub enum WorkerCmd {
         to_id: String,
         text: String,
         is_group: bool,
+        mentions: Vec<crate::chat::WireMention>,
     },
     SendQuote {
         to_id: String,
         text: String,
         quoted: ChatMessage,
         is_group: bool,
+        mentions: Vec<crate::chat::WireMention>,
     },
     Forward {
         target_id: String,
@@ -749,12 +751,18 @@ pub enum WorkerCmd {
     DeleteThread {
         thread_id: String,
         is_group: bool,
+        owner_id: String,
         last_cli_msg_id: String,
+        last_global_msg_id: String,
     },
     /// Rời nhóm Zalo (endpoint `/api/group/leave`, cmd 11189)
     LeaveGroup {
         group_id: String,
         silent: bool,
+    },
+    /// Giải tán nhóm (chỉ trưởng nhóm, `/api/group/disperse`)
+    DisperseGroup {
+        group_id: String,
     },
     FetchSocialProfile {
         target_uid: String,
@@ -889,13 +897,25 @@ fn build_qr_color_image(q: &crate::qr::QrLogin) -> Option<egui::ColorImage> {
 }
 
 pub(super) fn extract_msg_id(resp: &serde_json::Value) -> String {
+    let pick = |node: &serde_json::Value| -> Option<String> {
+        ["msgId", "globalMsgId", "realMsgId"]
+            .iter()
+            .find_map(|k| node.get(*k))
+            .and_then(|v| match v {
+                serde_json::Value::String(s) => {
+                    let t = s.trim();
+                    (!t.is_empty() && t != "0").then(|| t.to_string())
+                }
+                serde_json::Value::Number(n) => {
+                    let s = n.to_string();
+                    (s != "0").then_some(s)
+                }
+                _ => None,
+            })
+    };
     resp.get("data")
-        .and_then(|d| d.get("msgId"))
-        .and_then(|v| match v {
-            serde_json::Value::String(s) => Some(s.clone()),
-            serde_json::Value::Number(n) => Some(n.to_string()),
-            _ => None,
-        })
+        .and_then(pick)
+        .or_else(|| pick(resp))
         .unwrap_or_default()
 }
 
@@ -1367,6 +1387,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                         to_id: o.thread_id.clone(),
                                                         text: o.text.clone(),
                                                         is_group,
+                                                        mentions: Vec::new(),
                                                     });
                                                 }
                                             }
@@ -1427,6 +1448,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                 ));
 
                 // 1) Real-time `zpw_ws` WebSocket loop for instant chat messages + VoIP events
+                crate::chat::mark_file_done_listener_active();
                 {
                     let s_ws = session.clone();
                     let cb = call_bridge.clone();
@@ -1506,6 +1528,14 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                 cb.handle_control_event(voip_ev);
                                             }
                                             crate::chat::dispatch_file_done_controls(data_node);
+                                            let pin_evs =
+                                                crate::chat::extract_board_pin_controls(data_node);
+                                            if !pin_evs.is_empty() {
+                                                let _ = gui_tx_ws.send(
+                                                    GuiEvent::BoardPinControlsReceived(pin_evs),
+                                                );
+                                                ctx_ws.request_repaint();
+                                            }
                                             let mute_evs = crate::chat::extract_mute_controls(
                                                 data_node,
                                                 crate::login::unix_now() as i64,
@@ -1933,6 +1963,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                         } => {
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
                             tokio::spawn(async move {
                                 let s = session_clone.lock().await.clone();
                                 let result =
@@ -1946,6 +1977,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                     topics,
                                     error,
                                 });
+                                ctx_clone.request_repaint();
                             });
                         }
                         WorkerCmd::FetchPoll { poll_id } => {
@@ -2013,6 +2045,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                         } => {
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
                             tokio::spawn(async move {
                                 let s = session_clone.lock().await.clone();
                                 let result = if pin {
@@ -2062,6 +2095,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                         });
                                     }
                                 }
+                                ctx_clone.request_repaint();
                             });
                         }
                         WorkerCmd::PinThread {
@@ -2206,18 +2240,43 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                         WorkerCmd::DeleteThread {
                             thread_id,
                             is_group,
+                            owner_id,
                             last_cli_msg_id,
+                            last_global_msg_id,
                         } => {
                             let session_clone = session.clone();
+                            let gui_tx_clone = gui_tx.clone();
+                            let egui_ctx_clone = egui_ctx.clone();
                             tokio::spawn(async move {
                                 let s = session_clone.lock().await.clone();
-                                let _ = crate::chat::delete_conversation(
+                                match crate::chat::delete_conversation_with_meta(
                                     &s,
                                     &thread_id,
                                     is_group,
+                                    &owner_id,
                                     &last_cli_msg_id,
+                                    &last_global_msg_id,
                                 )
-                                .await;
+                                .await
+                                {
+                                    Ok(_) => {
+                                        let _ = gui_tx_clone.send(GuiEvent::ThreadDeleted {
+                                            thread_id,
+                                            success: true,
+                                            error: None,
+                                        });
+                                    }
+                                    Err(e) => {
+                                        let err_s = e.to_string();
+                                        crate::logger::log_error("gui::delete_thread", &err_s);
+                                        let _ = gui_tx_clone.send(GuiEvent::ThreadDeleted {
+                                            thread_id,
+                                            success: false,
+                                            error: Some(err_s),
+                                        });
+                                    }
+                                }
+                                egui_ctx_clone.request_repaint();
                             });
                         }
                         WorkerCmd::LeaveGroup { group_id, silent } => {
@@ -2245,6 +2304,34 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                         egui_ctx_clone.request_repaint();
                                     }
                                 }
+                            });
+                        }
+                        WorkerCmd::DisperseGroup { group_id } => {
+                            let session_clone = session.clone();
+                            let gui_tx_clone = gui_tx.clone();
+                            let egui_ctx_clone = egui_ctx.clone();
+                            let gid = group_id.clone();
+                            tokio::spawn(async move {
+                                let s = session_clone.lock().await.clone();
+                                match crate::chat::disperse_group(&s, &gid).await {
+                                    Ok(_) => {
+                                        let _ = gui_tx_clone.send(GuiEvent::GroupDispersed {
+                                            group_id: gid,
+                                            success: true,
+                                            error: None,
+                                        });
+                                    }
+                                    Err(e) => {
+                                        let err_s = e.to_string();
+                                        crate::logger::log_error("gui::disperse_group", &err_s);
+                                        let _ = gui_tx_clone.send(GuiEvent::GroupDispersed {
+                                            group_id: gid,
+                                            success: false,
+                                            error: Some(err_s),
+                                        });
+                                    }
+                                }
+                                egui_ctx_clone.request_repaint();
                             });
                         }
                         WorkerCmd::RequestQr => {
@@ -3455,6 +3542,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             to_id,
                             text,
                             is_group,
+                            mentions,
                         } => {
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
@@ -3474,8 +3562,9 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                         });
                                     let _ =
                                         gui_tx_clone.send(GuiEvent::LinkPreviewReady(meta.clone()));
-                                    match crate::chat::send_link_message_with_client_id(
-                                        &s, &to_id, &text, &meta, is_group, client_id)
+                                    match crate::chat::send_link_message_with_mentions(
+                                        &s, &to_id, &text, &meta, is_group, &mentions, client_id,
+                                    )
                                     .await
                                     {
                                         Ok(resp) => {
@@ -3486,7 +3575,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                             } else {
                                                 msg_id
                                             };
-                                            let msg = ChatMessage {
+                                            let mut msg = ChatMessage {
                                                 id: final_id,
                                                 client_message_id: client_id.to_string(),
                                                 sender: "Tôi".into(),
@@ -3518,6 +3607,11 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                 },
                                                 ..Default::default()
                                             };
+                                            if !mentions.is_empty() {
+                                                if let Ok(val) = serde_json::to_value(&mentions) {
+                                                    msg.wire_ref.fields.insert("mentions".into(), val);
+                                                }
+                                            }
                                             let _ = gui_tx_clone.send(GuiEvent::AttachmentSent {
                                                 thread_id: to_id,
                                                 msg,
@@ -3540,19 +3634,32 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 }
 
                                 let res = if is_group {
-                                    crate::chat::send_group_message_with_client_id(&s, &to_id, &text, client_id).await
+                                    crate::chat::send_group_message_with_mentions(
+                                        &s, &to_id, &text, &mentions, client_id,
+                                    )
+                                    .await
                                 } else {
                                     crate::chat::send_message_with_client_id(&s, &to_id, &text, client_id).await
                                 };
                                 match res {
                                     Ok(resp) => {
                                         let msg_id = extract_msg_id(&resp);
-                                        let _ = gui_tx_clone.send(GuiEvent::MessageSent {
-                                            client_message_id: client_id.to_string(),
-                                            thread_id: to_id,
-                                            text,
-                                            msg_id,
-                                        });
+                                        if mentions.is_empty() {
+                                            let _ = gui_tx_clone.send(GuiEvent::MessageSent {
+                                                client_message_id: client_id.to_string(),
+                                                thread_id: to_id,
+                                                text,
+                                                msg_id,
+                                            });
+                                        } else {
+                                            let _ = gui_tx_clone.send(GuiEvent::MentionMessageSent {
+                                                client_message_id: client_id.to_string(),
+                                                thread_id: to_id,
+                                                text,
+                                                msg_id,
+                                                mentions,
+                                            });
+                                        }
                                         ctx_clone.request_repaint();
                                     }
                                     Err(e) => {
@@ -3602,6 +3709,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             text,
                             quoted,
                             is_group,
+                            mentions,
                         } => {
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
@@ -3609,8 +3717,9 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             tokio::spawn(async move {
                                 let s = session_clone.lock().await.clone();
                                 let client_id = crate::chat::next_client_message_id();
-                                match crate::chat::send_quote_message_with_client_id(
-                                    &s, &to_id, &text, &quoted, is_group, client_id)
+                                match crate::chat::send_quote_message_with_mentions(
+                                    &s, &to_id, &text, &quoted, is_group, &mentions, client_id,
+                                )
                                 .await
                                 {
                                     Ok(resp) => {
@@ -3620,6 +3729,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                             text,
                                             msg_id: extract_msg_id(&resp),
                                             quoted,
+                                            mentions,
                                         });
                                     }
                                     Err(e) => {
@@ -3647,14 +3757,26 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             tokio::spawn(async move {
                                 let s = session_clone.lock().await.clone();
                                 let client_id = crate::chat::next_client_message_id();
-                                let res = crate::chat::forward_message_with_client_id(
+                                let res = crate::chat::forward_message_detailed_with_client_id(
                                     &s,
                                     &target_id,
                                     target_is_group,
-                                    &msg, client_id)
+                                    &msg,
+                                    client_id,
+                                )
                                 .await;
                                 match res {
-                                    Ok(resp) if resp_error_code(&resp).is_none() => {
+                                    Ok((resp, Some(sent_cm))) if resp_error_code(&resp).is_none() => {
+                                        let _ = gui_tx_clone.send(GuiEvent::AttachmentSent {
+                                            thread_id: target_id.clone(),
+                                            msg: sent_cm,
+                                        });
+                                        let _ = gui_tx_clone.send(GuiEvent::ForwardFinished {
+                                            target_name: target_name.clone(),
+                                            error: None,
+                                        });
+                                    }
+                                    Ok((resp, None)) if resp_error_code(&resp).is_none() => {
                                         let msg_id = extract_msg_id(&resp);
                                         if let Some(sid) = msg.sticker_id.filter(|v| *v > 0) {
                                             let _ = gui_tx_clone.send(GuiEvent::StickerSent {
@@ -3665,14 +3787,23 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                 cate_id: msg.sticker_cate_id.unwrap_or(0),
                                                 sticker_type: msg.sticker_type.unwrap_or(7),
                                             });
-                                        } else if msg.link_url.is_some() {
-                                            let clean_text = if let Some(stripped) = msg.text.strip_prefix("[Đã thu hồi] ") {
-                                                stripped
-                                            } else {
-                                                &msg.text
-                                            };
+                                        } else if (msg.kind == crate::message_model::MessageKind::Link
+                                            || msg.kind == crate::message_model::MessageKind::WebContent)
+                                            && msg.link_url.is_some()
+                                            && (msg.link_title.is_some()
+                                                || msg.link_thumb.is_some()
+                                                || msg.link_desc.is_some())
+                                        {
+                                            let clean_text = msg
+                                                .text
+                                                .strip_prefix("[Đã thu hồi] ")
+                                                .unwrap_or(&msg.text);
                                             let out_msg = ChatMessage {
-                                                id: if msg_id.is_empty() { format!("out_{client_id}") } else { msg_id },
+                                                id: if msg_id.is_empty() {
+                                                    format!("out_{client_id}")
+                                                } else {
+                                                    msg_id
+                                                },
                                                 client_message_id: client_id.to_string(),
                                                 sender: "Tôi".into(),
                                                 text: clean_text.to_string(),
@@ -3680,7 +3811,10 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                 is_outgoing: true,
                                                 ts: (crate::login::unix_now() * 1000) as i64,
                                                 delivery: crate::message_model::DeliveryState::ServerAccepted,
+                                                kind: crate::message_model::MessageKind::Link,
                                                 link_url: msg.link_url.clone(),
+                                                link_title: msg.link_title.clone(),
+                                                link_desc: msg.link_desc.clone(),
                                                 link_thumb: msg.link_thumb.clone(),
                                                 link_src: msg.link_src.clone(),
                                                 ..Default::default()
@@ -3690,15 +3824,12 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                 msg: out_msg,
                                             });
                                         } else {
-                                            let clean_text = if let Some(stripped) = msg.text.strip_prefix("[Đã thu hồi] ") {
-                                                stripped
-                                            } else {
-                                                &msg.text
-                                            };
+                                            let forward_text =
+                                                crate::chat::forward_content_for_message(&msg);
                                             let _ = gui_tx_clone.send(GuiEvent::MessageSent {
                                                 client_message_id: client_id.to_string(),
                                                 thread_id: target_id.clone(),
-                                                text: clean_text.to_string(),
+                                                text: forward_text,
                                                 msg_id,
                                             });
                                         }
@@ -3707,7 +3838,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                             error: None,
                                         });
                                     }
-                                    Ok(resp) => {
+                                    Ok((resp, _)) => {
                                         let err_s = format!(
                                             "server error {}",
                                             resp_error_code(&resp).unwrap_or(0)
@@ -3845,14 +3976,13 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             let ctx_clone = egui_ctx.clone();
                             tokio::spawn(async move {
                                 let s = session_clone.lock().await.clone();
-                                let local_only = msg.id.is_empty()
-                                    || msg.id.starts_with("out_")
-                                    || msg.id.starts_with("local_");
-                                if local_only {
-                                    let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(
-                                        "Không thể thu hồi: tin nhắn chưa có mã máy chủ, vui lòng thử lại sau vài giây"
+                                if crate::chat::resolve_recall_server_id(&msg).is_none() {
+                                    let _ = gui_tx_clone.send(GuiEvent::RecallFailed {
+                                        thread_id: to_id,
+                                        msg_id: msg.id.clone(),
+                                        error: "Tin nhắn chưa có mã máy chủ, vui lòng thử lại sau vài giây"
                                             .into(),
-                                    ));
+                                    });
                                     ctx_clone.request_repaint();
                                     return;
                                 }
@@ -3866,21 +3996,28 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                         });
                                     }
                                     Ok(resp) => {
-                                        let err_s = format!(
-                                            "server error {}",
-                                            resp_error_code(&resp).unwrap_or(-1)
-                                        );
+                                        let code = resp_error_code(&resp).unwrap_or(-1);
+                                        let msg_txt = resp
+                                            .get("error_message")
+                                            .and_then(serde_json::Value::as_str)
+                                            .filter(|m| !m.trim().is_empty())
+                                            .unwrap_or("máy chủ từ chối");
+                                        let err_s = format!("{msg_txt} (mã {code})");
                                         crate::logger::log_error("gui::recall", &err_s);
-                                        let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
-                                            "Thu hồi thất bại trên máy chủ: {err_s}"
-                                        )));
+                                        let _ = gui_tx_clone.send(GuiEvent::RecallFailed {
+                                            thread_id: to_id,
+                                            msg_id: msg.id.clone(),
+                                            error: err_s,
+                                        });
                                     }
                                     Err(e) => {
                                         let err_s = e.to_string();
                                         crate::logger::log_error("gui::recall", &err_s);
-                                        let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
-                                            "Thu hồi thất bại trên máy chủ: {err_s}"
-                                        )));
+                                        let _ = gui_tx_clone.send(GuiEvent::RecallFailed {
+                                            thread_id: to_id,
+                                            msg_id: msg.id.clone(),
+                                            error: err_s,
+                                        });
                                     }
                                 }
                                 ctx_clone.request_repaint();
@@ -6244,6 +6381,22 @@ mod tests {
                 25
             ),
             HistoryLoadOutcome::LoadedMore(5)
+        );
+    }
+
+    #[test]
+    fn extract_msg_id_reads_global_and_real_ids_from_data_or_top_level() {
+        assert_eq!(
+            super::extract_msg_id(&serde_json::json!({ "data": { "globalMsgId": 987654321 } })),
+            "987654321"
+        );
+        assert_eq!(
+            super::extract_msg_id(&serde_json::json!({ "realMsgId": "555111" })),
+            "555111"
+        );
+        assert_eq!(
+            super::extract_msg_id(&serde_json::json!({ "data": { "msgId": "0" } })),
+            ""
         );
     }
 }

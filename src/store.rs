@@ -284,6 +284,8 @@ impl MessageStore {
         Self::ensure_edit_history_schema(&conn)?;
         // Per-thread mini script workspace: bảng thread_scripts + thread_data + logs.
         Self::ensure_script_schema(&conn)?;
+        // Tombstones for locally deleted/left/dispersed threads so getlg/v4 doesn't resurrect them.
+        Self::ensure_deleted_threads_schema(&conn)?;
         let user_ver = conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))?;
         if user_ver < 1 {
             conn.execute_batch(
@@ -1542,6 +1544,60 @@ impl MessageStore {
         Ok(())
     }
 
+    fn ensure_deleted_threads_schema(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS deleted_threads (
+                thread_id TEXT PRIMARY KEY,
+                deleted_at_ts INTEGER NOT NULL
+            );",
+        )?;
+        Ok(())
+    }
+
+    /// Record a tombstone timestamp for a deleted, left, or dispersed conversation so `getlg/v4`
+    /// syncs do not resurrect it until a strictly newer message (`ts > deleted_at_ts`) arrives.
+    pub fn record_thread_deleted(&mut self, thread_id: &str, deleted_at_ts: i64) -> Result<()> {
+        if thread_id.is_empty() {
+            return Ok(());
+        }
+        Self::ensure_deleted_threads_schema(&self.conn)?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO deleted_threads (thread_id, deleted_at_ts) VALUES (?1, ?2)",
+            params![thread_id, deleted_at_ts],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a deleted-thread tombstone once fresh activity arrives for that thread.
+    pub fn clear_thread_deleted(&mut self, thread_id: &str) -> Result<()> {
+        if thread_id.is_empty() {
+            return Ok(());
+        }
+        Self::ensure_deleted_threads_schema(&self.conn)?;
+        self.conn.execute(
+            "DELETE FROM deleted_threads WHERE thread_id = ?1",
+            params![thread_id],
+        )?;
+        Ok(())
+    }
+
+    /// List all locally deleted/left/dispersed thread tombstones (`thread_id -> deleted_at_ts`).
+    pub fn list_deleted_threads(&self) -> std::collections::HashMap<String, i64> {
+        let mut out = std::collections::HashMap::new();
+        let Ok(mut stmt) = self
+            .conn
+            .prepare("SELECT thread_id, deleted_at_ts FROM deleted_threads")
+        else {
+            return out;
+        };
+        if let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))) {
+            for r in rows.flatten() {
+                out.insert(r.0, r.1);
+            }
+        }
+        out
+    }
+
     /// Delete an entire conversation and all its messages from local SQLite store (#24).
     pub fn delete_thread(&mut self, thread_id: &str) -> Result<()> {
         if thread_id.is_empty() {
@@ -2066,6 +2122,9 @@ impl MessageStore {
                 let mut link_src = None;
                 let mut oa_card: Option<crate::chat::OaRichCard> = None;
                 let mut media_group: Option<crate::chat::MediaGroupLayout> = None;
+                let mut client_message_id = String::new();
+                let mut board_topic_id = String::new();
+                let mut wire_ref = crate::message_model::WireMessageRef::default();
                 if !sm.raw_json.is_empty() {
                     // Expiry tombstone (`{"vanished":true}`): authoritative —
                     // keep the tombstone text, restore NO metadata, and never
@@ -2203,6 +2262,18 @@ impl MessageStore {
                         media_group = val
                             .get("media_group")
                             .and_then(|v| serde_json::from_value(v.clone()).ok());
+                        if let Some(cid) = val.get("client_message_id").and_then(|v| v.as_str()) {
+                            client_message_id = cid.to_string();
+                        }
+                        if let Some(btid) = val.get("board_topic_id").and_then(|v| v.as_str()) {
+                            board_topic_id = btid.to_string();
+                        }
+                        wire_ref.server_id = val.get("wire_server_id").cloned();
+                        wire_ref.client_id = val.get("wire_client_id").cloned();
+                        wire_ref.sender = val.get("wire_sender").cloned();
+                        if let Some(wm) = val.get("wire_mentions") {
+                            wire_ref.fields.insert("mentions".into(), wm.clone());
+                        }
                     }
                 }
                 let is_video_url = link_url.as_deref().is_some_and(|u| {
@@ -2251,6 +2322,8 @@ impl MessageStore {
                 }
                 let cm = ChatMessage {
                     id: sm.msg_id,
+                    client_message_id,
+                    wire_ref,
                     sender: if !sm.sender_name.is_empty() {
                         sm.sender_name
                     } else {
@@ -2275,6 +2348,7 @@ impl MessageStore {
                     reactions,
                     reaction_summaries,
                     is_pinned,
+                    board_topic_id,
                     is_starred,
                     edited: is_edited,
                     link_url,
@@ -2369,6 +2443,29 @@ impl MessageStore {
                         existing.reaction_summaries = cm.reaction_summaries;
                     }
                     existing.is_pinned = existing.is_pinned || cm.is_pinned;
+                    if existing.board_topic_id.is_empty() && !cm.board_topic_id.is_empty() {
+                        existing.board_topic_id = cm.board_topic_id.clone();
+                    }
+                    if (existing.client_message_id.is_empty() || existing.client_message_id == "0")
+                        && !cm.client_message_id.is_empty()
+                        && cm.client_message_id != "0"
+                    {
+                        existing.client_message_id = cm.client_message_id.clone();
+                    }
+                    if existing.wire_ref.server_id.is_none() && cm.wire_ref.server_id.is_some() {
+                        existing.wire_ref.server_id = cm.wire_ref.server_id.clone();
+                    }
+                    if existing.wire_ref.client_id.is_none() && cm.wire_ref.client_id.is_some() {
+                        existing.wire_ref.client_id = cm.wire_ref.client_id.clone();
+                    }
+                    if existing.wire_ref.sender.is_none() && cm.wire_ref.sender.is_some() {
+                        existing.wire_ref.sender = cm.wire_ref.sender.clone();
+                    }
+                    if !existing.wire_ref.fields.contains_key("mentions") {
+                        if let Some(wm) = cm.wire_ref.fields.get("mentions") {
+                            existing.wire_ref.fields.insert("mentions".into(), wm.clone());
+                        }
+                    }
                     existing.is_starred = existing.is_starred || cm.is_starred;
                     existing.edited = existing.edited || cm.edited;
                 } else {
@@ -2407,6 +2504,11 @@ impl From<&ChatMessage> for StoredMessage {
             match m.kind {
                 crate::message_model::MessageKind::Action => "chat.list.action".to_string(),
                 crate::message_model::MessageKind::WebContent => "chat.webcontent".to_string(),
+                crate::message_model::MessageKind::File => "share.file".to_string(),
+                crate::message_model::MessageKind::Video => "chat.video".to_string(),
+                crate::message_model::MessageKind::Voice => "chat.voice".to_string(),
+                crate::message_model::MessageKind::Photo => "chat.photo".to_string(),
+                crate::message_model::MessageKind::Link => "chat.link".to_string(),
                 _ => "chat.text".to_string(),
             }
         };
@@ -2430,6 +2532,30 @@ impl From<&ChatMessage> for StoredMessage {
         }
         if m.is_pinned {
             meta.insert("is_pinned".into(), serde_json::json!(true));
+        }
+        if !m.board_topic_id.is_empty() {
+            meta.insert(
+                "board_topic_id".into(),
+                serde_json::json!(m.board_topic_id),
+            );
+        }
+        if !m.client_message_id.trim().is_empty() && m.client_message_id.trim() != "0" {
+            meta.insert(
+                "client_message_id".into(),
+                serde_json::json!(m.client_message_id.trim()),
+            );
+        }
+        if let Some(ref srv) = m.wire_ref.server_id {
+            meta.insert("wire_server_id".into(), srv.clone());
+        }
+        if let Some(ref cli) = m.wire_ref.client_id {
+            meta.insert("wire_client_id".into(), cli.clone());
+        }
+        if let Some(ref snd) = m.wire_ref.sender {
+            meta.insert("wire_sender".into(), snd.clone());
+        }
+        if let Some(wm) = m.wire_ref.fields.get("mentions") {
+            meta.insert("wire_mentions".into(), wm.clone());
         }
         if m.is_starred {
             meta.insert("is_starred".into(), serde_json::json!(true));
@@ -4542,6 +4668,80 @@ mod tests {
         assert_eq!(name, "WAL Check");
 
         drop(reopened);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hz10_hz12_hz13_persists_pin_recall_wire_metadata_and_deleted_tombstones() {
+        let dir = std::env::temp_dir().join("hz_store_138_roundtrip_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("test.db");
+        let path = db_path.to_str().unwrap();
+
+        let mut st = MessageStore::open(path).unwrap();
+        let mut msg = ChatMessage {
+            id: "8518773499999".into(),
+            client_message_id: "1795000001".into(),
+            sender: "Tôi".into(),
+            text: "Tài liệu dự án".into(),
+            is_outgoing: true,
+            ts: 1_795_000_001_000,
+            is_pinned: true,
+            board_topic_id: "topic_42".into(),
+            kind: crate::message_model::MessageKind::File,
+            ..Default::default()
+        };
+        msg.wire_ref.server_id = Some(serde_json::json!("8518773499999"));
+        msg.wire_ref.client_id = Some(serde_json::json!("1795000001"));
+        msg.wire_ref.sender = Some(serde_json::json!("555000111"));
+        msg.wire_ref.fields.insert(
+            "mentions".into(),
+            serde_json::json!([{"uid":"1001","pos":0,"len":4,"type":0}]),
+        );
+
+        let mut sm = StoredMessage::from(&msg);
+        sm.thread_id = "group_99".into();
+        st.upsert_thread(&StoredThread {
+            thread_id: "group_99".into(),
+            name: "Nhóm 99".into(),
+            is_group: true,
+            last_ts: msg.ts,
+            ..Default::default()
+        })
+        .unwrap();
+        st.upsert_message(&sm).unwrap();
+
+        let mut threads = vec![Thread {
+            id: "group_99".into(),
+            name: "Nhóm 99".into(),
+            is_group: true,
+            ..Default::default()
+        }];
+        st.hydrate_threads(&mut threads, 50).unwrap();
+        assert_eq!(threads[0].messages.len(), 1);
+        let hydrated = &threads[0].messages[0];
+        assert_eq!(hydrated.client_message_id, "1795000001");
+        assert!(hydrated.is_pinned);
+        assert_eq!(hydrated.board_topic_id, "topic_42");
+        assert_eq!(
+            hydrated.wire_ref.server_id,
+            Some(serde_json::json!("8518773499999"))
+        );
+        assert_eq!(
+            hydrated.wire_ref.client_id,
+            Some(serde_json::json!("1795000001"))
+        );
+        assert!(hydrated.wire_ref.fields.contains_key("mentions"));
+
+        // Tombstone lifecycle
+        st.record_thread_deleted("group_99", 2_000_000).unwrap();
+        let tombstones = st.list_deleted_threads();
+        assert_eq!(tombstones.get("group_99").copied(), Some(2_000_000));
+        st.clear_thread_deleted("group_99").unwrap();
+        assert!(!st.list_deleted_threads().contains_key("group_99"));
+
+        drop(st);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

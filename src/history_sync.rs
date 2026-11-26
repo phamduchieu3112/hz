@@ -1725,6 +1725,29 @@ pub async fn import_mobile_backup_container(
                 }
             }
 
+            let mut meta_map = serde_json::Map::new();
+            if cli_msg_id > 0 {
+                meta_map.insert(
+                    "client_message_id".into(),
+                    serde_json::json!(cli_msg_id.to_string()),
+                );
+                meta_map.insert(
+                    "wire_client_id".into(),
+                    serde_json::json!(cli_msg_id.to_string()),
+                );
+            }
+            if glb_msg_id > 0 {
+                meta_map.insert(
+                    "wire_server_id".into(),
+                    serde_json::json!(glb_msg_id.to_string()),
+                );
+            }
+            let raw_json = if meta_map.is_empty() {
+                String::new()
+            } else {
+                serde_json::Value::Object(meta_map).to_string()
+            };
+
             let sm = StoredMessage {
                 msg_id,
                 thread_id: thread_id.clone(),
@@ -1734,7 +1757,7 @@ pub async fn import_mobile_backup_container(
                 msg_type,
                 ts,
                 is_outgoing,
-                raw_json: String::new(),
+                raw_json,
             };
 
             if store.upsert_message(&sm).unwrap_or(false) {
@@ -2825,7 +2848,7 @@ fn decode_sync_v2_proto_message(
         thread_id.to_string()
     };
     let msg_id = if !m.global_id.is_empty() && m.global_id != "0" {
-        m.global_id
+        m.global_id.clone()
     } else {
         m.client_id.to_string()
     };
@@ -2856,6 +2879,22 @@ fn decode_sync_v2_proto_message(
     let attaches = m.attaches;
     let raw_content_snapshot = text.clone();
     let mut raw_meta = serde_json::Map::new();
+    if m.client_id > 0 {
+        raw_meta.insert(
+            "client_message_id".into(),
+            serde_json::json!(m.client_id.to_string()),
+        );
+        raw_meta.insert(
+            "wire_client_id".into(),
+            serde_json::json!(m.client_id.to_string()),
+        );
+    }
+    if !m.global_id.is_empty() && m.global_id != "0" {
+        raw_meta.insert(
+            "wire_server_id".into(),
+            serde_json::json!(m.global_id.clone()),
+        );
+    }
     let att_opt = attaches.first().cloned();
     let mut is_call_bubble = false;
 

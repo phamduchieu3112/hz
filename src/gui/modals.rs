@@ -1003,6 +1003,7 @@ impl ZaloGuiApp {
                     to_id: tid,
                     text,
                     is_group,
+                    mentions: Vec::new(),
                 });
             }
             self.show_toast(format!("{} Đã gửi trả lời nhanh", lucide::CHECK));
@@ -5285,6 +5286,7 @@ impl ZaloGuiApp {
                     to_id: item.thread_id,
                     text: item.text,
                     is_group: item.is_group,
+                    mentions: Vec::new(),
                 });
             }
             self.show_toast("Đang gửi ngay tin nhắn hẹn giờ…");
@@ -6330,6 +6332,7 @@ impl ZaloGuiApp {
                                             to_id: call.partner_id.clone(),
                                             text: tpl,
                                             is_group: false,
+                                            mentions: Vec::new(),
                                         });
                                     }
                                     self.show_toast("Đã từ chối và gửi phản hồi nhanh");

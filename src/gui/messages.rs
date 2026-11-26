@@ -1412,6 +1412,42 @@ fn find_next_bare_url(s: &str) -> Option<usize> {
 }
 
 pub(crate) fn parse_inline_md_runs(text: &str, zalo_bold: bool) -> Vec<InlineMdRun> {
+    parse_inline_md_runs_with_mentions(text, zalo_bold, &[])
+}
+
+pub(crate) fn parse_inline_md_runs_with_mentions(
+    text: &str,
+    zalo_bold: bool,
+    wire_spans: &[(usize, usize)],
+) -> Vec<InlineMdRun> {
+    if !wire_spans.is_empty() {
+        let mut sorted: Vec<(usize, usize)> = wire_spans
+            .iter()
+            .copied()
+            .filter(|&(s, e)| {
+                s < e && e <= text.len() && text.is_char_boundary(s) && text.is_char_boundary(e)
+            })
+            .collect();
+        sorted.sort_by_key(|&(s, _)| s);
+        if !sorted.is_empty() {
+            let mut out = Vec::new();
+            let mut cursor = 0usize;
+            for (s, e) in sorted {
+                if s < cursor {
+                    continue;
+                }
+                if s > cursor {
+                    out.extend(parse_inline_md_runs(&text[cursor..s], zalo_bold));
+                }
+                out.push(InlineMdRun::Mention(text[s..e].to_string()));
+                cursor = e;
+            }
+            if cursor < text.len() {
+                out.extend(parse_inline_md_runs(&text[cursor..], zalo_bold));
+            }
+            return out;
+        }
+    }
     let mut runs: Vec<InlineMdRun> = Vec::new();
     let mut rest = text;
 
@@ -1757,7 +1793,19 @@ fn render_markdown_inline_rich_opts(
     pal: &ThemePalette,
     zalo_bold: bool,
 ) {
-    let runs = parse_inline_md_runs(text, zalo_bold);
+    render_markdown_inline_rich_with_mentions(ui, text, base_size, base_color, pal, zalo_bold, &[]);
+}
+
+fn render_markdown_inline_rich_with_mentions(
+    ui: &mut egui::Ui,
+    text: &str,
+    base_size: f32,
+    base_color: Color32,
+    pal: &ThemePalette,
+    zalo_bold: bool,
+    wire_spans: &[(usize, usize)],
+) {
+    let runs = parse_inline_md_runs_with_mentions(text, zalo_bold, wire_spans);
     let links: Vec<&str> = runs
         .iter()
         .filter_map(|r| match r {
@@ -1848,41 +1896,129 @@ pub(super) fn render_chat_markdown_block_opts(
     enabled: bool,
     zalo_bold: bool,
 ) {
+    render_chat_markdown_block_with_mentions(ui, raw, text_col, pal, enabled, zalo_bold, &[]);
+}
+
+pub(super) fn render_chat_markdown_block_with_mentions(
+    ui: &mut egui::Ui,
+    raw: &str,
+    text_col: Color32,
+    pal: &ThemePalette,
+    enabled: bool,
+    zalo_bold: bool,
+    wire_spans: &[(usize, usize)],
+) {
     if !enabled {
-        ui.add(egui::Label::new(RichText::new(raw).size(14.0).color(text_col)).wrap());
+        if wire_spans.is_empty() {
+            ui.add(egui::Label::new(RichText::new(raw).size(14.0).color(text_col)).wrap());
+        } else {
+            let mut job = egui::text::LayoutJob::default();
+            let mut cursor = 0usize;
+            for &(s, e) in wire_spans {
+                if s >= cursor && s < e && e <= raw.len() && raw.is_char_boundary(s) && raw.is_char_boundary(e) {
+                    if s > cursor {
+                        append_md_run_to_job(
+                            &mut job,
+                            &InlineMdRun::Plain(raw[cursor..s].to_string()),
+                            14.0,
+                            text_col,
+                            pal,
+                        );
+                    }
+                    append_md_run_to_job(
+                        &mut job,
+                        &InlineMdRun::Mention(raw[s..e].to_string()),
+                        14.0,
+                        text_col,
+                        pal,
+                    );
+                    cursor = e;
+                }
+            }
+            if cursor < raw.len() {
+                append_md_run_to_job(
+                    &mut job,
+                    &InlineMdRun::Plain(raw[cursor..].to_string()),
+                    14.0,
+                    text_col,
+                    pal,
+                );
+            }
+            ui.add(egui::Label::new(job).wrap());
+        }
         return;
     }
+    let slice_spans = |sub_start: usize, sub_len: usize| -> Vec<(usize, usize)> {
+        let sub_end = sub_start + sub_len;
+        wire_spans
+            .iter()
+            .filter_map(|&(s, e)| {
+                if s >= sub_start && e <= sub_end {
+                    Some((s - sub_start, e - sub_start))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+    let mut raw_cursor = 0usize;
     for block in split_md_blocks(raw) {
         match block {
             MdBlock::Code { lang, body } => render_code_block(ui, &lang, &body, pal),
             MdBlock::Table { headers, rows } => render_md_table(ui, &headers, &rows, text_col, pal, zalo_bold),
             MdBlock::Lines(lines) => {
                 for line in &lines {
+                    let line_start = raw[raw_cursor..]
+                        .find(line.as_str())
+                        .map(|rel| {
+                            let st = raw_cursor + rel;
+                            raw_cursor = st + line.len();
+                            st
+                        });
                     let trimmed = line.trim_end();
                     let t_start = trimmed.trim_start();
+                    let lead_ws = trimmed.len().saturating_sub(t_start.len());
+                    let spans_for = |offset_in_line: usize, len: usize| -> Vec<(usize, usize)> {
+                        match line_start {
+                            Some(ls) => slice_spans(ls + offset_in_line, len),
+                            None => Vec::new(),
+                        }
+                    };
                     if let Some(h3) = t_start.strip_prefix("### ") {
-                        render_markdown_inline_rich_opts(ui, h3, 15.0, text_col, pal, zalo_bold);
+                        let sp = spans_for(lead_ws + 4, h3.len());
+                        render_markdown_inline_rich_with_mentions(ui, h3, 15.0, text_col, pal, zalo_bold, &sp);
                     } else if let Some(h2) = t_start.strip_prefix("## ") {
-                        render_markdown_inline_rich_opts(ui, h2, 16.0, text_col, pal, zalo_bold);
+                        let sp = spans_for(lead_ws + 3, h2.len());
+                        render_markdown_inline_rich_with_mentions(ui, h2, 16.0, text_col, pal, zalo_bold, &sp);
                     } else if let Some(h1) = t_start.strip_prefix("# ") {
-                        render_markdown_inline_rich_opts(ui, h1, 17.0, text_col, pal, zalo_bold);
+                        let sp = spans_for(lead_ws + 2, h1.len());
+                        render_markdown_inline_rich_with_mentions(ui, h1, 17.0, text_col, pal, zalo_bold, &sp);
                     } else if let Some(quote) = t_start.strip_prefix("> ") {
+                        let sp = spans_for(lead_ws + 2, quote.len());
                         ui.horizontal(|ui| {
                             let (bar_r, _) = ui.allocate_exact_size(Vec2::new(3.0, 16.0), Sense::hover());
                             ui.painter().rect_filled(bar_r, Rounding::same(1.5), pal.primary_hover);
-                            render_markdown_inline_rich_opts(ui, quote, 13.8, text_col.linear_multiply(0.88), pal, zalo_bold);
+                            render_markdown_inline_rich_with_mentions(ui, quote, 13.8, text_col.linear_multiply(0.88), pal, zalo_bold, &sp);
                         });
                     } else if let Some((num, indent, body)) = parse_ordered_item(trimmed) {
+                        let body_off = line.find(body.as_str()).unwrap_or(0);
+                        let sp = spans_for(body_off, body.len());
                         ui.horizontal(|ui| {
                             ui.add_space(indent as f32 * 4.0);
                             ui.label(RichText::new(format!("{num}.")).size(14.0).color(text_col));
-                            render_markdown_inline_rich_opts(ui, &body, 14.0, text_col, pal, zalo_bold);
+                            render_markdown_inline_rich_with_mentions(ui, &body, 14.0, text_col, pal, zalo_bold, &sp);
                         });
                     } else if let Some(bullet) = t_start.strip_prefix("- ").or_else(|| t_start.strip_prefix("* ")) {
                         let bullet_line = format!("• {bullet}");
-                        render_markdown_inline_rich_opts(ui, &bullet_line, 14.0, text_col, pal, zalo_bold);
+                        let bullet_prefix = "• ".len();
+                        let sp: Vec<(usize, usize)> = spans_for(lead_ws + 2, bullet.len())
+                            .into_iter()
+                            .map(|(s, e)| (s + bullet_prefix, e + bullet_prefix))
+                            .collect();
+                        render_markdown_inline_rich_with_mentions(ui, &bullet_line, 14.0, text_col, pal, zalo_bold, &sp);
                     } else {
-                        render_markdown_inline_rich_opts(ui, trimmed, 14.0, text_col, pal, zalo_bold);
+                        let sp = spans_for(0, trimmed.len());
+                        render_markdown_inline_rich_with_mentions(ui, trimmed, 14.0, text_col, pal, zalo_bold, &sp);
                     }
                 }
             }
@@ -2417,7 +2553,16 @@ pub(super) fn render_message_body(
             &msg.text
         };
         let display_text = crate::chat::text_emoticons_to_emoji(display_text);
-        render_chat_markdown_block_opts(ui, &display_text, text_col, pal, md.enabled, md.zalo_bold);
+        let wire_spans = crate::chat::extract_wire_mention_spans_for_text(msg, &display_text);
+        render_chat_markdown_block_with_mentions(
+            ui,
+            &display_text,
+            text_col,
+            pal,
+            md.enabled,
+            md.zalo_bold,
+            &wire_spans,
+        );
         return None;
     };
 
@@ -5918,11 +6063,26 @@ pub(super) fn bubble_context_menu(
                         && msg.text.trim() != "[Tin nhắn đã thu hồi]"
                         && !msg.text.starts_with("[Đã thu hồi]")
                     {
-                        if menu_item(ui, lucide::BAN, "Thu hồi", Color32::from_rgb(249, 115, 22))
-                            .clicked()
-                        {
-                            action = Some(BubbleAction::RecallForEveryone);
-                            close_menu = true;
+                        let now_ms = (crate::login::unix_now() as u64) * 1000;
+                        if crate::chat::can_recall_message(msg, now_ms) {
+                            if menu_item(ui, lucide::BAN, "Thu hồi", Color32::from_rgb(249, 115, 22))
+                                .clicked()
+                            {
+                                action = Some(BubbleAction::RecallForEveryone);
+                                close_menu = true;
+                            }
+                        } else {
+                            ui.add_enabled_ui(false, |ui| {
+                                menu_item(
+                                    ui,
+                                    lucide::BAN,
+                                    "Thu hồi (quá 24 giờ)",
+                                    pal.text_muted,
+                                )
+                                .on_disabled_hover_text(
+                                    "Zalo chỉ cho phép thu hồi tin nhắn trong vòng 24 giờ kể từ khi gửi",
+                                );
+                            });
                         }
                     }
 
@@ -7810,5 +7970,21 @@ mod md_block_tests {
         // Decoded thumbnail downscaled to 480x320 has identical aspect ratio -> identical box.
         let post = compute_photo_display_size(480, 320, 420.0);
         assert_eq!(pre, post);
+    }
+
+    #[test]
+    fn hz11_wire_mention_spans_highlight_lowercase_multiword_vietnamese_names() {
+        let text = "Nhờ @Nguyễn văn an xem giúp nhé";
+        let start = text.find("@Nguyễn văn an").unwrap();
+        let end = start + "@Nguyễn văn an".len();
+        let runs = parse_inline_md_runs_with_mentions(text, true, &[(start, end)]);
+        assert_eq!(
+            runs,
+            vec![
+                InlineMdRun::Plain("Nhờ ".into()),
+                InlineMdRun::Mention("@Nguyễn văn an".into()),
+                InlineMdRun::Plain(" xem giúp nhé".into()),
+            ]
+        );
     }
 }

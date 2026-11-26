@@ -39,7 +39,8 @@
 - **Hiệu năng Native:** Giao diện đồ họa Rust thuần (`egui` + `glow`) và giao diện dòng lệnh (`ratatui`) — tiêu thụ RAM thấp, khởi động nhanh, không cần Electron hay Node.js.
 - **Quản lý phiên & Đa tài khoản:** Đăng nhập bằng mã QR hoặc mật khẩu, lưu phiên cục bộ, chuyển đổi nhiều tài khoản, hỗ trợ tách biệt dữ liệu qua `--profile` và `--data-dir`.
 - **Lịch sử cục bộ & Đồng bộ:** Lưu trữ tin nhắn trong SQLite theo từng tài khoản, hỗ trợ Dual Sync V2/V1, đọc tin nhắn khi ngoại tuyến (`--offline`), tìm kiếm nhanh và xuất dữ liệu hội thoại.
-- **Nhắn tin & Đa phương tiện đầy đủ:** Chat cá nhân và nhóm, thả cảm xúc, nhãn dán, bình chọn (poll), xem trước tài liệu (`PDF`, Excel/Office, ảnh, video), Nhật ký (Feed), gọi thoại và gọi video.
+- **Nhắn tin & Đa phương tiện đầy đủ:** Chat cá nhân và nhóm, gắn thẻ `@mention` (gợi ý thành viên + offset UTF-16), ghim/bỏ ghim tin nhắn với thanh tin ghim, thu hồi tin nhắn trong 24 giờ, thả cảm xúc, nhãn dán, bình chọn (poll), xem trước tài liệu (`PDF`, Excel/Office, ảnh, video), chia sẻ & chuyển tiếp tập tin an toàn, rời/giải tán nhóm cho trưởng nhóm, Nhật ký (Feed), gọi thoại và gọi video.
+- **Tài liệu chi tiết:** Xem [Tính năng](./docs/TINH_NANG.md) và [Vấn đề đã biết](./docs/DA_BIET.md).
 - **Tự động hóa & Tích hợp AI:**
   - **Local REST API & MCP Server** (`--api-port` / `--mcp`) để kết nối Claude Desktop, Cursor hoặc script tự động hóa.
   - **Hẹn giờ gửi tin & Trả lời tự động** lưu trữ hoàn toàn cục bộ.

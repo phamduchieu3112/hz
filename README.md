@@ -39,7 +39,8 @@
 - **Native Performance:** Pure Rust desktop GUI (`egui` + `glow`) and keyboard-driven TUI (`ratatui`) — lightweight memory footprint with no Electron or Node.js runtime.
 - **Session & Multi-Account Support:** QR code and password login, persistent sessions, multi-account snapshots, plus `--profile` and `--data-dir` isolation.
 - **Local History & Sync:** Per-account SQLite storage with Dual Sync V2/V1, offline browsing (`--offline`), fast local search, and conversation export.
-- **Rich Messaging & Media:** Direct & group chats, reactions, stickers, polls, document previews (`PDF`, Excel/Office, images, video), social feed, and voice/video calls.
+- **Rich Messaging & Media:** Direct & group chats, `@mention` user tagging (autocomplete + UTF-16 `mentionInfo`), message pinning & top banner, 24h message recall, reactions, stickers, polls, document previews (`PDF`, Excel/Office, images, video), safe file upload & forwarding, group leave/disband management, social feed, and voice/video calls.
+- **Documentation:** See [Features (VI)](./docs/TINH_NANG.md) and [Known Issues (VI)](./docs/DA_BIET.md).
 - **Automation & AI Integration:**
   - **Local REST API & MCP Server** (`--api-port` / `--mcp`) for Claude Desktop, Cursor, or custom scripts.
   - **Scheduled Messages & Auto-Reply Rules** stored locally.
