@@ -762,6 +762,12 @@ pub enum GuiEvent {
     GroupMembersLoaded {
         group_id: String,
         members: Vec<crate::chat::SidebarMember>,
+        total_member: Option<u64>,
+        expected_roster_count: usize,
+        processed_roster_count: usize,
+        members_restricted: bool,
+        is_complete: bool,
+        failed: bool,
     },
     PhoneLookupSuccess(crate::chat::PhoneLookupResult),
     PhoneLookupFailed(String),
@@ -1545,6 +1551,27 @@ impl IncomingPopupState {
 /// Message search hits for the sidebar: (thread_idx, msg_id, sender, text, is_outgoing).
 pub(crate) type MsgHits = Vec<(usize, String, String, String, bool)>;
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct GroupMembersLoadProgress {
+    pub total_member: Option<u64>,
+    pub expected_roster_count: usize,
+    pub processed_roster_count: usize,
+    pub members_restricted: bool,
+    pub loaded_once: bool,
+}
+
+pub(crate) fn compute_authoritative_member_count(
+    server_total: Option<u64>,
+    existing_count: Option<u64>,
+    loaded_len: usize,
+) -> Option<u64> {
+    let srv = server_total.filter(|&n| n > 0).unwrap_or(0);
+    let cur = existing_count.filter(|&n| n > 0).unwrap_or(0);
+    let loaded = loaded_len as u64;
+    let best = srv.max(cur).max(loaded);
+    (best > 0).then_some(best)
+}
+
 pub struct ZaloGuiApp {
     // Theme state
     dark_mode: bool,
@@ -1688,6 +1715,7 @@ pub struct ZaloGuiApp {
     friend_status_map: HashMap<String, crate::chat::FriendshipStatus>,
     checking_friend_status: HashSet<String>,
     group_members_map: HashMap<String, Vec<crate::chat::SidebarMember>>,
+    group_members_meta: HashMap<String, GroupMembersLoadProgress>,
     fetching_group_members: HashSet<String>,
     group_member_search: String,
     /// Group Workspace: ghi chú đang sửa theo thread (thread_id → text).
@@ -2099,6 +2127,7 @@ impl ZaloGuiApp {
             friend_status_map: HashMap::new(),
             checking_friend_status: HashSet::new(),
             group_members_map: HashMap::new(),
+            group_members_meta: HashMap::new(),
             fetching_group_members: HashSet::new(),
             group_member_search: String::new(),
             group_note_drafts: HashMap::new(),
@@ -2663,6 +2692,41 @@ impl ZaloGuiApp {
                 .iter()
                 .any(|m| m.role == "creator" && m.id == self.user_uin)
         })
+    }
+
+    pub(crate) fn group_display_member_count(&self, group_id: &str) -> usize {
+        let meta_total = self
+            .group_members_meta
+            .get(group_id)
+            .and_then(|m| m.total_member)
+            .unwrap_or(0) as usize;
+        let thread_total = self
+            .threads
+            .iter()
+            .find(|t| t.id == group_id)
+            .and_then(|t| t.presentation.member_count)
+            .unwrap_or(0) as usize;
+        let loaded_len = self
+            .group_members_map
+            .get(group_id)
+            .map(Vec::len)
+            .unwrap_or(0);
+        meta_total.max(thread_total).max(loaded_len)
+    }
+
+    pub(crate) fn should_fetch_group_members(&self, group_id: &str) -> bool {
+        if self.fetching_group_members.contains(group_id) {
+            return false;
+        }
+        let has_non_empty = self
+            .group_members_map
+            .get(group_id)
+            .is_some_and(|m| !m.is_empty());
+        let loaded_once = self
+            .group_members_meta
+            .get(group_id)
+            .is_some_and(|m| m.loaded_once);
+        !has_non_empty || !loaded_once
     }
 
     fn remove_thread_locally_with_tombstone(&mut self, thread_id: &str) {
@@ -4469,9 +4533,39 @@ impl ZaloGuiApp {
                         }
                     }
                 }
-                GuiEvent::GroupMembersLoaded { group_id, members } => {
-                    self.fetching_group_members.remove(&group_id);
-                    for m in &members {
+                GuiEvent::GroupMembersLoaded {
+                    group_id,
+                    members,
+                    total_member,
+                    expected_roster_count,
+                    processed_roster_count,
+                    members_restricted,
+                    is_complete,
+                    failed,
+                } => {
+                    if is_complete {
+                        self.fetching_group_members.remove(&group_id);
+                    }
+                    if failed {
+                        return;
+                    }
+                    {
+                        let meta = self
+                            .group_members_meta
+                            .entry(group_id.clone())
+                            .or_default();
+                        if let Some(tot) = total_member.filter(|&n| n > 0) {
+                            meta.total_member = Some(tot);
+                        }
+                        if expected_roster_count > 0 {
+                            meta.expected_roster_count = expected_roster_count;
+                        }
+                        meta.processed_roster_count = processed_roster_count;
+                        meta.members_restricted = members_restricted;
+                        meta.loaded_once |= is_complete;
+                    }
+                    // Warm only a small head slice of avatars; scrolled rows lazy-load via `paint_user_avatar`.
+                    for m in members.iter().take(16) {
                         if let Some(ref ava_url) = m.avatar {
                             if ava_url.starts_with("http")
                                 && !ava_url.ends_with("/default")
@@ -4489,10 +4583,20 @@ impl ZaloGuiApp {
                         }
                     }
                     if let Some(t) = self.threads.iter_mut().find(|th| th.id == group_id) {
-                        t.presentation.members = members.clone();
-                        t.presentation.member_count = Some(members.len() as u64);
+                        if !members.is_empty() || is_complete {
+                            t.presentation.members = members.clone();
+                        }
+                        if let Some(cnt) = compute_authoritative_member_count(
+                            total_member,
+                            t.presentation.member_count,
+                            members.len(),
+                        ) {
+                            t.presentation.member_count = Some(cnt);
+                        }
                     }
-                    self.group_members_map.insert(group_id, members);
+                    if !members.is_empty() || is_complete {
+                        self.group_members_map.insert(group_id, members);
+                    }
                 }
                 GuiEvent::FriendStatusChecked {
                     user_id,
@@ -7442,6 +7546,26 @@ mod tests {
         assert!((fast_scroll.normalized_scroll_speed() - 4.0).abs() < f32::EPSILON);
         fast_scroll.scroll_speed = -1.0;
         assert!((fast_scroll.normalized_scroll_speed() - 2.2).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn authoritative_member_count_preserves_total_member_over_restricted_roster() {
+        assert_eq!(
+            super::compute_authoritative_member_count(Some(602), Some(602), 6),
+            Some(602)
+        );
+        assert_eq!(
+            super::compute_authoritative_member_count(None, Some(602), 6),
+            Some(602)
+        );
+        assert_eq!(
+            super::compute_authoritative_member_count(Some(0), Some(0), 12),
+            Some(12)
+        );
+        assert_eq!(
+            super::compute_authoritative_member_count(None, None, 0),
+            None
+        );
     }
 }
 

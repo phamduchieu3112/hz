@@ -7158,11 +7158,14 @@ pub async fn get_groups(s: &Session) -> Result<Vec<Thread>> {
                                 }
                             }
                         }
-                        if g.preview.is_empty() {
-                            if let Some(n_mem) = info.get("totalMember").and_then(Value::as_u64) {
-                                if n_mem > 0 {
-                                    g.preview = format!("Nhóm · {n_mem} thành viên");
-                                }
+                        if let Some(n_mem) = info
+                            .get("totalMember")
+                            .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()))
+                            .filter(|&n| n > 0)
+                        {
+                            g.presentation.member_count = Some(n_mem);
+                            if g.preview.is_empty() {
+                                g.preview = format!("Nhóm · {n_mem} thành viên");
                             }
                         }
                     }
@@ -7233,15 +7236,420 @@ pub async fn get_mini_profiles(
             resp["data"] = parsed;
         }
     }
+    if let Some(code) = resp
+        .get("error_code")
+        .and_then(Value::as_i64)
+        .or_else(|| resp.pointer("/data/error_code").and_then(Value::as_i64))
+    {
+        if code != 0 {
+            let msg = resp
+                .get("error_message")
+                .and_then(Value::as_str)
+                .or_else(|| resp.pointer("/data/error_message").and_then(Value::as_str))
+                .unwrap_or("get_mini_profiles error");
+            anyhow::bail!("get_mini_profiles failed ({code}): {msg}");
+        }
+    }
     if let Some(profiles) = resp
         .pointer("/data/profiles")
         .or_else(|| resp.pointer("/data/data/profiles"))
         .or_else(|| resp.get("data"))
         .and_then(Value::as_object)
     {
-        return Ok(profiles.clone());
+        let mut normalized = serde_json::Map::with_capacity(profiles.len());
+        for (k, v) in profiles {
+            let base = k.split('_').next().unwrap_or(k).trim();
+            let key = if base.is_empty() { k.as_str() } else { base };
+            normalized.insert(key.to_string(), v.clone());
+        }
+        return Ok(normalized);
     }
     Ok(serde_json::Map::new())
+}
+
+/// Default batch size for `/api/social/group/members` profile resolution requests.
+pub const GROUP_MEMBER_PROFILE_CHUNK_SIZE: usize = 50;
+
+/// Full parsed roster & metadata extracted from a Zalo `getmg-v2` group info object.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GroupRosterMetadata {
+    pub member_uids: Vec<String>,
+    pub versioned_uids: std::collections::HashMap<String, String>,
+    pub creator_id: String,
+    pub admin_ids: Vec<String>,
+    pub inline_profiles: serde_json::Map<String, Value>,
+    pub total_member: Option<u64>,
+    pub members_restricted: bool,
+    pub has_more_member: bool,
+}
+
+fn json_id_string(v: &Value) -> Option<String> {
+    if let Some(s) = v.as_str() {
+        let t = s.trim();
+        if !t.is_empty() {
+            return Some(t.to_string());
+        }
+    } else if let Some(n) = v.as_u64() {
+        return Some(n.to_string());
+    }
+    None
+}
+
+fn normalize_member_avatar_url(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.ends_with("/default")
+        || trimmed.contains("default_avatar")
+        || trimmed.contains("avatar_default")
+    {
+        return None;
+    }
+    if trimmed.starts_with("//") {
+        Some(format!("https:{trimmed}"))
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Parse all available member UIDs, roles, inline profiles, and restriction flags
+/// from a `getmg-v2` group info object without any hard cap.
+pub fn parse_group_roster_metadata(info: &Value) -> GroupRosterMetadata {
+    let mut meta = GroupRosterMetadata {
+        total_member: info
+            .get("totalMember")
+            .and_then(|v| v.as_u64().or_else(|| v.as_str()?.trim().parse().ok())),
+        has_more_member: info
+            .get("hasMoreMember")
+            .and_then(|v| v.as_i64().or_else(|| v.as_bool().map(i64::from)))
+            .is_some_and(|v| v != 0),
+        ..Default::default()
+    };
+
+    let parsed_setting = info.get("setting").and_then(|v| match v {
+        Value::Object(_) => Some(v.clone()),
+        Value::String(s) => serde_json::from_str::<Value>(s.trim()).ok(),
+        _ => None,
+    });
+    if let Some(ref st) = parsed_setting {
+        meta.members_restricted = st
+            .get("lockViewMember")
+            .and_then(|v| v.as_i64().or_else(|| v.as_bool().map(i64::from)))
+            .is_some_and(|v| v != 0);
+    }
+
+    if let Some(creator) = info.get("creatorId").and_then(json_id_string) {
+        meta.creator_id = creator;
+    }
+
+    let mut admin_seen = std::collections::HashSet::new();
+    if let Some(admins) = info.get("adminIds").and_then(Value::as_array) {
+        for item in admins {
+            if let Some(aid) = json_id_string(item) {
+                if admin_seen.insert(aid.clone()) {
+                    meta.admin_ids.push(aid);
+                }
+            }
+        }
+    }
+
+    let mut raw_ids: Vec<String> = Vec::new();
+    let mut seen_ids = std::collections::HashSet::new();
+    let mut push_uid = |uid: String| {
+        if !uid.is_empty() && seen_ids.insert(uid.clone()) {
+            raw_ids.push(uid);
+        }
+    };
+
+    if let Some(arr) = info.get("memVerList").and_then(Value::as_array) {
+        for item in arr {
+            if let Some(raw) = item.as_str() {
+                let raw_trim = raw.trim();
+                let uid = raw_trim.split('_').next().unwrap_or("").trim();
+                if !uid.is_empty() {
+                    if raw_trim.contains('_') {
+                        meta.versioned_uids
+                            .entry(uid.to_string())
+                            .or_insert_with(|| raw_trim.to_string());
+                    }
+                    push_uid(uid.to_string());
+                }
+            }
+        }
+    }
+
+    if let Some(map) = info.get("memberVerMap").and_then(Value::as_object) {
+        for (uid_raw, ver_val) in map {
+            let uid = uid_raw.split('_').next().unwrap_or("").trim();
+            if !uid.is_empty() {
+                if let Some(ver) = ver_val.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                    meta.versioned_uids
+                        .entry(uid.to_string())
+                        .or_insert_with(|| format!("{uid}_{ver}"));
+                } else if let Some(ver) = ver_val.as_u64() {
+                    meta.versioned_uids
+                        .entry(uid.to_string())
+                        .or_insert_with(|| format!("{uid}_{ver}"));
+                }
+                push_uid(uid.to_string());
+            }
+        }
+    }
+
+    if let Some(arr) = info.get("memberIds").and_then(Value::as_array) {
+        for item in arr {
+            if let Some(uid) = json_id_string(item) {
+                push_uid(uid);
+            }
+        }
+    }
+
+    for field in ["currentMems", "updateMems", "topMember"] {
+        if let Some(arr) = info.get(field).and_then(Value::as_array) {
+            for item in arr {
+                if let Some(uid) = json_id_string(item) {
+                    push_uid(uid);
+                } else if let Some(uid) = item
+                    .get("id")
+                    .or_else(|| item.get("userId"))
+                    .or_else(|| item.get("uid"))
+                    .and_then(json_id_string)
+                {
+                    meta.inline_profiles
+                        .entry(uid.clone())
+                        .or_insert_with(|| item.clone());
+                    push_uid(uid);
+                }
+            }
+        }
+    }
+
+    if !meta.creator_id.is_empty() {
+        push_uid(meta.creator_id.clone());
+    }
+    for aid in &meta.admin_ids {
+        push_uid(aid.clone());
+    }
+
+    let mut ordered = Vec::with_capacity(raw_ids.len());
+    let mut ordered_seen = std::collections::HashSet::with_capacity(raw_ids.len());
+    if !meta.creator_id.is_empty() && ordered_seen.insert(meta.creator_id.clone()) {
+        ordered.push(meta.creator_id.clone());
+    }
+    for aid in &meta.admin_ids {
+        if ordered_seen.insert(aid.clone()) {
+            ordered.push(aid.clone());
+        }
+    }
+    for uid in raw_ids {
+        if ordered_seen.insert(uid.clone()) {
+            ordered.push(uid);
+        }
+    }
+    meta.member_uids = ordered;
+    meta
+}
+
+/// Build `SidebarMember` rows for all UIDs in `roster` using resolved `profiles` and inline
+/// profile metadata. When `include_unresolved` is `false`, UIDs without a resolved display name
+/// yet are omitted (for clean progressive updates); when `true`, unresolved UIDs fall back to
+/// `"Thành viên"`.
+pub fn build_sidebar_members_from_profiles(
+    roster: &GroupRosterMetadata,
+    profiles: &serde_json::Map<String, Value>,
+    include_unresolved: bool,
+) -> Vec<SidebarMember> {
+    let admin_set: std::collections::HashSet<&str> =
+        roster.admin_ids.iter().map(String::as_str).collect();
+    let mut members = Vec::with_capacity(roster.member_uids.len());
+
+    for uid in &roster.member_uids {
+        let profile = profiles
+            .get(uid)
+            .or_else(|| roster.inline_profiles.get(uid));
+        let resolved_name = profile
+            .and_then(|p| pick_str(p, &["displayName", "dName", "zaloName", "name", "display_name"]))
+            .map(|n| n.trim().to_string())
+            .filter(|n| !n.is_empty());
+
+        let m_name = match resolved_name {
+            Some(n) => n,
+            None if include_unresolved => "Thành viên".to_string(),
+            None => continue,
+        };
+
+        let m_ava = profile
+            .and_then(|p| pick_str(p, &["avatar", "avt", "profile_avatar", "avatar_25"]))
+            .and_then(|a| normalize_member_avatar_url(&a));
+
+        let role = if !roster.creator_id.is_empty() && uid == &roster.creator_id {
+            "creator".to_string()
+        } else if admin_set.contains(uid.as_str()) {
+            "admin".to_string()
+        } else {
+            "member".to_string()
+        };
+
+        members.push(SidebarMember {
+            id: uid.clone(),
+            name: m_name,
+            avatar: m_ava,
+            role,
+        });
+    }
+    members
+}
+
+/// Resolve member profiles in chunks off the UI thread, calling `on_chunk` after each batch so
+/// callers can stream partial progress to the UI cleanly. Errors in individual chunks are tolerated
+/// so remaining chunks still complete.
+pub async fn resolve_member_profiles_in_chunks<F, Fut, Cb>(
+    uids: &[String],
+    versioned_uids: &std::collections::HashMap<String, String>,
+    chunk_size: usize,
+    mut fetch_chunk: F,
+    mut on_chunk: Cb,
+) -> serde_json::Map<String, Value>
+where
+    F: FnMut(Vec<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<serde_json::Map<String, Value>>>,
+    Cb: FnMut(usize, usize, &serde_json::Map<String, Value>),
+{
+    let mut accumulated = serde_json::Map::new();
+    let total = uids.len();
+    if total == 0 {
+        return accumulated;
+    }
+
+    let step = chunk_size.max(1);
+    let mut processed = 0usize;
+    for chunk in uids.chunks(step) {
+        let request_ids: Vec<String> = chunk
+            .iter()
+            .map(|uid| {
+                versioned_uids
+                    .get(uid)
+                    .cloned()
+                    .unwrap_or_else(|| uid.clone())
+            })
+            .collect();
+        if let Ok(mp) = fetch_chunk(request_ids).await {
+            for (k, v) in mp {
+                let base = k.split('_').next().unwrap_or(&k).trim();
+                let clean_key = if base.is_empty() {
+                    k
+                } else {
+                    base.to_string()
+                };
+                accumulated.insert(clean_key, v);
+            }
+        }
+        processed = (processed + chunk.len()).min(total);
+        on_chunk(processed, total, &accumulated);
+    }
+    accumulated
+}
+
+/// Optional paginated fallback via `/api/group/link/detail` + `/api/group/link/ginfo`
+/// (`mp = 1..=max_pages`) when `hasMoreMember != 0` and the group member list is not restricted.
+pub async fn fetch_group_link_members_pages(
+    s: &Session,
+    group_id: &str,
+    max_pages: u32,
+) -> Vec<(String, Value)> {
+    if s.login.is_none() || max_pages == 0 {
+        return Vec::new();
+    }
+    let clean = clean_group_id(group_id);
+    if clean.is_empty() {
+        return Vec::new();
+    }
+    let Ok(detail_params) = s.encoded_params(&obj(&[("grid", json!(clean))])) else {
+        return Vec::new();
+    };
+    let detail_url = format!(
+        "{}/api/group/link/detail?{}&params={detail_params}",
+        s.domains.group,
+        s.common_params()
+    );
+    let Ok(detail_resp) = s.get(&detail_url).await else {
+        return Vec::new();
+    };
+    let mut detail_dec = s.maybe_decrypt(detail_resp, s.session_key_bytes()).await;
+    if let Some(d_str) = detail_dec.get("data").and_then(Value::as_str) {
+        if let Ok(parsed) = serde_json::from_str::<Value>(d_str.trim()) {
+            detail_dec["data"] = parsed;
+        }
+    }
+    let link = detail_dec
+        .pointer("/data/data/link")
+        .or_else(|| detail_dec.pointer("/data/link"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string);
+    let Some(link) = link else {
+        return Vec::new();
+    };
+
+    let mut collected = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for page in 1..=max_pages {
+        let body = obj(&[
+            ("link", json!(link)),
+            ("avatar_size", json!(120)),
+            ("member_avatar_size", json!(120)),
+            ("mp", json!(page)),
+        ]);
+        let Ok(page_params) = s.encoded_params(&body) else {
+            break;
+        };
+        let page_url = format!(
+            "{}/api/group/link/ginfo?{}&params={page_params}",
+            s.domains.group,
+            s.common_params()
+        );
+        let Ok(page_resp) = s.get(&page_url).await else {
+            break;
+        };
+        let mut page_dec = s.maybe_decrypt(page_resp, s.session_key_bytes()).await;
+        if let Some(d_str) = page_dec.get("data").and_then(Value::as_str) {
+            if let Ok(parsed) = serde_json::from_str::<Value>(d_str.trim()) {
+                page_dec["data"] = parsed;
+            }
+        }
+        let gdata = page_dec
+            .pointer("/data/data")
+            .or_else(|| page_dec.get("data"))
+            .unwrap_or(&page_dec);
+        let Some(arr) = gdata.get("currentMems").and_then(Value::as_array) else {
+            break;
+        };
+        if arr.is_empty() {
+            break;
+        }
+        let mut added_this_page = 0usize;
+        for item in arr {
+            if let Some(uid) = item
+                .get("id")
+                .or_else(|| item.get("userId"))
+                .or_else(|| item.get("uid"))
+                .and_then(json_id_string)
+            {
+                if seen.insert(uid.clone()) {
+                    collected.push((uid, item.clone()));
+                    added_this_page += 1;
+                }
+            }
+        }
+        let has_more = gdata
+            .get("hasMoreMember")
+            .and_then(|v| v.as_i64().or_else(|| v.as_bool().map(i64::from)))
+            .is_some_and(|v| v != 0);
+        if added_this_page == 0 || !has_more {
+            break;
+        }
+    }
+    collected
 }
 
 /// Automatically resolve real display names and avatars for 1-1 and group threads that only have placeholder names.
@@ -7327,11 +7735,14 @@ pub async fn resolve_thread_names(s: &Session, threads: &mut [Thread]) {
                                 }
                             }
                         }
-                        if t.preview.is_empty() {
-                            if let Some(n_mem) = info.get("totalMember").and_then(Value::as_u64) {
-                                if n_mem > 0 {
-                                    t.preview = format!("Nhóm · {n_mem} thành viên");
-                                }
+                        if let Some(n_mem) = info
+                            .get("totalMember")
+                            .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()))
+                            .filter(|&n| n > 0)
+                        {
+                            t.presentation.member_count = Some(n_mem);
+                            if t.preview.is_empty() {
+                                t.preview = format!("Nhóm · {n_mem} thành viên");
                             }
                         }
                     }
@@ -15535,5 +15946,118 @@ mod send_identity_tests {
         assert_eq!(del["conver"]["ownerId"], "owner_1");
         assert_eq!(del["conver"]["cliMsgId"], "1700001");
         assert_eq!(del["conver"]["globalMsgId"], "8500001");
+    }
+
+    #[test]
+    fn parse_group_roster_metadata_extracts_all_members_and_flags_without_truncation() {
+        let mut mem_ver_list: Vec<Value> = (1000..1605)
+            .map(|uid| json!(format!("{uid}_0")))
+            .collect();
+        // Inject duplicate and creator/admin entries
+        mem_ver_list.push(json!("1005_0"));
+        let info = json!({
+            "totalMember": 605,
+            "creatorId": "1200",
+            "adminIds": ["1050", 1300],
+            "memVerList": mem_ver_list,
+            "setting": "{\"lockViewMember\":1,\"lockSendMsg\":0}",
+            "hasMoreMember": 0
+        });
+
+        let roster = parse_group_roster_metadata(&info);
+        assert_eq!(roster.total_member, Some(605));
+        assert!(roster.members_restricted);
+        assert!(!roster.has_more_member);
+        assert_eq!(roster.member_uids.len(), 605);
+        assert_eq!(roster.member_uids[0], "1200");
+        assert_eq!(roster.member_uids[1], "1050");
+        assert_eq!(roster.member_uids[2], "1300");
+        assert_eq!(
+            roster.versioned_uids.get("1005").map(String::as_str),
+            Some("1005_0")
+        );
+
+        let info_obj_setting = json!({
+            "totalMember": "602",
+            "setting": { "lockViewMember": 0 }
+        });
+        let roster2 = parse_group_roster_metadata(&info_obj_setting);
+        assert_eq!(roster2.total_member, Some(602));
+        assert!(!roster2.members_restricted);
+    }
+
+    #[tokio::test]
+    async fn resolve_member_profiles_in_chunks_streams_progress_and_survives_chunk_error() {
+        let mut mem_ver_list = Vec::with_capacity(130);
+        for i in 1..=130 {
+            mem_ver_list.push(json!(format!("{i}_0")));
+        }
+        let info = json!({
+            "totalMember": 130,
+            "creatorId": "1",
+            "adminIds": ["2"],
+            "memVerList": mem_ver_list
+        });
+        let roster = parse_group_roster_metadata(&info);
+        assert_eq!(roster.member_uids.len(), 130);
+
+        let mut chunk_sizes = Vec::new();
+        let mut progress_steps = Vec::new();
+        let mut chunk_idx = 0usize;
+
+        let profiles = resolve_member_profiles_in_chunks(
+            &roster.member_uids,
+            &roster.versioned_uids,
+            GROUP_MEMBER_PROFILE_CHUNK_SIZE,
+            |batch| {
+                chunk_sizes.push(batch.len());
+                let cur = chunk_idx;
+                chunk_idx += 1;
+                async move {
+                    if cur == 1 {
+                        anyhow::bail!("simulated rate limit on chunk 2");
+                    }
+                    let mut map = serde_json::Map::new();
+                    for ver_id in batch {
+                        let uid = ver_id.split('_').next().unwrap_or(&ver_id);
+                        map.insert(
+                            format!("{uid}_0"),
+                            json!({
+                                "displayName": format!("Thành viên {uid}"),
+                                "avatar": format!("//ava.test/{uid}.jpg")
+                            }),
+                        );
+                    }
+                    Ok(map)
+                }
+            },
+            |processed, total, accumulated| {
+                let resolved_so_far =
+                    build_sidebar_members_from_profiles(&roster, accumulated, false).len();
+                progress_steps.push((processed, total, resolved_so_far));
+            },
+        )
+        .await;
+
+        assert_eq!(chunk_sizes, vec![50, 50, 30]);
+        assert_eq!(
+            progress_steps,
+            vec![(50, 130, 50), (100, 130, 50), (130, 130, 80)]
+        );
+        assert_eq!(profiles.len(), 80);
+
+        let final_members = build_sidebar_members_from_profiles(&roster, &profiles, true);
+        assert_eq!(final_members.len(), 130);
+        assert_eq!(final_members[0].id, "1");
+        assert_eq!(final_members[0].role, "creator");
+        assert_eq!(final_members[0].name, "Thành viên 1");
+        assert_eq!(
+            final_members[0].avatar.as_deref(),
+            Some("https://ava.test/1.jpg")
+        );
+        assert_eq!(final_members[1].id, "2");
+        assert_eq!(final_members[1].role, "admin");
+        // Chunk 2 UIDs were skipped on error, so final list preserves them with fallback label
+        assert!(final_members.iter().any(|m| m.name == "Thành viên"));
     }
 }

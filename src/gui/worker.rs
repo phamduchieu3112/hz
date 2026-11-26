@@ -5264,86 +5264,131 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             let ctx_clone = egui_ctx.clone();
                             tokio::spawn(async move {
                                 let s = session_clone.lock().await.clone();
-                                if let Ok((info_map, _)) = crate::chat::fetch_group_profiles(&s, &[group_id.clone()]).await {
-                                    if let Some(info) = info_map.get(&group_id) {
-                                        let mut member_uids: Vec<String> = Vec::new();
-                                        if let Some(arr) = info.get("memVerList").and_then(serde_json::Value::as_array) {
-                                            for item in arr {
-                                                if let Some(s_val) = item.as_str() {
-                                                    let uid = s_val.split('_').next().unwrap_or("").trim();
-                                                    if !uid.is_empty() && !member_uids.contains(&uid.to_string()) {
-                                                        member_uids.push(uid.to_string());
-                                                    }
-                                                }
+                                let clean_gid = crate::chat::clean_group_id(&group_id).to_string();
+                                let info_opt = crate::chat::fetch_group_profiles(&s, &[group_id.clone()])
+                                    .await
+                                    .ok()
+                                    .and_then(|(info_map, _)| {
+                                        info_map
+                                            .get(&group_id)
+                                            .or_else(|| info_map.get(&clean_gid))
+                                            .cloned()
+                                    });
+                                let Some(info) = info_opt else {
+                                    let _ = gui_tx_clone.send(GuiEvent::GroupMembersLoaded {
+                                        group_id,
+                                        members: Vec::new(),
+                                        total_member: None,
+                                        expected_roster_count: 0,
+                                        processed_roster_count: 0,
+                                        members_restricted: false,
+                                        is_complete: true,
+                                        failed: true,
+                                    });
+                                    ctx_clone.request_repaint();
+                                    return;
+                                };
+
+                                let mut roster = crate::chat::parse_group_roster_metadata(&info);
+                                if roster.has_more_member && !roster.members_restricted {
+                                    let extra = crate::chat::fetch_group_link_members_pages(&s, &group_id, 50).await;
+                                    if !extra.is_empty() {
+                                        let mut existing: std::collections::HashSet<String> =
+                                            roster.member_uids.iter().cloned().collect();
+                                        for (uid, profile) in extra {
+                                            roster
+                                                .inline_profiles
+                                                .entry(uid.clone())
+                                                .or_insert(profile);
+                                            if existing.insert(uid.clone()) {
+                                                roster.member_uids.push(uid);
                                             }
                                         }
-                                        let creator_id = crate::chat::pick_str(info, &["creatorId"]).unwrap_or_default();
-                                        if !creator_id.is_empty() && !member_uids.contains(&creator_id) {
-                                            member_uids.insert(0, creator_id.clone());
-                                        }
-                                        let mut admin_ids: Vec<String> = Vec::new();
-                                        if let Some(admins) = info.get("adminIds").and_then(serde_json::Value::as_array) {
-                                            for a in admins {
-                                                if let Some(aid) = a.as_str() {
-                                                    let aid_s = aid.to_string();
-                                                    if !member_uids.contains(&aid_s) {
-                                                        member_uids.push(aid_s.clone());
-                                                    }
-                                                    if !admin_ids.contains(&aid_s) {
-                                                        admin_ids.push(aid_s);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        let mut profiles = serde_json::Map::new();
-                                        for chunk in member_uids.chunks(50) {
-                                            if let Ok(mp) = crate::chat::get_mini_profiles(&s, chunk).await {
-                                                for (k, v) in mp {
-                                                    profiles.insert(k, v);
-                                                }
-                                            }
-                                        }
-                                        let mut members = Vec::new();
-                                        for uid in &member_uids {
-                                            let mut m_name = "Thành viên".to_string();
-                                            let mut m_ava = None;
-                                            if let Some(p) = profiles.get(uid) {
-                                                if let Some(n) = crate::chat::pick_str(p, &["displayName", "zaloName", "name"]) {
-                                                    if !n.is_empty() {
-                                                        m_name = n;
-                                                    }
-                                                }
-                                                if let Some(a) = crate::chat::pick_str(p, &["avatar", "avt"]) {
-                                                    if !a.is_empty() && !a.ends_with("/default") {
-                                                        m_ava = Some(a);
-                                                    }
-                                                }
-                                            }
-                                            let role = if uid == &creator_id {
-                                                "creator".to_string()
-                                            } else if admin_ids.contains(uid) {
-                                                "admin".to_string()
-                                            } else {
-                                                "member".to_string()
-                                            };
-                                            members.push(crate::chat::SidebarMember {
-                                                id: uid.clone(),
-                                                name: m_name,
-                                                avatar: m_ava,
-                                                role,
-                                            });
-                                        }
-                                        let _ = gui_tx_clone.send(GuiEvent::GroupMembersLoaded {
-                                            group_id,
-                                            members,
-                                        });
-                                        ctx_clone.request_repaint();
-                                        return;
                                     }
                                 }
+
+                                let expected_roster_count = roster.member_uids.len();
+                                if expected_roster_count > crate::chat::GROUP_MEMBER_PROFILE_CHUNK_SIZE
+                                    || !roster.inline_profiles.is_empty()
+                                {
+                                    let initial_members = crate::chat::build_sidebar_members_from_profiles(
+                                        &roster,
+                                        &serde_json::Map::new(),
+                                        false,
+                                    );
+                                    let _ = gui_tx_clone.send(GuiEvent::GroupMembersLoaded {
+                                        group_id: group_id.clone(),
+                                        members: initial_members,
+                                        total_member: roster.total_member,
+                                        expected_roster_count,
+                                        processed_roster_count: 0,
+                                        members_restricted: roster.members_restricted,
+                                        is_complete: false,
+                                        failed: false,
+                                    });
+                                    ctx_clone.request_repaint();
+                                }
+
+                                let mut batch_idx = 0usize;
+                                let final_profiles = crate::chat::resolve_member_profiles_in_chunks(
+                                    &roster.member_uids,
+                                    &roster.versioned_uids,
+                                    crate::chat::GROUP_MEMBER_PROFILE_CHUNK_SIZE,
+                                    |batch| {
+                                        let s_req = s.clone();
+                                        let cur_batch = batch_idx;
+                                        batch_idx += 1;
+                                        async move {
+                                            if cur_batch > 0 {
+                                                tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                                            }
+                                            match crate::chat::get_mini_profiles(&s_req, &batch).await {
+                                                Ok(mp) => Ok(mp),
+                                                Err(_) => {
+                                                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                                                    crate::chat::get_mini_profiles(&s_req, &batch).await
+                                                }
+                                            }
+                                        }
+                                    },
+                                    |processed, total, accumulated| {
+                                        if processed < total {
+                                            let partial_members =
+                                                crate::chat::build_sidebar_members_from_profiles(
+                                                    &roster,
+                                                    accumulated,
+                                                    false,
+                                                );
+                                            let _ = gui_tx_clone.send(GuiEvent::GroupMembersLoaded {
+                                                group_id: group_id.clone(),
+                                                members: partial_members,
+                                                total_member: roster.total_member,
+                                                expected_roster_count: total,
+                                                processed_roster_count: processed,
+                                                members_restricted: roster.members_restricted,
+                                                is_complete: false,
+                                                failed: false,
+                                            });
+                                            ctx_clone.request_repaint();
+                                        }
+                                    },
+                                )
+                                .await;
+
+                                let members = crate::chat::build_sidebar_members_from_profiles(
+                                    &roster,
+                                    &final_profiles,
+                                    true,
+                                );
                                 let _ = gui_tx_clone.send(GuiEvent::GroupMembersLoaded {
                                     group_id,
-                                    members: Vec::new(),
+                                    members,
+                                    total_member: roster.total_member,
+                                    expected_roster_count,
+                                    processed_roster_count: expected_roster_count,
+                                    members_restricted: roster.members_restricted,
+                                    is_complete: true,
+                                    failed: false,
                                 });
                                 ctx_clone.request_repaint();
                             });

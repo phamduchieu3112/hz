@@ -5706,7 +5706,7 @@ impl ZaloGuiApp {
             .and_then(|t| t.avatar.clone());
 
         if call.is_group
-            && !self.group_members_map.contains_key(&call.partner_id)
+            && self.should_fetch_group_members(&call.partner_id)
             && self.fetching_group_members.insert(call.partner_id.clone())
         {
             if let Some(tx) = WORKER_TX.get() {

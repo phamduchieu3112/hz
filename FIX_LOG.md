@@ -295,3 +295,43 @@ Tracking completed fixes from `bug_analysis_report.md` (branch `clean-release`, 
 5. **HZ-13 (`#138` Delete / Disband / Leave Group):**
    - Create a temporary test group in `Hz` (you are `creatorId`): open the sidebar context menu or right Group Info Drawer → verify `"Giải tán nhóm"` is visible → click it, confirm in `"Xác nhận giải tán nhóm"` → verify the group is permanently disbanded and stays gone after `"Làm mới"`.
    - In a group where you are a non-creator member → verify `"Giải tán nhóm"` is hidden, click `"Rời nhóm"` → confirm it removes only after server confirmation and does not reappear on thread refresh; test `"Xoá hội thoại"` / `"Xoá lịch sử trò chuyện"` and verify the tombstone keeps it hidden until new activity arrives.
+
+---
+
+## Hotfix — Large-Group Member Loading & Virtualized `@mention` Popup (`2026-11-27`)
+
+### Summary
+Fixed the partial 6-member header/mention regression in large groups after `90d4ed2`:
+- **Authoritative `totalMember` & Full Roster Parsing (`src/chat.rs`, `src/gui.rs`):**
+  - Preserved `totalMember` into `Thread.presentation.member_count` inside `get_groups` and `resolve_thread_names`, and added `compute_authoritative_member_count` + `group_display_member_count` so partial/restricted community rosters (`setting.lockViewMember == 1`) never overwrite `totalMember` (e.g. `602` → `6`).
+  - Added `parse_group_roster_metadata` (parsing `memVerList`, `memberVerMap`, `memberIds`, `currentMems`, `updateMems`, `topMember`, `creatorId`, `adminIds`, `totalMember`, `setting.lockViewMember`, and `hasMoreMember` with O(N) deduplication and no cap), `build_sidebar_members_from_profiles`, `resolve_member_profiles_in_chunks`, and `fetch_group_link_members_pages`.
+  - Updated `get_mini_profiles` to check `error_code` and normalize `<uid>_<ver>` response keys.
+- **Progressive Async Chunked Fetching (`src/gui/worker.rs`, `src/gui.rs`, `src/gui/modals.rs`):**
+  - Updated `WorkerCmd::FetchGroupMembers` to stream partial `GuiEvent::GroupMembersLoaded` updates as each 50-UID profile chunk resolves off the UI thread (with 40 ms inter-batch pacing and 1 retry on error), avoid poisoning `group_members_map` with empty vectors on failure (`failed: true`), and cap eager avatar warm-up to the first 16 members while visible rows lazy-load via `paint_user_avatar`.
+- **Full-List `@mention` & Virtualized Rendering (`src/gui/workspace.rs`):**
+  - Added `build_group_mention_candidates` pinning `@All` (`"Báo cho cả nhóm"`) at index 0 followed by **all** matching group members (plus deduped observed message senders/mentioned UIDs) with live Vietnamese accent-insensitive filtering and zero truncation.
+  - Upgraded `render_mention_suggestion_popover` and the Group Info Drawer member list to virtualized `egui::ScrollArea::vertical().show_rows(...)` rendering (zero UI lag for 600–1000+ members), added keyboard scroll-into-view on `ArrowUp`/`ArrowDown`, and added progressive loading progress indicators (`Đang tải X/Y…`) and restricted-community notices.
+
+### Modified Files
+- `src/chat.rs` — `get_groups`, `resolve_thread_names`, `get_mini_profiles`, `GROUP_MEMBER_PROFILE_CHUNK_SIZE`, `GroupRosterMetadata`, `parse_group_roster_metadata`, `build_sidebar_members_from_profiles`, `resolve_member_profiles_in_chunks`, `fetch_group_link_members_pages`, and 2 new unit tests.
+- `src/gui.rs` — Enriched `GuiEvent::GroupMembersLoaded`, `GroupMembersLoadProgress`, `compute_authoritative_member_count`, `group_display_member_count`, `should_fetch_group_members`, progressive `GroupMembersLoaded` handler, and 1 new unit test.
+- `src/gui/worker.rs` — Progressive async chunked `WorkerCmd::FetchGroupMembers` with `fetch_group_link_members_pages` fallback and chunk retry.
+- `src/gui/workspace.rs` — `MentionPopoverStatus`, `build_group_mention_candidates`, virtualized `show_rows` in `render_mention_suggestion_popover` and Info Drawer, chat header `group_display_member_count`, observed-sender fallback merge, and 1 new unit test.
+- `src/gui/modals.rs` — Updated call overlay group member trigger to `should_fetch_group_members`.
+
+### Verification Results
+- `cargo check --all-targets`: **PASS** (0 errors, 0 new warnings)
+- `cargo clippy --all-targets -j 2`: **PASS** (0 errors, 0 new warnings on modified/added code)
+- `cargo test -j 2`: **PASS** — **571 passed; 0 failed; 1 ignored** (2.26s)
+  - New tests passing:
+    - `chat::send_identity_tests::parse_group_roster_metadata_extracts_all_members_and_flags_without_truncation`
+    - `chat::send_identity_tests::resolve_member_profiles_in_chunks_streams_progress_and_survives_chunk_error`
+    - `gui::tests::authoritative_member_count_preserves_total_member_over_restricted_roster`
+    - `gui::workspace::quote_navigation_tests::mention_candidates_include_all_602_members_and_filter_vietnamese_without_truncation`
+
+### Windows 10/11 `--gui` Manual QA Steps
+1. Open a large group with full roster visibility (e.g. 500–926+ members) and type `@` immediately:
+   - Confirm `@All` (`Báo cho cả nhóm`) appears at the top, followed by resolved members updating smoothly as background chunks complete, and scrolling through all 500–900+ entries is lag-free.
+   - Type Vietnamese queries with and without accents (e.g. `@nguyen`, `@thảo`) and verify all matching members appear and `ArrowUp`/`ArrowDown` keeps the selected row scrolled into view.
+2. Open a large community group with `lockViewMember = 1` (e.g. 602 members):
+   - Confirm the chat header and Group Info Drawer display `👥 602 thành viên` (never dropping to `6`), while `@mention` lists `@All`, group creator/admins, and any observed message senders/mentioned members cleanly.

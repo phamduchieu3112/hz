@@ -3634,6 +3634,8 @@ impl ZaloGuiApp {
                                     }
 
                                     if sec_mem_open {
+                                        let total_cnt = self.group_display_member_count(d_id);
+                                        let mem_meta = self.group_members_meta.get(d_id).cloned();
                                         ui.add_space(6.0);
                                         ui.horizontal(|ui| {
                                             ui.label(
@@ -3643,14 +3645,43 @@ impl ZaloGuiApp {
                                             );
                                             ui.add_space(6.0);
                                             ui.label(
-                                                RichText::new(format!(
-                                                    "{} thành viên",
-                                                    group_members.len()
-                                                ))
-                                                .size(12.5)
-                                                .color(pal.text_primary),
+                                                RichText::new(format!("{total_cnt} thành viên"))
+                                                    .size(12.5)
+                                                    .color(pal.text_primary),
                                             );
+                                            if is_fetching {
+                                                ui.spinner();
+                                                if let Some(ref meta) = mem_meta {
+                                                    if meta.expected_roster_count > 0 {
+                                                        ui.label(
+                                                            RichText::new(format!(
+                                                                "({}/{})",
+                                                                meta.processed_roster_count,
+                                                                meta.expected_roster_count
+                                                            ))
+                                                            .size(11.0)
+                                                            .color(pal.text_muted),
+                                                        );
+                                                    }
+                                                }
+                                            }
                                         });
+                                        if let Some(ref meta) = mem_meta {
+                                            if meta.members_restricted
+                                                && !is_fetching
+                                                && total_cnt > group_members.len()
+                                            {
+                                                ui.label(
+                                                    RichText::new(format!(
+                                                        "Nhóm cộng đồng ẩn danh sách thành viên (hiển thị {}/{})",
+                                                        group_members.len(),
+                                                        total_cnt
+                                                    ))
+                                                    .size(10.5)
+                                                    .color(pal.text_muted),
+                                                );
+                                            }
+                                        }
                                     ui.add_space(8.0);
 
                                     if is_fetching && group_members.is_empty() {
@@ -3692,129 +3723,176 @@ impl ZaloGuiApp {
                                         }
 
                                         let q = self.group_member_search.trim().to_lowercase();
+                                        let q_fold = crate::chat::strip_vn_for_sticker_kw(&q);
                                         let filtered_members: Vec<&crate::chat::SidebarMember> =
                                             group_members
                                                 .iter()
                                                 .filter(|m| {
                                                     q.is_empty()
                                                         || m.name.to_lowercase().contains(&q)
+                                                        || crate::chat::strip_vn_for_sticker_kw(
+                                                            &m.name,
+                                                        )
+                                                        .contains(&q_fold)
                                                         || m.id.contains(&q)
                                                 })
                                                 .collect();
 
-                                        egui::ScrollArea::vertical()
-                                            .id_salt("info_drawer_members_scroll")
-                                            .max_height(200.0)
-                                            .auto_shrink([false, false])
-                                            .show(ui, |ui| {
-                                                ui.spacing_mut().item_spacing = Vec2::new(0.0, 5.0);
-                                                for m in filtered_members {
-                                                    ui.horizontal(|ui| {
-                                                        let (av_r, _) = ui.allocate_exact_size(
-                                                            Vec2::new(26.0, 26.0),
-                                                            Sense::hover(),
-                                                        );
-                                                        paint_user_avatar(
-                                                            ui.painter(),
-                                                            av_r.center(),
-                                                            13.0,
-                                                            &m.name,
-                                                            false,
-                                                            m.avatar.as_deref(),
-                                                            &self.sticker_textures,
-                                                            &mut self.loading_stickers,
-                                                        );
+                                        let row_h = 34.0_f32;
+                                        ui.scope(|ui| {
+                                            ui.spacing_mut().item_spacing = Vec2::ZERO;
+                                            egui::ScrollArea::vertical()
+                                                .id_salt("info_drawer_members_scroll")
+                                                .max_height(220.0)
+                                                .auto_shrink([false, false])
+                                                .show_rows(
+                                                    ui,
+                                                    row_h,
+                                                    filtered_members.len(),
+                                                    |ui, row_range| {
+                                                        for idx in row_range {
+                                                            let m = filtered_members[idx];
+                                                            ui.allocate_ui(
+                                                                Vec2::new(
+                                                                    ui.available_width(),
+                                                                    row_h,
+                                                                ),
+                                                                |ui| {
+                                                                    ui.horizontal_centered(|ui| {
+                                                                        let (av_r, _) = ui
+                                                                            .allocate_exact_size(
+                                                                                Vec2::new(
+                                                                                    26.0, 26.0,
+                                                                                ),
+                                                                                Sense::hover(),
+                                                                            );
+                                                                        paint_user_avatar(
+                                                                            ui.painter(),
+                                                                            av_r.center(),
+                                                                            13.0,
+                                                                            &m.name,
+                                                                            false,
+                                                                            m.avatar.as_deref(),
+                                                                            &self.sticker_textures,
+                                                                            &mut self
+                                                                                .loading_stickers,
+                                                                        );
 
-                                                        ui.add_space(4.0);
-                                                        ui.vertical(|ui| {
-                                                            ui.horizontal(|ui| {
-                                                                ui.label(
-                                                                    RichText::new(truncate_chars(
-                                                                        &m.name, 16,
-                                                                    ))
-                                                                    .size(12.0)
-                                                                    .color(pal.text_primary)
-                                                                    .strong(),
-                                                                );
-                                                                if m.role == "creator" {
-                                                                    ui.label(
-                                                                        RichText::new(
-                                                                            "Trưởng nhóm",
-                                                                        )
-                                                                        .size(9.5)
-                                                                        .color(Color32::from_rgb(
-                                                                            245, 158, 11,
-                                                                        )),
-                                                                    );
-                                                                } else if m.role == "admin" {
-                                                                    ui.label(
-                                                                        RichText::new("Phó nhóm")
-                                                                            .size(9.5)
-                                                                            .color(
-                                                                                pal.primary_hover,
-                                                                            ),
-                                                                    );
-                                                                }
-                                                            });
-                                                        });
+                                                                        ui.add_space(4.0);
+                                                                        ui.horizontal(|ui| {
+                                                                            ui.label(
+                                                                                RichText::new(
+                                                                                    truncate_chars(
+                                                                                        &m.name,
+                                                                                        16,
+                                                                                    ),
+                                                                                )
+                                                                                .size(12.0)
+                                                                                .color(
+                                                                                    pal.text_primary,
+                                                                                )
+                                                                                .strong(),
+                                                                            );
+                                                                            if m.role == "creator" {
+                                                                                ui.label(
+                                                                                    RichText::new(
+                                                                                        "Trưởng nhóm",
+                                                                                    )
+                                                                                    .size(9.5)
+                                                                                    .color(
+                                                                                        Color32::from_rgb(
+                                                                                            245,
+                                                                                            158,
+                                                                                            11,
+                                                                                        ),
+                                                                                    ),
+                                                                                );
+                                                                            } else if m.role
+                                                                                == "admin"
+                                                                            {
+                                                                                ui.label(
+                                                                                    RichText::new(
+                                                                                        "Phó nhóm",
+                                                                                    )
+                                                                                    .size(9.5)
+                                                                                    .color(
+                                                                                        pal.primary_hover,
+                                                                                    ),
+                                                                                );
+                                                                            }
+                                                                        });
 
-                                                        ui.with_layout(
-                                                            Layout::right_to_left(Align::Center),
-                                                            |ui| {
-                                                                let chat_btn = ui
-                                                                    .add(
-                                                                        egui::Button::new(
-                                                                            RichText::new(
-                                                                                lucide::SEND,
-                                                                            )
-                                                                            .size(11.0)
-                                                                            .color(
-                                                                                pal.text_secondary,
+                                                                        ui.with_layout(
+                                                                            Layout::right_to_left(
+                                                                                Align::Center,
                                                                             ),
-                                                                        )
-                                                                        .fill(Color32::TRANSPARENT)
-                                                                        .frame(false),
-                                                                    )
-                                                                    .on_hover_cursor(
-                                                                        CursorIcon::PointingHand,
-                                                                    )
-                                                                    .on_hover_text(
-                                                                        "Nhắn tin riêng",
-                                                                    );
-                                                                if chat_btn.clicked() {
-                                                                    open_chat_member =
-                                                                        Some(m.clone());
-                                                                }
+                                                                            |ui| {
+                                                                                let chat_btn = ui
+                                                                                    .add(
+                                                                                        egui::Button::new(
+                                                                                            RichText::new(
+                                                                                                lucide::SEND,
+                                                                                            )
+                                                                                            .size(11.0)
+                                                                                            .color(
+                                                                                                pal.text_secondary,
+                                                                                            ),
+                                                                                        )
+                                                                                        .fill(Color32::TRANSPARENT)
+                                                                                        .frame(false),
+                                                                                    )
+                                                                                    .on_hover_cursor(
+                                                                                        CursorIcon::PointingHand,
+                                                                                    )
+                                                                                    .on_hover_text(
+                                                                                        "Nhắn tin riêng",
+                                                                                    );
+                                                                                if chat_btn
+                                                                                    .clicked()
+                                                                                {
+                                                                                    open_chat_member =
+                                                                                        Some(
+                                                                                            m.clone(),
+                                                                                        );
+                                                                                }
 
-                                                                let prof_btn = ui
-                                                                    .add(
-                                                                        egui::Button::new(
-                                                                            RichText::new(
-                                                                                lucide::USER,
-                                                                            )
-                                                                            .size(12.0)
-                                                                            .color(
-                                                                                pal.text_secondary,
-                                                                            ),
-                                                                        )
-                                                                        .fill(Color32::TRANSPARENT)
-                                                                        .frame(false),
-                                                                    )
-                                                                    .on_hover_cursor(
-                                                                        CursorIcon::PointingHand,
-                                                                    )
-                                                                    .on_hover_text(
-                                                                        "Xem trang cá nhân",
-                                                                    );
-                                                                if prof_btn.clicked() {
-                                                                    view_profile_member =
-                                                                        Some(m.id.clone());
-                                                                }
-                                                            },
-                                                        );
-                                                    });
-                                                }
-                                            });
+                                                                                let prof_btn = ui
+                                                                                    .add(
+                                                                                        egui::Button::new(
+                                                                                            RichText::new(
+                                                                                                lucide::USER,
+                                                                                            )
+                                                                                            .size(12.0)
+                                                                                            .color(
+                                                                                                pal.text_secondary,
+                                                                                            ),
+                                                                                        )
+                                                                                        .fill(Color32::TRANSPARENT)
+                                                                                        .frame(false),
+                                                                                    )
+                                                                                    .on_hover_cursor(
+                                                                                        CursorIcon::PointingHand,
+                                                                                    )
+                                                                                    .on_hover_text(
+                                                                                        "Xem trang cá nhân",
+                                                                                    );
+                                                                                if prof_btn
+                                                                                    .clicked()
+                                                                                {
+                                                                                    view_profile_member =
+                                                                                        Some(
+                                                                                            m.id.clone(),
+                                                                                        );
+                                                                                }
+                                                                            },
+                                                                        );
+                                                                    });
+                                                                },
+                                                            );
+                                                        }
+                                                    },
+                                                );
+                                        });
                                     }
                                     }
                                 });
@@ -5355,7 +5433,7 @@ impl ZaloGuiApp {
                                 }
 
                                 if d_is_group {
-                                    if !self.group_members_map.contains_key(d_id)
+                                    if self.should_fetch_group_members(d_id)
                                         && self.fetching_group_members.insert(d_id.to_string())
                                     {
                                         if let Some(tx) = WORKER_TX.get() {
@@ -5646,7 +5724,7 @@ impl ZaloGuiApp {
                         }
                     }
                     if is_group
-                        && !self.group_members_map.contains_key(&thread_id)
+                        && self.should_fetch_group_members(&thread_id)
                         && self.fetching_group_members.insert(thread_id.clone())
                     {
                         if let Some(tx) = WORKER_TX.get() {
@@ -5683,6 +5761,11 @@ impl ZaloGuiApp {
                                     &self.sticker_textures,
                                     &mut self.loading_stickers,
                                 );
+                                let header_member_count = if is_group {
+                                    self.group_display_member_count(&thread_id)
+                                } else {
+                                    0
+                                };
                                 let cur_onl = self.user_online_map.get(&thread_id);
                                 if !is_group
                                     && cur_onl.map(|(onl, _)| *onl).unwrap_or(false)
@@ -5795,12 +5878,13 @@ impl ZaloGuiApp {
                                                 let who = self.typing_map.get(&thread_id).map(|(w, _)| w.as_str()).unwrap_or("Đang");
                                                 (format!("✍ {who} đang soạn thảo…"), pal.primary)
                                             } else if is_group {
-                                                let m_cnt = self.group_members_map.get(&thread_id)
-                                                    .map(|m| m.len())
-                                                    .or(self.threads.get(self.selected_thread_index).and_then(|t| t.presentation.member_count).map(|c| c as usize))
-                                                    .unwrap_or(0);
+                                                let m_cnt = header_member_count;
                                                 let txt = if m_cnt > 0 {
-                                                    format!("👥 {m_cnt} thành viên")
+                                                    if self.fetching_group_members.contains(&thread_id) {
+                                                        format!("👥 {m_cnt} thành viên · đang tải…")
+                                                    } else {
+                                                        format!("👥 {m_cnt} thành viên")
+                                                    }
                                                 } else if self.fetching_group_members.contains(&thread_id) {
                                                     "👥 Đang tải thành viên…".into()
                                                 } else {
@@ -6962,63 +7046,94 @@ impl ZaloGuiApp {
                     } else {
                         None
                     };
+                    let mut observed_group_members: Vec<crate::chat::SidebarMember> = Vec::new();
                     let mut mention_candidates: Vec<MentionCandidate> = Vec::new();
                     if let Some((_, ref query)) = active_mention_info {
                         if &self.dismissed_mention_suggest_for != query {
-                            let q_trim = query.trim();
-                            let q_fold = crate::chat::strip_vn_for_sticker_kw(q_trim);
-
                             if is_group {
-                                if q_trim.is_empty()
-                                    || "all".contains(&q_fold)
-                                    || "tat ca".contains(&q_fold)
-                                    || "nhom".contains(&q_fold)
+                                if self.should_fetch_group_members(&thread_id)
+                                    && self.fetching_group_members.insert(thread_id.clone())
                                 {
-                                    mention_candidates.push(MentionCandidate {
-                                        id: "-1".to_string(),
-                                        name: "All".to_string(),
-                                        avatar: None,
-                                        role: "Nhac ca nhom (@All)".to_string(),
-                                        is_all: true,
-                                    });
-                                }
-
-                                if let Some(members) = self.group_members_map.get(&thread_id) {
-                                    for m in members {
-                                        if m.name.trim().is_empty() {
-                                            continue;
-                                        }
-                                        if q_trim.is_empty() {
-                                            mention_candidates.push(MentionCandidate {
-                                                id: m.id.clone(),
-                                                name: m.name.clone(),
-                                                avatar: m.avatar.clone(),
-                                                role: m.role.clone(),
-                                                is_all: false,
-                                            });
-                                        } else {
-                                            let m_fold = crate::chat::strip_vn_for_sticker_kw(&m.name);
-                                            if m.name.to_lowercase().contains(&q_trim.to_lowercase())
-                                                || m_fold.contains(&q_fold)
-                                            {
-                                                mention_candidates.push(MentionCandidate {
-                                                    id: m.id.clone(),
-                                                    name: m.name.clone(),
-                                                    avatar: m.avatar.clone(),
-                                                    role: m.role.clone(),
-                                                    is_all: false,
-                                                });
-                                            }
-                                        }
-                                    }
-                                } else if self.fetching_group_members.insert(thread_id.clone()) {
                                     if let Some(tx) = WORKER_TX.get() {
                                         let _ = tx.send(WorkerCmd::FetchGroupMembers {
                                             group_id: thread_id.clone(),
                                         });
                                     }
                                 }
+                                let contact_avatars: HashMap<&str, &str> = self
+                                    .threads
+                                    .iter()
+                                    .filter(|th| !th.is_group)
+                                    .filter_map(|th| {
+                                        th.avatar
+                                            .as_deref()
+                                            .filter(|a| !a.is_empty())
+                                            .map(|a| (th.id.as_str(), a))
+                                    })
+                                    .collect();
+                                if let Some(thread) = self.threads.get(self.selected_thread_index) {
+                                    let mut seen_obs: HashSet<String> = HashSet::new();
+                                    for msg in &thread.messages {
+                                        if let Some(uid) = crate::chat::sidebar_sender_id(msg) {
+                                            let sname = msg.sender.trim();
+                                            if !sname.is_empty()
+                                                && !sname.chars().all(|c| c.is_ascii_digit())
+                                                && seen_obs.insert(uid.clone())
+                                            {
+                                                let ava = contact_avatars
+                                                    .get(uid.as_str())
+                                                    .map(|s| (*s).to_string());
+                                                observed_group_members.push(
+                                                    crate::chat::SidebarMember {
+                                                        id: uid,
+                                                        name: sname.to_string(),
+                                                        avatar: ava,
+                                                        role: "member".to_string(),
+                                                    },
+                                                );
+                                            }
+                                        }
+                                        for (uid, uname) in &msg.resolved_mention_uids {
+                                            let tname = uname.trim();
+                                            if !tname.is_empty()
+                                                && !tname.chars().all(|c| c.is_ascii_digit())
+                                                && seen_obs.insert(uid.clone())
+                                            {
+                                                let ava = contact_avatars
+                                                    .get(uid.as_str())
+                                                    .map(|s| (*s).to_string());
+                                                observed_group_members.push(
+                                                    crate::chat::SidebarMember {
+                                                        id: uid.clone(),
+                                                        name: tname.to_string(),
+                                                        avatar: ava,
+                                                        role: "member".to_string(),
+                                                    },
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                let empty_members = Vec::new();
+                                let base_members = self
+                                    .group_members_map
+                                    .get(&thread_id)
+                                    .filter(|m| !m.is_empty())
+                                    .or_else(|| {
+                                        self.threads
+                                            .get(self.selected_thread_index)
+                                            .map(|t| &t.presentation.members)
+                                            .filter(|m| !m.is_empty())
+                                    })
+                                    .unwrap_or(&empty_members);
+                                mention_candidates = build_group_mention_candidates(
+                                    base_members,
+                                    &observed_group_members,
+                                    query,
+                                );
                             } else {
+                                let q_trim = query.trim();
+                                let q_fold = crate::chat::strip_vn_for_sticker_kw(q_trim);
                                 let p_name = thread_name.clone();
                                 if !p_name.is_empty() {
                                     let p_fold = crate::chat::strip_vn_for_sticker_kw(&p_name);
@@ -7030,7 +7145,7 @@ impl ZaloGuiApp {
                                             id: thread_id.clone(),
                                             name: p_name,
                                             avatar: thread_avatar.clone(),
-                                            role: "Ban be".to_string(),
+                                            role: "Bạn bè".to_string(),
                                             is_all: false,
                                         });
                                     }
@@ -8455,6 +8570,7 @@ impl ZaloGuiApp {
                     }
 
                     // 4. Bottom Message Composer Bar — Zalo PC 2-row style (Toolbar strip + Full-width Input & Send)
+                    let mut mention_sel_changed_by_key = false;
                     let comp_outer_w = ui.available_width();
                     let composer_frame = egui::Frame::none()
                         .fill(pal.bg_sidebar)
@@ -9242,9 +9358,11 @@ impl ZaloGuiApp {
                                         if ui.input(|i| i.key_pressed(Key::ArrowUp)) {
                                             self.composer_mention_selected =
                                                 (self.composer_mention_selected + len - 1) % len;
+                                            mention_sel_changed_by_key = true;
                                         } else if ui.input(|i| i.key_pressed(Key::ArrowDown)) {
                                             self.composer_mention_selected =
                                                 (self.composer_mention_selected + 1) % len;
+                                            mention_sel_changed_by_key = true;
                                         } else if ui.input(|i| i.key_pressed(Key::Escape)) {
                                             if let Some((_, ref q)) = active_mention_info {
                                                 self.dismissed_mention_suggest_for = q.clone();
@@ -9376,15 +9494,27 @@ impl ZaloGuiApp {
                                         let pending_mentions =
                                             std::mem::take(&mut self.composer_pending_mentions);
                                         let mentions = if is_group {
-                                            let member_pairs: Vec<(String, String)> = self
+                                            let mut seen_uids: HashSet<String> = HashSet::new();
+                                            let mut member_pairs: Vec<(String, String)> = self
                                                 .group_members_map
                                                 .get(&thread_id)
+                                                .or_else(|| {
+                                                    self.threads
+                                                        .get(self.selected_thread_index)
+                                                        .map(|t| &t.presentation.members)
+                                                })
                                                 .map(|ms| {
                                                     ms.iter()
+                                                        .filter(|m| seen_uids.insert(m.id.clone()))
                                                         .map(|m| (m.id.clone(), m.name.clone()))
                                                         .collect()
                                                 })
                                                 .unwrap_or_default();
+                                            for m in &observed_group_members {
+                                                if seen_uids.insert(m.id.clone()) {
+                                                    member_pairs.push((m.id.clone(), m.name.clone()));
+                                                }
+                                            }
                                             crate::chat::build_wire_mentions(
                                                 &text,
                                                 &pending_mentions,
@@ -9459,11 +9589,35 @@ impl ZaloGuiApp {
                     // 4a. Floating Mention Suggestion Popover (`egui::Area`, rendered AFTER composer bar)
                     let mut click_chosen_mention: Option<MentionCandidate> = None;
                     if !mention_candidates.is_empty() {
+                        let loaded_member_cnt = self
+                            .group_members_map
+                            .get(&thread_id)
+                            .map(Vec::len)
+                            .unwrap_or(0);
+                        let meta_opt = self.group_members_meta.get(&thread_id);
+                        let popover_status = MentionPopoverStatus {
+                            is_loading: is_group && self.fetching_group_members.contains(&thread_id),
+                            loaded_count: meta_opt
+                                .map(|m| m.processed_roster_count.max(loaded_member_cnt))
+                                .unwrap_or(loaded_member_cnt),
+                            total_expected: meta_opt
+                                .map(|m| m.expected_roster_count)
+                                .unwrap_or(0),
+                            total_member: if is_group {
+                                self.group_display_member_count(&thread_id)
+                            } else {
+                                1
+                            },
+                            members_restricted: meta_opt.is_some_and(|m| m.members_restricted),
+                        };
                         if let Some(chosen) = self.render_mention_suggestion_popover(
                             ctx,
+                            &thread_id,
                             composer_frame.response.rect,
                             &mention_candidates,
                             self.composer_mention_selected,
+                            mention_sel_changed_by_key,
+                            &popover_status,
                             pal,
                         ) {
                             click_chosen_mention = Some(chosen);
@@ -10634,13 +10788,100 @@ fn play_voice_attachment(url: &str, file_name: &str, msg_id: &str, download_dir:
 }
 
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MentionCandidate {
     pub id: String,
     pub name: String,
     pub avatar: Option<String>,
     pub role: String,
     pub is_all: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct MentionPopoverStatus {
+    pub is_loading: bool,
+    pub loaded_count: usize,
+    pub total_expected: usize,
+    pub total_member: usize,
+    pub members_restricted: bool,
+}
+
+fn mention_role_rank(role: &str) -> u8 {
+    match role {
+        "creator" | "Trưởng nhóm" => 0,
+        "admin" | "Phó nhóm" => 1,
+        _ => 2,
+    }
+}
+
+/// Build `@mention` autocomplete candidates for a group chat without truncation.
+/// Pins `@All` ("Báo cho cả nhóm") at index 0 when the query matches, followed by
+/// ALL matching members from `members` and deduped `observed_members`, filtered
+/// live with Vietnamese accent-insensitive matching.
+pub(crate) fn build_group_mention_candidates(
+    members: &[crate::chat::SidebarMember],
+    observed_members: &[crate::chat::SidebarMember],
+    query: &str,
+) -> Vec<MentionCandidate> {
+    let q_trim = query.trim();
+    let q_lower = q_trim.to_lowercase();
+    let q_fold = crate::chat::strip_vn_for_sticker_kw(q_trim);
+
+    let mut out: Vec<MentionCandidate> = Vec::new();
+    if q_trim.is_empty()
+        || "all".contains(&q_fold)
+        || "tat ca".contains(&q_fold)
+        || "ca nhom".contains(&q_fold)
+        || "bao cho ca nhom".contains(&q_fold)
+        || "nhom".contains(&q_fold)
+    {
+        out.push(MentionCandidate {
+            id: "-1".to_string(),
+            name: "All".to_string(),
+            avatar: None,
+            role: "Báo cho cả nhóm".to_string(),
+            is_all: true,
+        });
+    }
+
+    let mut seen_ids: HashSet<&str> = HashSet::with_capacity(members.len() + observed_members.len());
+    let mut member_matches: Vec<(bool, u8, MentionCandidate)> = Vec::new();
+
+    for m in members.iter().chain(observed_members.iter()) {
+        if m.name.trim().is_empty() || !seen_ids.insert(m.id.as_str()) {
+            continue;
+        }
+        let m_lower = m.name.to_lowercase();
+        let m_fold = crate::chat::strip_vn_for_sticker_kw(&m.name);
+        let matched = q_trim.is_empty()
+            || m_lower.contains(&q_lower)
+            || (!q_fold.is_empty() && m_fold.contains(&q_fold));
+        if matched {
+            let is_prefix = !q_trim.is_empty()
+                && (m_lower.starts_with(&q_lower)
+                    || (!q_fold.is_empty() && m_fold.starts_with(&q_fold)));
+            member_matches.push((
+                is_prefix,
+                mention_role_rank(&m.role),
+                MentionCandidate {
+                    id: m.id.clone(),
+                    name: m.name.clone(),
+                    avatar: m.avatar.clone(),
+                    role: m.role.clone(),
+                    is_all: false,
+                },
+            ));
+        }
+    }
+
+    if q_trim.is_empty() {
+        member_matches.sort_by_key(|(_, rank, _)| *rank);
+    } else {
+        member_matches.sort_by_key(|(is_prefix, rank, _)| (!*is_prefix, *rank));
+    }
+
+    out.extend(member_matches.into_iter().map(|(_, _, cand)| cand));
+    out
 }
 
 pub(crate) fn extract_active_mention_query(text: &str) -> Option<(usize, &str)> {
@@ -10721,29 +10962,33 @@ impl ZaloGuiApp {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn render_mention_suggestion_popover(
         &mut self,
         ctx: &egui::Context,
+        thread_id: &str,
         composer_rect: Rect,
         candidates: &[MentionCandidate],
         selected_idx: usize,
+        selection_changed_by_key: bool,
+        status: &MentionPopoverStatus,
         pal: &ThemePalette,
     ) -> Option<MentionCandidate> {
         if candidates.is_empty() {
             return None;
         }
 
-        let max_visible = 6;
+        let max_visible = 8;
         let item_h = 36.0_f32;
         let header_h = 28.0_f32;
         let footer_h = 24.0_f32;
         let visible_items = candidates.len().min(max_visible);
-        let content_h = (visible_items as f32 * item_h) + header_h + footer_h + 16.0;
+        let content_h = (visible_items as f32 * item_h) + header_h + footer_h + 18.0;
         let raw_comp_w = composer_rect.width();
         let popover_w = if raw_comp_w.is_finite() {
-            raw_comp_w.clamp(280.0, 380.0_f32.max(280.0))
+            raw_comp_w.clamp(300.0, 420.0)
         } else {
-            320.0
+            340.0
         };
         let pos = Pos2::new(
             composer_rect.left() + 8.0,
@@ -10751,6 +10996,8 @@ impl ZaloGuiApp {
         );
 
         let mut chosen = None;
+        let member_match_count = candidates.iter().filter(|c| !c.is_all).count();
+        let scroll_state_id = Id::new(("mention_scroll_y", thread_id));
 
         egui::Area::new(Id::new("zalo_composer_mention_popover"))
             .order(egui::Order::Foreground)
@@ -10777,125 +11024,204 @@ impl ZaloGuiApp {
                         // Header
                         ui.horizontal(|ui| {
                             ui.label(
-                                RichText::new("👥  NHẮC ĐẾN THÀNH VIÊN (@mention)")
+                                RichText::new("👥  NHẮC ĐẾN THÀNH VIÊN")
                                     .size(11.0)
                                     .color(pal.primary)
                                     .strong(),
                             );
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if status.is_loading {
+                                    let expected = status.total_expected.max(status.total_member);
+                                    ui.label(
+                                        RichText::new(if expected > 0 {
+                                            format!("Đang tải {}/{}…", status.loaded_count, expected)
+                                        } else {
+                                            "Đang tải…".to_string()
+                                        })
+                                        .size(10.5)
+                                        .color(pal.text_muted),
+                                    );
+                                    ui.spinner();
+                                } else {
+                                    ui.label(
+                                        RichText::new(format!("{member_match_count} thành viên"))
+                                            .size(10.5)
+                                            .color(pal.text_muted),
+                                    );
+                                }
+                            });
                         });
                         ui.add_space(4.0);
                         ui.separator();
                         ui.add_space(2.0);
 
-                        // Candidates List
+                        // Virtualized Candidates List (`show_rows` keeps 600-1000+ rows O(1) per frame)
                         let scroll_max_h = (visible_items as f32 * item_h) + 2.0;
-                        egui::ScrollArea::vertical()
+                        let mut scroll_area = egui::ScrollArea::vertical()
                             .id_salt("mention_candidates_scroll")
                             .max_height(scroll_max_h)
-                            .auto_shrink([false, true])
-                            .show(ui, |ui| {
-                                for (idx, cand) in candidates.iter().enumerate() {
-                                    let is_sel = idx == selected_idx;
-                                    let (row_rect, row_resp) = ui.allocate_exact_size(
-                                        Vec2::new(ui.available_width(), item_h),
-                                        Sense::click(),
-                                    );
+                            .auto_shrink([false, true]);
+                        if selection_changed_by_key {
+                            let prev_y: f32 =
+                                ui.ctx().data(|d| d.get_temp(scroll_state_id)).unwrap_or(0.0);
+                            let row_top = selected_idx as f32 * item_h;
+                            let row_bottom = row_top + item_h;
+                            if row_top < prev_y {
+                                scroll_area = scroll_area.vertical_scroll_offset(row_top);
+                            } else if row_bottom > prev_y + scroll_max_h {
+                                scroll_area = scroll_area
+                                    .vertical_scroll_offset((row_bottom - scroll_max_h).max(0.0));
+                            }
+                        }
 
-                                    if is_sel || row_resp.hovered() {
-                                        ui.painter().rect_filled(
-                                            row_rect,
-                                            Rounding::same(6.0),
+                        let scroll_out = ui
+                            .scope(|ui| {
+                                ui.spacing_mut().item_spacing.y = 0.0;
+                                scroll_area.show_rows(ui, item_h, candidates.len(), |ui, row_range| {
+                                    for idx in row_range {
+                                        let cand = &candidates[idx];
+                                        let is_sel = idx == selected_idx;
+                                        let (row_rect, row_resp) = ui.allocate_exact_size(
+                                            Vec2::new(ui.available_width(), item_h),
+                                            Sense::click(),
+                                        );
+
+                                        if is_sel || row_resp.hovered() {
+                                            ui.painter().rect_filled(
+                                                row_rect,
+                                                Rounding::same(6.0),
+                                                if is_sel {
+                                                    pal.bg_selected
+                                                } else {
+                                                    pal.bg_hover
+                                                },
+                                            );
+                                        }
+
+                                        // Avatar
+                                        let ava_center =
+                                            Pos2::new(row_rect.left() + 18.0, row_rect.center().y);
+                                        if cand.is_all {
+                                            ui.painter().circle_filled(ava_center, 12.0, pal.primary);
+                                            ui.painter().text(
+                                                ava_center,
+                                                egui::Align2::CENTER_CENTER,
+                                                "@",
+                                                FontId::proportional(12.0),
+                                                Color32::WHITE,
+                                            );
+                                        } else {
+                                            paint_user_avatar(
+                                                ui.painter(),
+                                                ava_center,
+                                                12.0,
+                                                &cand.name,
+                                                false,
+                                                cand.avatar.as_deref(),
+                                                &self.sticker_textures,
+                                                &mut self.loading_stickers,
+                                            );
+                                        }
+
+                                        // Name
+                                        let name_left = row_rect.left() + 38.0;
+                                        let name_text = if cand.is_all {
+                                            "@All".to_string()
+                                        } else {
+                                            truncate_chars(&cand.name, 26).to_string()
+                                        };
+                                        ui.painter().text(
+                                            Pos2::new(name_left, row_rect.center().y),
+                                            egui::Align2::LEFT_CENTER,
+                                            name_text,
+                                            FontId::proportional(13.0),
                                             if is_sel {
-                                                pal.bg_selected
+                                                pal.primary
                                             } else {
-                                                pal.bg_hover
+                                                pal.text_primary
                                             },
                                         );
-                                    }
 
-                                    // Avatar
-                                    let ava_center =
-                                        Pos2::new(row_rect.left() + 18.0, row_rect.center().y);
-                                    if cand.is_all {
-                                        ui.painter().circle_filled(ava_center, 12.0, pal.primary);
-                                        ui.painter().text(
-                                            ava_center,
-                                            egui::Align2::CENTER_CENTER,
-                                            "@",
-                                            FontId::proportional(12.0),
-                                            Color32::WHITE,
-                                        );
-                                    } else {
-                                        paint_user_avatar(
-                                            ui.painter(),
-                                            ava_center,
-                                            12.0,
-                                            &cand.name,
-                                            false,
-                                            cand.avatar.as_deref(),
-                                            &self.sticker_textures,
-                                            &mut self.loading_stickers,
-                                        );
-                                    }
-
-                                    // Name
-                                    let name_left = row_rect.left() + 38.0;
-                                    let name_text = if cand.is_all {
-                                        "@All".to_string()
-                                    } else {
-                                        truncate_chars(&cand.name, 24).to_string()
-                                    };
-                                    ui.painter().text(
-                                        Pos2::new(name_left, row_rect.center().y),
-                                        egui::Align2::LEFT_CENTER,
-                                        name_text,
-                                        FontId::proportional(13.0),
-                                        if is_sel {
-                                            pal.primary
-                                        } else {
-                                            pal.text_primary
-                                        },
-                                    );
-
-                                    // Role or subtitle tag
-                                    if !cand.role.is_empty() {
-                                        let role_str = match cand.role.as_str() {
-                                            "creator" | "Trưởng nhóm" => "Trưởng nhóm",
-                                            "admin" | "Phó nhóm" => "Phó nhóm",
-                                            other => other,
-                                        };
-                                        let role_col = match cand.role.as_str() {
-                                            "creator" | "Trưởng nhóm" => {
-                                                Color32::from_rgb(234, 179, 8)
+                                        // Role or subtitle tag
+                                        if !cand.role.is_empty() {
+                                            let role_str = match cand.role.as_str() {
+                                                "creator" | "Trưởng nhóm" => "Trưởng nhóm",
+                                                "admin" | "Phó nhóm" => "Phó nhóm",
+                                                "member" => "",
+                                                other => other,
+                                            };
+                                            if !role_str.is_empty() {
+                                                let role_col = match cand.role.as_str() {
+                                                    "creator" | "Trưởng nhóm" => {
+                                                        Color32::from_rgb(234, 179, 8)
+                                                    }
+                                                    "admin" | "Phó nhóm" => pal.primary,
+                                                    _ => pal.text_muted,
+                                                };
+                                                ui.painter().text(
+                                                    Pos2::new(
+                                                        row_rect.right() - 8.0,
+                                                        row_rect.center().y,
+                                                    ),
+                                                    egui::Align2::RIGHT_CENTER,
+                                                    role_str,
+                                                    FontId::proportional(11.0),
+                                                    role_col,
+                                                );
                                             }
-                                            "admin" | "Phó nhóm" => pal.primary,
-                                            _ => pal.text_muted,
-                                        };
-                                        ui.painter().text(
-                                            Pos2::new(row_rect.right() - 8.0, row_rect.center().y),
-                                            egui::Align2::RIGHT_CENTER,
-                                            role_str,
-                                            FontId::proportional(11.0),
-                                            role_col,
-                                        );
-                                    }
+                                        }
 
-                                    if row_resp.on_hover_cursor(CursorIcon::PointingHand).clicked()
-                                    {
-                                        chosen = Some(cand.clone());
+                                        if row_resp
+                                            .on_hover_cursor(CursorIcon::PointingHand)
+                                            .clicked()
+                                        {
+                                            chosen = Some(cand.clone());
+                                        }
                                     }
-                                }
-                            });
+                                })
+                            })
+                            .inner;
+                        ui.ctx().data_mut(|d| {
+                            d.insert_temp(scroll_state_id, scroll_out.state.offset.y);
+                        });
 
                         // Footer hint
                         ui.add_space(4.0);
                         ui.separator();
                         ui.add_space(2.0);
-                        ui.label(
-                            RichText::new("↑↓ duyệt · Enter/Tab chèn · Esc huỷ")
+                        if status.is_loading {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                let expected = status.total_expected.max(status.total_member);
+                                let msg = if expected > 0 {
+                                    format!(
+                                        "Đang tải thêm thành viên ({}/{})… · ↑↓ duyệt · Enter/Tab chèn",
+                                        status.loaded_count, expected
+                                    )
+                                } else {
+                                    "Đang tải thêm thành viên… · ↑↓ duyệt · Enter/Tab chèn"
+                                        .to_string()
+                                };
+                                ui.label(RichText::new(msg).size(10.5).color(pal.text_muted));
+                            });
+                        } else if status.members_restricted
+                            && status.total_member > status.loaded_count
+                        {
+                            ui.label(
+                                RichText::new(format!(
+                                    "Cộng đồng ẩn danh sách ({}/{}) · ↑↓ duyệt · Enter/Tab chèn",
+                                    status.loaded_count, status.total_member
+                                ))
                                 .size(10.5)
                                 .color(pal.text_muted),
-                        );
+                            );
+                        } else {
+                            ui.label(
+                                RichText::new("↑↓ duyệt · Enter/Tab chèn · Esc huỷ")
+                                    .size(10.5)
+                                    .color(pal.text_muted),
+                            );
+                        }
                     });
             });
 
@@ -11451,5 +11777,80 @@ mod quote_navigation_tests {
             fp_unread, fp_msg,
             "new message at index 75 must invalidate sidebar cache"
         );
+    }
+
+    #[test]
+    fn mention_candidates_include_all_602_members_and_filter_vietnamese_without_truncation() {
+        let mut members: Vec<crate::chat::SidebarMember> = (1..=602)
+            .map(|i| crate::chat::SidebarMember {
+                id: format!("u_{i}"),
+                name: match i {
+                    1 => "Trần Văn Hiển".to_string(),
+                    2 => "Nguyễn Thị Thảo".to_string(),
+                    250 => "Nguyễn Minh Thảo".to_string(),
+                    602 => "Phạm Thảo Nguyên".to_string(),
+                    _ => format!("Thành viên số {i}"),
+                },
+                avatar: None,
+                role: if i == 1 {
+                    "creator".to_string()
+                } else if i <= 4 {
+                    "admin".to_string()
+                } else {
+                    "member".to_string()
+                },
+            })
+            .collect();
+
+        let observed = vec![
+            crate::chat::SidebarMember {
+                id: "u_602".to_string(),
+                name: "Phạm Thảo Nguyên".to_string(),
+                avatar: None,
+                role: "member".to_string(),
+            },
+            crate::chat::SidebarMember {
+                id: "u_extra".to_string(),
+                name: "Lê Hoàng Thảo".to_string(),
+                avatar: None,
+                role: "member".to_string(),
+            },
+        ];
+
+        // Empty query returns @All ("Báo cho cả nhóm") pinned at 0 + ALL 603 unique members (no cap)
+        let all = super::build_group_mention_candidates(&members, &observed, "");
+        assert_eq!(all.len(), 604);
+        assert!(all[0].is_all);
+        assert_eq!(all[0].id, "-1");
+        assert_eq!(all[0].name, "All");
+        assert_eq!(all[0].role, "Báo cho cả nhóm");
+        assert_eq!(all[1].id, "u_1");
+        assert_eq!(all[1].role, "creator");
+
+        // Accent-insensitive Vietnamese search finds all matches across the entire 602+ roster
+        let thao = super::build_group_mention_candidates(&members, &observed, "thao");
+        let thao_ids: Vec<&str> = thao.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(thao_ids.len(), 4);
+        assert!(thao_ids.contains(&"u_2"));
+        assert!(thao_ids.contains(&"u_250"));
+        assert!(thao_ids.contains(&"u_602"));
+        assert!(thao_ids.contains(&"u_extra"));
+
+        // Prefix match ranks before substring match
+        let nguyen = super::build_group_mention_candidates(&members, &[], "nguyen");
+        assert_eq!(nguyen.len(), 3);
+        assert!(nguyen[0].name.starts_with("Nguyễn"));
+
+        // @All aliases match cleanly
+        for q in ["all", "tat ca", "bao cho"] {
+            let hits = super::build_group_mention_candidates(&members, &[], q);
+            assert!(hits.iter().any(|c| c.is_all), "query '{q}' should match @All");
+        }
+
+        // Keep compiler happy if we test mutating empty slice too
+        members.clear();
+        let empty = super::build_group_mention_candidates(&members, &[], "");
+        assert_eq!(empty.len(), 1);
+        assert!(empty[0].is_all);
     }
 }
