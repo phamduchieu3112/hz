@@ -10155,6 +10155,7 @@ impl ZaloGuiApp {
                                     group_id: tid,
                                     is_group: true,
                                     have: 0,
+                                    mode: HistoryLoadMode::RefreshLatest,
                                 });
                             }
                         }

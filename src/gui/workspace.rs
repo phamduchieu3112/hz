@@ -1,5 +1,34 @@
 use super::*;
 
+/// Computes a fingerprint over ALL threads (including unread counts, presentation flags, and
+/// latest message metadata) so sidebar sorting/filtering never misses updates past index 64.
+pub(crate) fn compute_sidebar_cache_fingerprint(threads: &[Thread], selected_index: usize) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    threads.len().hash(&mut h);
+    for t in threads {
+        t.id.hash(&mut h);
+        t.name.hash(&mut h);
+        t.preview.hash(&mut h);
+        t.time.hash(&mut h);
+        t.messages.len().hash(&mut h);
+        if let Some(last) = t.messages.last() {
+            last.ts.hash(&mut h);
+            last.id.hash(&mut h);
+        }
+        t.unread.unread_ids.len().hash(&mut h);
+        t.unread.marked_unread.hash(&mut h);
+        t.presentation.pinned.hash(&mut h);
+        t.presentation.hidden.hash(&mut h);
+        t.presentation.muted.hash(&mut h);
+        t.unread.muted_until.hash(&mut h);
+    }
+    if let Some(t) = threads.get(selected_index) {
+        t.id.hash(&mut h);
+    }
+    h.finish()
+}
+
 /// Computes the vertical height reserved for the central chat message ScrollArea
 /// so the composer toolbar and optional sticker picker remain visible on compact windows (e.g. 480x360).
 pub(crate) fn compute_chat_stream_height(avail_h: f32, reserved_bottom_h: f32) -> f32 {
@@ -443,6 +472,7 @@ impl ZaloGuiApp {
                                     group_id: cid,
                                     is_group: false,
                                     have: 0,
+                                    mode: HistoryLoadMode::RefreshLatest,
                                 });
                             }
                         }
@@ -1094,6 +1124,7 @@ impl ZaloGuiApp {
                                                         group_id: gid,
                                                         is_group: true,
                                                         have: 0,
+                                                        mode: HistoryLoadMode::RefreshLatest,
                                                     });
                                                 }
                                             }
@@ -1298,20 +1329,8 @@ impl ZaloGuiApp {
 
                 // Sidebar cache (#135): skip re-filter+sort every frame unless
                 // query/filter/threads/selected changed or 500ms passed.
-                let cache_key_fingerprint: u64 = {
-                    use std::hash::{Hash, Hasher};
-                    let mut h = std::collections::hash_map::DefaultHasher::new();
-                    self.threads.len().hash(&mut h);
-                    self.threads.iter().take(64).for_each(|t| {
-                        t.id.hash(&mut h);
-                        t.preview.hash(&mut h);
-                        t.messages.len().hash(&mut h);
-                    });
-                    if let Some(t) = self.threads.get(self.selected_thread_index) {
-                        t.id.hash(&mut h);
-                    }
-                    h.finish()
-                };
+                let cache_key_fingerprint: u64 =
+                    compute_sidebar_cache_fingerprint(&self.threads, self.selected_thread_index);
                 let cache_key = (
                     query.clone(),
                     format!("{:?}", self.thread_filter),
@@ -2476,6 +2495,7 @@ impl ZaloGuiApp {
                                 group_id: tid,
                                 is_group,
                                 have: 0,
+                                mode: HistoryLoadMode::RefreshLatest,
                             });
                         }
                     }
@@ -3394,6 +3414,7 @@ impl ZaloGuiApp {
                                                     group_id: d_id.clone(),
                                                     is_group: d_is_group,
                                                     have: d_msg_count,
+                                                    mode: HistoryLoadMode::RefreshLatest,
                                                 });
                                             }
                                             self.show_toast("Đang đồng bộ dữ liệu hội thoại…");
@@ -3432,6 +3453,7 @@ impl ZaloGuiApp {
                                                             group_id: d_id.clone(),
                                                             is_group: d_is_group,
                                                             have: d_msg_count,
+                                                            mode: HistoryLoadMode::RefreshLatest,
                                                         });
                                                     }
                                                     self.show_toast("Đang đồng bộ lịch sử hội thoại…");
@@ -7036,6 +7058,7 @@ impl ZaloGuiApp {
                                                                             group_id: thread_id.clone(),
                                                                             is_group,
                                                                             have: thread.messages.len(),
+                                                                            mode: HistoryLoadMode::LoadOlder,
                                                                         },
                                                                     );
                                                                 }
@@ -11076,5 +11099,36 @@ mod quote_navigation_tests {
                 .expect("should replace active mention");
         assert_eq!(new_draft, "Nhắc @Anh Tuấn về báo cáo");
         assert_eq!(next_cursor, "Nhắc @Anh Tuấn".chars().count());
+    }
+
+    #[test]
+    fn sidebar_cache_fingerprint_detects_changes_past_index_64_and_unread_badges() {
+        let mut threads: Vec<Thread> = (0..80)
+            .map(|i| Thread {
+                id: format!("t_{i}"),
+                name: format!("Hội thoại {i}"),
+                ..Default::default()
+            })
+            .collect();
+        let fp_initial = compute_sidebar_cache_fingerprint(&threads, 0);
+
+        threads[75].unread.marked_unread = true;
+        let fp_unread = compute_sidebar_cache_fingerprint(&threads, 0);
+        assert_ne!(
+            fp_initial, fp_unread,
+            "unread badge change at index 75 must invalidate sidebar cache"
+        );
+
+        threads[75].messages.push(ChatMessage {
+            id: "m_new".into(),
+            ts: 1_760_000_000_000,
+            text: "Tin mới".into(),
+            ..Default::default()
+        });
+        let fp_msg = compute_sidebar_cache_fingerprint(&threads, 0);
+        assert_ne!(
+            fp_unread, fp_msg,
+            "new message at index 75 must invalidate sidebar cache"
+        );
     }
 }

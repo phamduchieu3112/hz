@@ -2509,7 +2509,10 @@ impl ZaloGuiApp {
         self.load_draft_for(&new_tid);
         self.filter_starred_only = false;
         self.force_scroll_to_bottom = true;
-        self.chat_render_window = (new_tid, CHAT_RENDER_STEP);
+        self.chat_render_window = (new_tid.clone(), CHAT_RENDER_STEP);
+        if let Ok(mut sel) = worker::SELECTED_THREAD_ID.lock() {
+            *sel = new_tid;
+        }
     }
 
     /// Tải lại badge nháp + list reminder từ DB acc hiện tại (WaveA1).
@@ -2579,6 +2582,13 @@ impl ZaloGuiApp {
                 .iter()
                 .map(|t| (t.id.clone(), t.name.clone(), t.is_group))
                 .collect();
+        }
+        if let Ok(mut sel) = worker::SELECTED_THREAD_ID.lock() {
+            *sel = self
+                .threads
+                .get(self.selected_thread_index)
+                .map(|t| t.id.clone())
+                .unwrap_or_default();
         }
     }
     /// Rebuild `VANISH_THREADS` from the current RAM threads (gui.rs:875).

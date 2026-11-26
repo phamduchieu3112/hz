@@ -162,21 +162,407 @@ fn require_next_cursor(candidate: Option<String>, current: &str) -> Result<Strin
         })
 }
 
-static LATEST_MOBILE_TEMP_KEY: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+const TEMP_KEY_TTL: Duration = Duration::from_secs(300);
+
+static LATEST_MOBILE_TEMP_KEY: std::sync::Mutex<Option<(String, std::time::Instant)>> =
+    std::sync::Mutex::new(None);
 
 /// Record a fresh `temp_key` received from a `transfer_after_login` control event.
 pub fn set_latest_mobile_temp_key(temp_key: &str) {
+    let trimmed = temp_key.trim();
     if let Ok(mut g) = LATEST_MOBILE_TEMP_KEY.lock() {
-        *g = temp_key.trim().to_string();
+        if trimmed.is_empty() {
+            *g = None;
+        } else {
+            *g = Some((trimmed.to_string(), std::time::Instant::now()));
+        }
     }
 }
 
-/// Return the most recent `temp_key` issued by the user's phone on login (if any).
+/// Return the most recent non-expired `temp_key` issued by the user's phone on login (if any).
 pub fn latest_mobile_temp_key() -> String {
-    LATEST_MOBILE_TEMP_KEY
+    if let Ok(mut g) = LATEST_MOBILE_TEMP_KEY.lock() {
+        if let Some((ref key, at)) = *g {
+            if at.elapsed() < TEMP_KEY_TTL {
+                return key.clone();
+            }
+            *g = None;
+        }
+    }
+    String::new()
+}
+
+/// Consume and clear the one-time `temp_key` (returns empty if missing or expired).
+pub fn take_latest_mobile_temp_key() -> String {
+    let taken = if let Ok(mut g) = LATEST_MOBILE_TEMP_KEY.lock() {
+        match g.take() {
+            Some((key, at)) if at.elapsed() < TEMP_KEY_TTL => key,
+            _ => String::new(),
+        }
+    } else {
+        String::new()
+    };
+    if !taken.is_empty() {
+        crate::logger::log_sync_event("sync::temp_key", "consumed one-time temp_key", false);
+    }
+    taken
+}
+
+/// Typed phase for an active phone message sync handshake / transfer (`HZ-04`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum SyncSessionPhase {
+    #[default]
+    Idle,
+    Requested,
+    WaitingConfirm,
+    Busy,
+    MobileIdle,
+    Confirmed,
+    Transferring,
+    Completed,
+    Rejected,
+    Failed {
+        code: Option<i64>,
+        message: String,
+    },
+}
+
+/// Typed control/protocol events routed into [`SyncSessionState::apply_event`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncSessionEvent {
+    WaitingConfirm {
+        sync_id: String,
+        status: String,
+    },
+    MobileBusy {
+        sync_id: String,
+        status: String,
+    },
+    MobileIdle {
+        sync_id: String,
+        status: String,
+    },
+    UserConfirmed {
+        sync_id: String,
+        status: String,
+    },
+    UserRejected {
+        sync_id: String,
+        status: String,
+    },
+    BatchProgress {
+        sync_id: String,
+        status: String,
+    },
+    Completed {
+        sync_id: String,
+        status: String,
+    },
+    TransferError {
+        sync_id: String,
+        err: i64,
+        message: String,
+        is_last: bool,
+        imported_count: usize,
+    },
+    WsAckError {
+        cmd: u16,
+        error_code: i64,
+        message: String,
+    },
+}
+
+/// Typed state machine replacing substring polling on `LAST_MOBILE_SYNC_STATUS`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SyncSessionState {
+    pub sync_id: Option<String>,
+    pub phase: SyncSessionPhase,
+    pub status_text: String,
+    pub partition_skips: usize,
+    pub got_v2_response: bool,
+}
+
+impl SyncSessionState {
+    pub fn begin_v2(sync_id: String) -> Self {
+        Self {
+            sync_id: Some(sync_id),
+            phase: SyncSessionPhase::Requested,
+            status_text: "📲 Đang gửi yêu cầu đồng bộ tới Zalo trên điện thoại…".into(),
+            partition_skips: 0,
+            got_v2_response: false,
+        }
+    }
+
+    pub fn begin_v1() -> Self {
+        Self {
+            sync_id: None,
+            phase: SyncSessionPhase::Requested,
+            status_text: "📲 Đã gửi yêu cầu đồng bộ tới Zalo trên điện thoại — hãy mở Zalo trên điện thoại và bấm 'Đồng bộ'…".into(),
+            partition_skips: 0,
+            got_v2_response: false,
+        }
+    }
+
+    pub fn reset() -> Self {
+        Self::default()
+    }
+
+    fn matches_sync_id(&self, incoming: &str) -> bool {
+        match self.sync_id.as_deref() {
+            Some(active) => incoming.is_empty() || incoming == active,
+            None => incoming.is_empty(),
+        }
+    }
+
+    fn is_terminal(&self) -> bool {
+        matches!(
+            self.phase,
+            SyncSessionPhase::Completed | SyncSessionPhase::Rejected | SyncSessionPhase::Failed { .. }
+        )
+    }
+
+    /// Apply a typed control/ACK event. Returns `false` if ignored (stale `sync_id` or terminal).
+    pub fn apply_event(&mut self, event: SyncSessionEvent) -> bool {
+        match event {
+            SyncSessionEvent::WaitingConfirm { sync_id, status } => {
+                if !self.matches_sync_id(&sync_id) || self.is_terminal() {
+                    return false;
+                }
+                if self.sync_id.is_some() {
+                    self.got_v2_response = true;
+                }
+                if matches!(
+                    self.phase,
+                    SyncSessionPhase::Idle
+                        | SyncSessionPhase::Requested
+                        | SyncSessionPhase::WaitingConfirm
+                        | SyncSessionPhase::MobileIdle
+                        | SyncSessionPhase::Busy
+                ) {
+                    self.phase = SyncSessionPhase::WaitingConfirm;
+                }
+                self.status_text = status;
+                true
+            }
+            SyncSessionEvent::MobileBusy { sync_id, status } => {
+                if !self.matches_sync_id(&sync_id) || self.is_terminal() {
+                    return false;
+                }
+                if self.sync_id.is_some() {
+                    self.got_v2_response = true;
+                }
+                if matches!(
+                    self.phase,
+                    SyncSessionPhase::Idle
+                        | SyncSessionPhase::Requested
+                        | SyncSessionPhase::WaitingConfirm
+                        | SyncSessionPhase::MobileIdle
+                        | SyncSessionPhase::Busy
+                ) {
+                    self.phase = SyncSessionPhase::Busy;
+                }
+                self.status_text = status;
+                true
+            }
+            SyncSessionEvent::MobileIdle { sync_id, status } => {
+                if !self.matches_sync_id(&sync_id) || self.is_terminal() {
+                    return false;
+                }
+                if self.sync_id.is_some() {
+                    self.got_v2_response = true;
+                }
+                if matches!(
+                    self.phase,
+                    SyncSessionPhase::Idle
+                        | SyncSessionPhase::Requested
+                        | SyncSessionPhase::WaitingConfirm
+                        | SyncSessionPhase::Busy
+                ) {
+                    self.phase = SyncSessionPhase::MobileIdle;
+                }
+                self.status_text = status;
+                true
+            }
+            SyncSessionEvent::UserConfirmed { sync_id, status } => {
+                if !self.matches_sync_id(&sync_id) || self.is_terminal() {
+                    return false;
+                }
+                if self.sync_id.is_some() {
+                    self.got_v2_response = true;
+                }
+                if !matches!(self.phase, SyncSessionPhase::Transferring) {
+                    self.phase = SyncSessionPhase::Confirmed;
+                }
+                self.status_text = status;
+                true
+            }
+            SyncSessionEvent::UserRejected { sync_id, status } => {
+                if !self.matches_sync_id(&sync_id) || self.is_terminal() {
+                    return false;
+                }
+                if self.sync_id.is_some() {
+                    self.got_v2_response = true;
+                }
+                self.phase = SyncSessionPhase::Rejected;
+                self.status_text = status;
+                true
+            }
+            SyncSessionEvent::BatchProgress { sync_id, status } => {
+                if !self.matches_sync_id(&sync_id) || self.is_terminal() {
+                    return false;
+                }
+                if self.sync_id.is_some() {
+                    self.got_v2_response = true;
+                }
+                self.phase = SyncSessionPhase::Transferring;
+                self.status_text = status;
+                true
+            }
+            SyncSessionEvent::Completed { sync_id, status } => {
+                if !self.matches_sync_id(&sync_id) {
+                    return false;
+                }
+                if matches!(self.phase, SyncSessionPhase::Rejected | SyncSessionPhase::Failed { .. }) {
+                    return false;
+                }
+                if self.sync_id.is_some() {
+                    self.got_v2_response = true;
+                }
+                self.phase = SyncSessionPhase::Completed;
+                self.status_text = status;
+                true
+            }
+            SyncSessionEvent::TransferError {
+                sync_id,
+                err,
+                message,
+                is_last,
+                imported_count,
+            } => {
+                if !self.matches_sync_id(&sync_id) || self.is_terminal() {
+                    return false;
+                }
+                if self.sync_id.is_some() {
+                    self.got_v2_response = true;
+                }
+                if is_last && imported_count > 0 {
+                    self.phase = SyncSessionPhase::Completed;
+                    self.status_text = format!(
+                        "🎉 Đã giải mã & đồng bộ thành công {imported_count} tin nhắn từ điện thoại vào ứng dụng!"
+                    );
+                } else if is_last
+                    || err == -1
+                    || !matches!(
+                        self.phase,
+                        SyncSessionPhase::Confirmed | SyncSessionPhase::Transferring
+                    )
+                {
+                    self.phase = SyncSessionPhase::Failed {
+                        code: Some(err),
+                        message: message.clone(),
+                    };
+                    self.status_text = format!("⚠️ Lỗi đồng bộ từ điện thoại (mã {err}): {message}");
+                } else {
+                    self.partition_skips += 1;
+                    self.status_text = format!(
+                        "⏳ Điện thoại bỏ qua 1 phân vùng (mã {err}) — đang tiếp tục nhận các gói tin còn lại…"
+                    );
+                }
+                true
+            }
+            SyncSessionEvent::WsAckError {
+                cmd,
+                error_code,
+                message,
+            } => {
+                if self.sync_id.is_none() || error_code == 0 || self.is_terminal() {
+                    return false;
+                }
+                let msg = if message.trim().is_empty() {
+                    format!("máy chủ từ chối lệnh đồng bộ cmd {cmd}")
+                } else {
+                    message
+                };
+                self.phase = SyncSessionPhase::Failed {
+                    code: Some(error_code),
+                    message: msg.clone(),
+                };
+                self.status_text = format!("⚠️ Lỗi đồng bộ từ máy chủ (mã {error_code}): {msg}");
+                true
+            }
+        }
+    }
+}
+
+static SYNC_SESSION_STATE: std::sync::LazyLock<std::sync::Mutex<SyncSessionState>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(SyncSessionState::default()));
+static SYNC_STATE_WATCH: std::sync::LazyLock<tokio::sync::watch::Sender<SyncSessionState>> =
+    std::sync::LazyLock::new(|| tokio::sync::watch::channel(SyncSessionState::default()).0);
+
+pub fn begin_sync_session_v2(sync_id: &str) {
+    let next = SyncSessionState::begin_v2(sync_id.to_string());
+    if let Ok(mut g) = SYNC_SESSION_STATE.lock() {
+        *g = next.clone();
+    }
+    set_last_mobile_sync_status(None);
+    let _ = SYNC_STATE_WATCH.send(next);
+}
+
+pub fn begin_sync_session_v1() {
+    let next = SyncSessionState::begin_v1();
+    if let Ok(mut g) = SYNC_SESSION_STATE.lock() {
+        *g = next.clone();
+    }
+    set_last_mobile_sync_status(None);
+    let _ = SYNC_STATE_WATCH.send(next);
+}
+
+pub fn reset_sync_session_state() {
+    let next = SyncSessionState::reset();
+    if let Ok(mut g) = SYNC_SESSION_STATE.lock() {
+        *g = next.clone();
+    }
+    set_last_mobile_sync_status(None);
+    let _ = SYNC_STATE_WATCH.send(next);
+}
+
+pub fn sync_session_snapshot() -> SyncSessionState {
+    SYNC_SESSION_STATE
         .lock()
         .map(|g| g.clone())
         .unwrap_or_default()
+}
+
+pub fn subscribe_sync_session() -> tokio::sync::watch::Receiver<SyncSessionState> {
+    SYNC_STATE_WATCH.subscribe()
+}
+
+pub fn apply_sync_session_event(ev: SyncSessionEvent) -> Option<SyncSessionState> {
+    let updated = {
+        let mut g = SYNC_SESSION_STATE.lock().ok()?;
+        if !g.apply_event(ev) {
+            return None;
+        }
+        g.clone()
+    };
+    let is_err = matches!(updated.phase, SyncSessionPhase::Failed { .. });
+    crate::logger::log_sync_event(
+        "sync::state",
+        &format!(
+            "sync={:?} phase={:?} skips={} status={}",
+            updated
+                .sync_id
+                .as_deref()
+                .map(|s| s.chars().take(8).collect::<String>()),
+            updated.phase,
+            updated.partition_skips,
+            updated.status_text
+        ),
+        is_err,
+    );
+    set_last_mobile_sync_status(Some(updated.status_text.clone()));
+    let _ = SYNC_STATE_WATCH.send(updated.clone());
+    Some(updated)
 }
 static LAST_MOBILE_SYNC_STATUS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
@@ -199,6 +585,13 @@ fn set_last_phone_sync_error(error: Option<String>) {
 /// e.g. no Zalo PC WASM on this machine. `None` when it started or was not attempted.
 pub fn last_phone_sync_error() -> Option<String> {
     LAST_PHONE_SYNC_ERROR.lock().ok().and_then(|g| g.clone())
+}
+
+fn combine_sync_errors(v2_err: Option<&str>, v1_err: &str) -> String {
+    match v2_err.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(v2) if !v1_err.contains(v2) => format!("{v1_err} ({v2})"),
+        _ => v1_err.to_string(),
+    }
 }
 
 /// Read the latest status returned by the user's phone during `sync_phone_messages`.
@@ -361,79 +754,160 @@ where
     let mut warnings = Vec::new();
 
     if send_phone_prompt {
-        set_last_mobile_sync_status(None);
+        reset_sync_session_state();
         set_last_phone_sync_error(None);
         reset_sync_v2_imported_count();
 
         // Phase 1 — Dual Sync (iOS V2 -> Android V1 fallback):
-        // iOS dùng Sync V2 (`cmd 590` `transfer_sync2`) và phản hồi rất nhanh (~0.5–1.5s).
-        // Android APK không hỗ trợ `transfer_sync2`, chỉ hỗ trợ Sync V1 (`cmd 12000`
-        // `pull_mobile_msg` -> `transfer_msg`/`syncmsgmb` -> `.db.crypt`).
-        // Vì vậy: gửi `cmd 590` trước KHÔNG kèm V1 (tránh 2 phiên đè nhau trên iOS), thăm dò
-        // 5.5s; nếu im lặng hoàn toàn thì dọn phiên V2 (`cmd 591` OutDated) rồi bắn V1!
+        // iOS dùng Sync V2 (`cmd 590` `transfer_sync2`). Android APK chỉ hỗ trợ Sync V1
+        // (`cmd 12000` `pull_mobile_msg` -> `transfer_msg`/`syncmsgmb` -> `.db.crypt`).
+        // Khởi tạo SyncSessionState trước khi gửi `cmd 590`, gửi wakeup `cmd 592` sau 3s im lặng,
+        // thăm dò tối đa 15s (dừng ngay nếu gặp lỗi `Failed`), rồi chuyển V1 nếu V2 không phản hồi.
         on_progress(
             0.10,
             "📲 Đang gửi yêu cầu đồng bộ tới Zalo trên điện thoại (hãy mở Zalo trên điện thoại và bấm 'Đồng bộ ngay')…".to_string(),
         );
         let partitions = chat::resolve_thread_partitions(s, threads).await;
-        crate::logger::log_sync(&format!("Tìm được {} partitions cho sync", partitions.len()));
+        crate::logger::log_sync_event(
+            "sync::phase1",
+            &format!("resolved {} partitions (cap={})", partitions.len(), chat::MAX_SYNC_V2_QUERIES),
+            false,
+        );
 
+        let mut v2_init_error: Option<String> = None;
         let mut v2_sync_id = match chat::wake_phone_sync_v2(s).await {
-            Ok(sync_id) => match chat::send_sync_v2_request_with_queries(s, &sync_id, &partitions) {
-                Ok(true) => Some(sync_id),
-                Ok(false) => {
-                    set_active_v2_sync_id(None);
-                    crate::logger::log_sync("V2 cmd 590 thất bại (WebSocket chưa kết nối)");
-                    None
+            Ok(sync_id) => {
+                begin_sync_session_v2(&sync_id);
+                match chat::send_sync_v2_request_with_queries(s, &sync_id, &partitions) {
+                    Ok(true) => Some(sync_id),
+                    Ok(false) => {
+                        set_active_v2_sync_id(None);
+                        reset_sync_session_state();
+                        let msg = "WebSocket chưa kết nối nên chưa gửi được yêu cầu Sync V2 (cmd 590)".to_string();
+                        crate::logger::log_sync_event("sync::v2_init", &msg, true);
+                        v2_init_error = Some(msg);
+                        None
+                    }
+                    Err(e) => {
+                        set_active_v2_sync_id(None);
+                        reset_sync_session_state();
+                        let msg = format!("Lỗi tạo gói Sync V2 (cmd 590): {e}");
+                        crate::logger::log_sync_event("sync::v2_init", &msg, true);
+                        v2_init_error = Some(msg);
+                        None
+                    }
                 }
-                Err(e) => {
-                    set_active_v2_sync_id(None);
-                    crate::logger::log_sync(&format!("V2 tạo gói cmd 590 FAIL: {e}"));
-                    None
-                }
-            },
+            }
             Err(e) => {
                 set_active_v2_sync_id(None);
-                crate::logger::log_sync(&format!("V2 mở session FAIL: {e}"));
+                reset_sync_session_state();
+                let msg = e.to_string();
+                crate::logger::log_sync_event("sync::v2_init", &msg, true);
+                v2_init_error = Some(msg);
                 None
             }
         };
 
+        let mut state_rx = subscribe_sync_session();
         let mut v2_got_response = false;
+        let mut v2_probe_failed = false;
+        let mut v2_probe_error: Option<String> = None;
         let probe_start = std::time::Instant::now();
-        if v2_sync_id.is_some() {
-            for _ in 0..11 {
+        let mut sent_wakeup = false;
+
+        if let Some(sid) = v2_sync_id.as_deref() {
+            let probe_deadline = probe_start + Duration::from_secs(15);
+            loop {
                 if PHONE_SYNC_CANCEL.load(Ordering::Relaxed) {
-                    if let Some(sid) = v2_sync_id.as_deref() {
-                        crate::socket::send_sync_ack_delete(
-                            sid,
-                            crate::socket::SYNC_DISPOSE_USER_CANCEL,
-                        );
-                        remove_sync_v2_session(sid);
-                    }
+                    crate::socket::send_sync_ack_delete(
+                        sid,
+                        crate::socket::SYNC_DISPOSE_USER_CANCEL,
+                    );
+                    remove_sync_v2_session(sid);
                     set_active_v2_sync_id(None);
+                    reset_sync_session_state();
                     return Ok(PhoneSyncReport::default());
                 }
-                if last_mobile_sync_status().is_some() {
-                    v2_got_response = true;
+                let snap = sync_session_snapshot();
+                match &snap.phase {
+                    SyncSessionPhase::WaitingConfirm
+                    | SyncSessionPhase::Busy
+                    | SyncSessionPhase::MobileIdle
+                    | SyncSessionPhase::Confirmed
+                    | SyncSessionPhase::Transferring
+                    | SyncSessionPhase::Completed
+                    | SyncSessionPhase::Rejected => {
+                        v2_got_response = true;
+                        break;
+                    }
+                    SyncSessionPhase::Failed { code, message } => {
+                        v2_probe_failed = true;
+                        let msg = format!("Sync V2 thất bại (mã {:?}): {message}", code);
+                        crate::logger::log_sync_event("sync::v2_probe", &msg, true);
+                        v2_probe_error = Some(msg);
+                        break;
+                    }
+                    SyncSessionPhase::Idle | SyncSessionPhase::Requested => {}
+                }
+                if !sent_wakeup && probe_start.elapsed() >= Duration::from_secs(3) {
+                    sent_wakeup = true;
+                    let woke = crate::socket::send_mobile_wakeup(sid);
+                    crate::logger::log_sync_event(
+                        "sync::v2_wakeup",
+                        &format!(
+                            "sent proactive cmd 592 after 3s silence: sync={} ok={woke}",
+                            sid.chars().take(8).collect::<String>()
+                        ),
+                        !woke,
+                    );
+                }
+                let now = std::time::Instant::now();
+                if now >= probe_deadline {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                let wait = (probe_deadline - now).min(Duration::from_millis(500));
+                tokio::select! {
+                    _ = state_rx.changed() => {}
+                    _ = tokio::time::sleep(wait) => {}
+                }
             }
         }
 
         let mut v1_active = false;
         if !v2_got_response {
             if let Some(sid) = v2_sync_id.take() {
-                crate::socket::send_sync_ack_delete(&sid, crate::socket::SYNC_DISPOSE_OUTDATED);
+                let dispose = if v2_probe_failed {
+                    crate::socket::SYNC_DISPOSE_ERROR
+                } else {
+                    crate::socket::SYNC_DISPOSE_OUTDATED
+                };
+                crate::socket::send_sync_ack_delete(&sid, dispose);
                 remove_sync_v2_session(&sid);
             }
             set_active_v2_sync_id(None);
             set_last_phone_sync_error(None);
-            set_last_mobile_sync_status(None);
-            crate::logger::log_sync(
-                "V2 không phản hồi sau 5.5s (Android / V1) -> chuyển sang pull_mobile_msg (cmd 12000)",
+            let reason_note = if let Some(ref init_err) = v2_init_error {
+                init_err.as_str()
+            } else if let Some(ref probe_err) = v2_probe_error {
+                probe_err.as_str()
+            } else {
+                "V2 không phản hồi sau 15s (Android / V1)"
+            };
+            crate::logger::log_sync_event(
+                "sync::v1_fallback",
+                &format!("{reason_note} -> chuyển sang pull_mobile_msg (cmd 12000)"),
+                v2_probe_failed,
             );
+            if v2_init_error
+                .as_deref()
+                .is_some_and(|e| e.contains("Zalo PC") || e.contains("libzproto"))
+            {
+                on_progress(
+                    0.12,
+                    "⚠️ Không có libzproto WASM (cần Zalo PC hoặc HZ_ZPROTO_WASM cho Sync V2 iOS) — đang thử đồng bộ V1…".to_string(),
+                );
+            }
+            begin_sync_session_v1();
             if !pub_key.is_empty() {
                 match chat::request_phone_sync(s, &pub_key).await {
                     Ok(resp) => {
@@ -441,9 +915,11 @@ where
                             .get("error_code")
                             .and_then(serde_json::Value::as_i64)
                             .unwrap_or(0);
-                        crate::logger::log_sync(&format!(
-                            "V1 pull_mobile_msg response: error_code={ec}"
-                        ));
+                        crate::logger::log_sync_event(
+                            "sync::v1_pull",
+                            &format!("pull_mobile_msg response error_code={ec}"),
+                            ec != 0,
+                        );
                         if ec == 0 {
                             v1_active = true;
                             on_progress(
@@ -455,22 +931,38 @@ where
                                 .get("error_message")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("máy chủ từ chối yêu cầu đồng bộ V1");
-                            let err = format!("⚠️ Yêu cầu đồng bộ V1 thất bại (code {ec}): {em}");
-                            set_last_phone_sync_error(Some(err.clone()));
-                            on_progress(0.15, err);
+                            let v1_err = format!("⚠️ Yêu cầu đồng bộ V1 thất bại (code {ec}): {em}");
+                            let combined = combine_sync_errors(
+                                v2_init_error.as_deref().or(v2_probe_error.as_deref()),
+                                &v1_err,
+                            );
+                            set_last_phone_sync_error(Some(combined.clone()));
+                            on_progress(0.15, combined);
                         }
                     }
                     Err(e) => {
-                        crate::logger::log_sync(&format!("V1 pull_mobile_msg FAIL: {e}"));
-                        let err = format!("⚠️ Không gửi được yêu cầu đồng bộ tới điện thoại: {e}");
-                        set_last_phone_sync_error(Some(err.clone()));
-                        on_progress(0.15, err);
+                        crate::logger::log_sync_event(
+                            "sync::v1_pull",
+                            &format!("pull_mobile_msg FAIL: {e}"),
+                            true,
+                        );
+                        let v1_err = format!("⚠️ Không gửi được yêu cầu đồng bộ tới điện thoại: {e}");
+                        let combined = combine_sync_errors(
+                            v2_init_error.as_deref().or(v2_probe_error.as_deref()),
+                            &v1_err,
+                        );
+                        set_last_phone_sync_error(Some(combined.clone()));
+                        on_progress(0.15, combined);
                     }
                 }
             } else {
-                let err = "⚠️ Không tạo được khoá RSA đồng bộ cho điện thoại".to_string();
-                set_last_phone_sync_error(Some(err.clone()));
-                on_progress(0.15, err);
+                let v1_err = "⚠️ Không tạo được khoá RSA đồng bộ cho điện thoại".to_string();
+                let combined = combine_sync_errors(
+                    v2_init_error.as_deref().or(v2_probe_error.as_deref()),
+                    &v1_err,
+                );
+                set_last_phone_sync_error(Some(combined.clone()));
+                on_progress(0.15, combined);
             }
         }
 
@@ -499,36 +991,47 @@ where
                     let _ = chat::cancel_phone_sync(s, &pub_key).await;
                 }
                 set_active_v2_sync_id(None);
+                reset_sync_session_state();
                 return Ok(PhoneSyncReport::default());
             }
-            if let Some(st) = last_mobile_sync_status().as_deref() {
-                let is_error = st.contains("Lỗi") || st.contains("Không thể") || st.contains("thất bại");
-                if is_error {
+            let snap = sync_session_snapshot();
+            match &snap.phase {
+                SyncSessionPhase::Failed { .. } => {
                     had_error = true;
-                    set_last_phone_sync_error(Some(st.to_string()));
-                    on_progress(1.0, st.to_string());
+                    set_last_phone_sync_error(Some(snap.status_text.clone()));
+                    on_progress(1.0, snap.status_text);
                     break;
-                } else if st.contains("từ chối") {
-                    rejected = true;
-                    set_last_phone_sync_error(Some(st.to_string()));
-                    on_progress(1.0, st.to_string());
-                    break;
-                } else if st.contains("đã xác nhận")
-                    || st.contains("đang nén")
-                    || st.contains("giải mã")
-                    || st.contains("Đang tải và giải mã")
-                    || st.contains("bỏ qua 1 phân vùng")
-                    || st.contains("Đã nhận gói đồng bộ")
-                    || st.contains("thành công")
-                {
-                    confirmed = true;
-                    on_progress(0.40, st.to_string());
-                    break;
-                } else {
-                    on_progress(0.20, st.to_string());
                 }
+                SyncSessionPhase::Rejected => {
+                    rejected = true;
+                    set_last_phone_sync_error(Some(snap.status_text.clone()));
+                    on_progress(1.0, snap.status_text);
+                    break;
+                }
+                SyncSessionPhase::Confirmed
+                | SyncSessionPhase::Transferring
+                | SyncSessionPhase::Completed => {
+                    confirmed = true;
+                    on_progress(0.45, snap.status_text);
+                    break;
+                }
+                SyncSessionPhase::Busy
+                | SyncSessionPhase::WaitingConfirm
+                | SyncSessionPhase::MobileIdle => {
+                    on_progress(0.25, snap.status_text);
+                }
+                SyncSessionPhase::Idle | SyncSessionPhase::Requested => {}
             }
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            let wait = deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .min(Duration::from_millis(500));
+            if wait.is_zero() {
+                break;
+            }
+            tokio::select! {
+                _ = state_rx.changed() => {}
+                _ = tokio::time::sleep(wait) => {}
+            }
         }
         if rejected {
             if let Some(sid) = v2_sync_id.as_deref() {
@@ -554,41 +1057,47 @@ where
                 let v2_done = v2_sync_id.is_some()
                     && is_sync_v2_last_seen()
                     && sync_v2_inflight_count() == 0;
-                if v2_done {
-                    let done_msg = last_mobile_sync_status()
-                        .filter(|s| s.contains("thành công"))
-                        .unwrap_or_else(|| {
-                            format!(
-                                "🎉 Đã giải mã & đồng bộ thành công {} tin nhắn từ điện thoại vào ứng dụng!",
-                                sync_v2_imported_count()
-                            )
-                        });
+                let snap = sync_session_snapshot();
+                if v2_done || matches!(snap.phase, SyncSessionPhase::Completed) {
+                    let done_msg = if matches!(snap.phase, SyncSessionPhase::Completed)
+                        && !snap.status_text.is_empty()
+                    {
+                        snap.status_text
+                    } else {
+                        format!(
+                            "🎉 Đã giải mã & đồng bộ thành công {} tin nhắn từ điện thoại vào ứng dụng!",
+                            sync_v2_imported_count()
+                        )
+                    };
                     ok = true;
                     on_progress(0.95, done_msg);
-                    tokio::time::sleep(Duration::from_millis(1200)).await;
-                    let _ = sync_v2_batch_lock().lock().await;
+                    if v2_sync_id.is_some() {
+                        // Đợi nhịp ngắn để các batch upload song song (nếu tới lệch thứ tự
+                        // sau gói `isLast=1`) kịp tải & ghi vào SQLite trước khi gửi `cmd 591`.
+                        tokio::time::sleep(Duration::from_millis(1200)).await;
+                        let _ = sync_v2_batch_lock().lock().await;
+                    }
                     break;
                 }
-                if let Some(st) = last_mobile_sync_status().as_deref() {
-                    if st.contains("thành công") {
-                        ok = true;
-                        on_progress(0.95, st.to_string());
-                        if v2_sync_id.is_some() {
-                            // Đợi nhịp ngắn để các batch upload song song (nếu tới lệch thứ tự
-                            // sau gói `isLast=1`) kịp tải & ghi vào SQLite trước khi gửi `cmd 591`.
-                            tokio::time::sleep(Duration::from_millis(1200)).await;
-                            let _ = sync_v2_batch_lock().lock().await;
-                        }
-                        break;
-                    } else if st.contains("Lỗi") || st.contains("Không thể") || st.contains("thất bại") {
-                        set_last_phone_sync_error(Some(st.to_string()));
-                        on_progress(1.0, st.to_string());
-                        break;
-                    } else {
-                        on_progress(0.70, st.to_string());
-                    }
+                if matches!(snap.phase, SyncSessionPhase::Failed { .. }) {
+                    set_last_phone_sync_error(Some(snap.status_text.clone()));
+                    on_progress(1.0, snap.status_text);
+                    break;
                 }
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                let imported = sync_v2_imported_count();
+                let transfer_prog = (0.55 + (imported as f32 / 2000.0).min(0.35)).min(0.90);
+                on_progress(transfer_prog, snap.status_text);
+
+                let wait = finish_deadline
+                    .saturating_duration_since(std::time::Instant::now())
+                    .min(Duration::from_millis(500));
+                if wait.is_zero() {
+                    break;
+                }
+                tokio::select! {
+                    _ = state_rx.changed() => {}
+                    _ = tokio::time::sleep(wait) => {}
+                }
             }
             let cancelled = PHONE_SYNC_CANCEL.load(Ordering::Relaxed);
             if !ok && !cancelled && last_phone_sync_error().is_none() {
@@ -616,10 +1125,21 @@ where
             }
             clear_sync_keys();
         } else if v2_sync_id.is_some() || v1_active {
+            let snap = sync_session_snapshot();
             if !had_error && last_phone_sync_error().is_none() {
-                set_last_phone_sync_error(Some(
-                    "⚠️ Hết thời gian chờ xác nhận đồng bộ trên điện thoại".to_string(),
-                ));
+                let timeout_msg = if matches!(snap.phase, SyncSessionPhase::Busy)
+                    && !snap.status_text.is_empty()
+                {
+                    snap.status_text
+                } else if let Some(ref init_err) = v2_init_error {
+                    combine_sync_errors(
+                        Some(init_err.as_str()),
+                        "⚠️ Hết thời gian chờ xác nhận đồng bộ trên điện thoại",
+                    )
+                } else {
+                    "⚠️ Hết thời gian chờ xác nhận đồng bộ trên điện thoại".to_string()
+                };
+                set_last_phone_sync_error(Some(timeout_msg));
             }
             if let Some(sid) = v2_sync_id.as_deref() {
                 crate::socket::send_sync_ack_delete(sid, crate::socket::SYNC_DISPOSE_ERROR);
@@ -1372,6 +1892,18 @@ pub async fn import_sync_v2_meta(s: &Session, url: &str) -> Result<SyncV2Meta> {
 }
 
 
+#[cfg(test)]
+pub(crate) fn set_test_v2_keys_for_unit_tests() {
+    if let Ok(mut g) = CURRENT_V2_KEYS.lock() {
+        *g = Some(SyncV2KeysRaw {
+            ik_pub: vec![5; 33],
+            ik_priv: vec![1; 32],
+            ek_pub: vec![5; 33],
+            ek_priv: vec![2; 32],
+        });
+    }
+}
+
 pub fn current_v2_keys() -> Result<SyncV2Keys> {
     use base64::Engine;
     let raw = current_v2_keys_raw()?;
@@ -1488,7 +2020,7 @@ static NOISED_TO_THREAD_ID: std::sync::LazyLock<
 /// Xóa toàn bộ state/key đồng bộ điện thoại trong bộ nhớ khi chuyển/đăng xuất tài khoản.
 pub fn reset_for_account_switch() {
     set_latest_mobile_temp_key("");
-    set_last_mobile_sync_status(None);
+    reset_sync_session_state();
     set_last_phone_sync_error(None);
     clear_sync_keys();
     if let Ok(mut g) = CURRENT_V2_KEYS.lock() {
@@ -2936,7 +3468,9 @@ mod tests {
                 crate::chat::MobileSyncControlEvent::WaitingConfirmOnPhone {
                     sync_id: "abc123".into()
                 },
-                crate::chat::MobileSyncControlEvent::MobileBusyRestoring,
+                crate::chat::MobileSyncControlEvent::MobileBusyRestoring {
+                    sync_id: String::new()
+                },
                 crate::chat::MobileSyncControlEvent::SyncV2Batch {
                     url: "https://f.zalo.me/batch1".into(),
                     sync_id: "abc123".into(),
@@ -3290,5 +3824,90 @@ mod tests {
         let meta2: serde_json::Value =
             serde_json::from_str(&captioned.raw_json).expect("valid raw_json");
         assert_eq!(meta2["reply_to_text"], "[Hình ảnh] Hóa đơn");
+    }
+
+    #[test]
+    fn sync_state_transfer_error_minus_one_fails_immediately_and_never_confirms() {
+        let mut st = SyncSessionState::begin_v2("sync_201".into());
+        assert!(st.apply_event(SyncSessionEvent::TransferError {
+            sync_id: "sync_201".into(),
+            err: -1,
+            message: "Điện thoại báo lỗi đồng bộ".into(),
+            is_last: false,
+            imported_count: 0,
+        }));
+        assert!(matches!(
+            st.phase,
+            SyncSessionPhase::Failed {
+                code: Some(-1),
+                ..
+            }
+        ));
+        assert!(st.status_text.contains("mã -1"));
+        assert!(!matches!(
+            st.phase,
+            SyncSessionPhase::Confirmed | SyncSessionPhase::Transferring
+        ));
+    }
+
+    #[test]
+    fn sync_state_mobile_busy_never_confirms_and_stale_sync_id_is_ignored() {
+        let mut st = SyncSessionState::begin_v2("sync_active".into());
+        assert!(!st.apply_event(SyncSessionEvent::UserConfirmed {
+            sync_id: "sync_old".into(),
+            status: "stale".into(),
+        }));
+        assert_eq!(st.phase, SyncSessionPhase::Requested);
+
+        assert!(st.apply_event(SyncSessionEvent::MobileBusy {
+            sync_id: "sync_active".into(),
+            status: "⚠️ Điện thoại đang bận".into(),
+        }));
+        assert_eq!(st.phase, SyncSessionPhase::Busy);
+        assert!(st.got_v2_response);
+    }
+
+    #[test]
+    fn sync_state_partition_skip_during_transfer_keeps_transferring_and_ws_ack_error_fails() {
+        let mut st = SyncSessionState::begin_v2("sync_ok".into());
+        assert!(st.apply_event(SyncSessionEvent::UserConfirmed {
+            sync_id: "sync_ok".into(),
+            status: "confirmed".into(),
+        }));
+        assert!(st.apply_event(SyncSessionEvent::BatchProgress {
+            sync_id: "sync_ok".into(),
+            status: "transferring".into(),
+        }));
+        assert!(st.apply_event(SyncSessionEvent::TransferError {
+            sync_id: "sync_ok".into(),
+            err: 502,
+            message: "OA partition skipped".into(),
+            is_last: false,
+            imported_count: 10,
+        }));
+        assert_eq!(st.phase, SyncSessionPhase::Transferring);
+        assert_eq!(st.partition_skips, 1);
+
+        assert!(st.apply_event(SyncSessionEvent::WsAckError {
+            cmd: 590,
+            error_code: -1,
+            message: "rejected".into(),
+        }));
+        assert!(matches!(
+            st.phase,
+            SyncSessionPhase::Failed {
+                code: Some(-1),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn take_latest_mobile_temp_key_consumes_once() {
+        set_latest_mobile_temp_key("  tk_once  ");
+        assert_eq!(latest_mobile_temp_key(), "tk_once");
+        assert_eq!(take_latest_mobile_temp_key(), "tk_once");
+        assert_eq!(take_latest_mobile_temp_key(), "");
+        assert_eq!(latest_mobile_temp_key(), "");
     }
 }

@@ -6169,52 +6169,58 @@ pub async fn fetch_group_profiles(
     if s.login.is_none() || group_ids.is_empty() {
         return Ok((serde_json::Map::new(), std::collections::HashSet::new()));
     }
-    let mut gv_zero = serde_json::Map::new();
-    for gid in group_ids {
-        let clean = gid
-            .trim_start_matches("group_")
-            .trim_start_matches('g')
-            .trim_start_matches('G')
-            .trim();
-        if !clean.is_empty() {
-            gv_zero.insert(clean.to_string(), json!(0));
-        }
-    }
-    let gv_str = serde_json::to_string(&gv_zero)?;
-    let body = obj(&[("gridVerMap", json!(gv_str)), ("imei", json!(s.imei))]);
-    let params = s.encoded_params(&body)?;
-    let mg_url = format!(
-        "{}/api/group/getmg-v2?{}",
-        s.domains.group,
-        s.common_params()
-    );
-    let mg_resp = s.post_form(&mg_url, format!("params={params}")).await?;
-    let mut mg_dec = s.maybe_decrypt(mg_resp, s.session_key_bytes()).await;
-    if let Some(d_str) = mg_dec.get("data").and_then(Value::as_str) {
-        if let Ok(parsed) = serde_json::from_str::<Value>(d_str.trim()) {
-            mg_dec["data"] = parsed;
-        }
-    }
-    let data_node = mg_dec
-        .pointer("/data/data")
-        .or_else(|| mg_dec.get("data"))
-        .unwrap_or(&mg_dec);
-    let info_map = data_node
-        .get("gridInfoMap")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    let removed: std::collections::HashSet<String> = data_node
-        .get("removedsGroup")
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect()
+    let clean_ids: Vec<String> = group_ids
+        .iter()
+        .map(|gid| {
+            gid.trim_start_matches("group_")
+                .trim_start_matches('g')
+                .trim_start_matches('G')
+                .trim()
+                .to_string()
         })
-        .unwrap_or_default();
-    Ok((info_map, removed))
+        .filter(|c| !c.is_empty())
+        .collect();
+    let mut all_info = serde_json::Map::new();
+    let mut all_removed = std::collections::HashSet::new();
+
+    for chunk in clean_ids.chunks(40) {
+        let mut gv_zero = serde_json::Map::new();
+        for clean in chunk {
+            gv_zero.insert(clean.clone(), json!(0));
+        }
+        let gv_str = serde_json::to_string(&gv_zero)?;
+        let body = obj(&[("gridVerMap", json!(gv_str)), ("imei", json!(s.imei))]);
+        let params = s.encoded_params(&body)?;
+        let mg_url = format!(
+            "{}/api/group/getmg-v2?{}",
+            s.domains.group,
+            s.common_params()
+        );
+        let mg_resp = s.post_form(&mg_url, format!("params={params}")).await?;
+        let mut mg_dec = s.maybe_decrypt(mg_resp, s.session_key_bytes()).await;
+        if let Some(d_str) = mg_dec.get("data").and_then(Value::as_str) {
+            if let Ok(parsed) = serde_json::from_str::<Value>(d_str.trim()) {
+                mg_dec["data"] = parsed;
+            }
+        }
+        let data_node = mg_dec
+            .pointer("/data/data")
+            .or_else(|| mg_dec.get("data"))
+            .unwrap_or(&mg_dec);
+        if let Some(info_map) = data_node.get("gridInfoMap").and_then(Value::as_object) {
+            for (k, v) in info_map {
+                all_info.insert(k.clone(), v.clone());
+            }
+        }
+        if let Some(arr) = data_node.get("removedsGroup").and_then(Value::as_array) {
+            for item in arr {
+                if let Some(id) = item.as_str() {
+                    all_removed.insert(id.to_string());
+                }
+            }
+        }
+    }
+    Ok((all_info, all_removed))
 }
 
 /// Extract up to 4 sorted member UIDs (`creatorId` first, then `adminIds`, then `memVerList`)
@@ -6875,6 +6881,27 @@ pub async fn get_cloud_messages(
             }
         }
     }
+    check_cloud_messages_response(dec)
+}
+
+/// Validate `error_code` on `/api/cm/getrecentv2` or `/api/cm/getoldv2` responses so
+/// server rejections (including `-69` `STOP_RETRY`) surface as `SessionError` instead of silent empty pages.
+pub fn check_cloud_messages_response(dec: Value) -> Result<Value> {
+    if let Some(code) = dec.get("error_code").and_then(Value::as_i64) {
+        if code != 0 {
+            let msg = dec
+                .get("error_message")
+                .or_else(|| dec.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("cloud message history error");
+            crate::logger::log_sync_event(
+                "chat::get_cloud_messages",
+                &format!("error_code={code} msg={msg}"),
+                code != -69,
+            );
+            return Err(crate::session::SessionError::new(code, msg).into());
+        }
+    }
     Ok(dec)
 }
 
@@ -6962,9 +6989,47 @@ pub async fn poll_new_messages(
     state: &mut PollState,
     threads: &mut Vec<Thread>,
 ) -> Result<()> {
+    poll_new_messages_streaming(s, state, threads, None, |_| {}).await
+}
+
+/// Like [`poll_new_messages`], but prioritizes `priority_thread_id` first and streams
+/// intermediate thread batches via `on_batch` so the active group/UI updates without waiting
+/// for every group's `/api/cm/getrecentv2` request to complete.
+pub async fn poll_new_messages_streaming<F>(
+    s: &Session,
+    state: &mut PollState,
+    threads: &mut Vec<Thread>,
+    priority_thread_id: Option<&str>,
+    mut on_batch: F,
+) -> Result<()>
+where
+    F: FnMut(Vec<Thread>),
+{
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
+    let send2me_id = s
+        .login
+        .as_ref()
+        .map(|l| l.send2me_id.clone())
+        .unwrap_or_default();
+
+    // 0. Prioritize currently selected group / Cloud thread first so active view updates immediately.
+    let mut synced_priority_cloud = false;
+    if let Some(sel_id) = priority_thread_id.filter(|id| !id.is_empty()) {
+        if let Some(idx) = threads.iter().position(|t| t.id == sel_id) {
+            let is_cloud_or_group =
+                threads[idx].is_group || (!send2me_id.is_empty() && threads[idx].id == send2me_id);
+            if is_cloud_or_group {
+                if let Ok(cm_resp) = get_cloud_messages(s, sel_id, "0", false, 50).await {
+                    merge_group_history(&mut threads[idx], &cm_resp);
+                    synced_priority_cloud = true;
+                    on_batch(vec![threads[idx].clone()]);
+                }
+            }
+        }
+    }
+
     // 1. Poll live/offline message queues via `getChatFromPolling` (follow `more == 1` / `resetLastActionId` up to 3 batches)
     for _ in 0..3 {
         let Ok(lp_resp) = get_chat_from_polling(s, state).await else {
@@ -7000,16 +7065,16 @@ pub async fn poll_new_messages(
             merge_previews(threads, &preview_resp);
         }
     }
+    if !threads.is_empty() {
+        on_batch(threads.clone());
+    }
+
     // 2b. Sync Cloud của tôi (`send2me_id`) and group conversations via `/api/cm/getrecentv2`
-    let send2me_id = s
-        .login
-        .as_ref()
-        .map(|l| l.send2me_id.clone())
-        .unwrap_or_default();
-    if !send2me_id.is_empty() {
+    if !send2me_id.is_empty() && !(synced_priority_cloud && priority_thread_id == Some(send2me_id.as_str())) {
         if let Ok(cm_resp) = get_cloud_messages(s, &send2me_id, "0", false, 50).await {
             if let Some(t) = threads.iter_mut().find(|t| t.id == send2me_id) {
                 merge_group_history(t, &cm_resp);
+                on_batch(vec![t.clone()]);
             } else {
                 merge_previews(threads, &cm_resp);
             }
@@ -7018,14 +7083,25 @@ pub async fn poll_new_messages(
     let group_ids: Vec<String> = threads
         .iter()
         .filter(|t| t.is_group && !t.id.is_empty())
+        .filter(|t| !(synced_priority_cloud && priority_thread_id == Some(t.id.as_str())))
         .map(|t| t.id.clone())
         .collect();
+    let mut streamed_groups: Vec<Thread> = Vec::new();
     for gid in group_ids {
         if let Ok(cm_resp) = get_cloud_messages(s, &gid, "0", false, 50).await {
             if let Some(t) = threads.iter_mut().find(|t| t.id == gid) {
                 merge_group_history(t, &cm_resp);
+                if !t.messages.is_empty() {
+                    streamed_groups.push(t.clone());
+                    if streamed_groups.len() >= 8 {
+                        on_batch(std::mem::take(&mut streamed_groups));
+                    }
+                }
             }
         }
+    }
+    if !streamed_groups.is_empty() {
+        on_batch(streamed_groups);
     }
     // 3. Resolve display names for any newly discovered threads
     resolve_thread_names(s, threads).await;
@@ -8619,6 +8695,16 @@ fn extract_message_thread_id_ext(
 
 /// Fold a `get-last-msgs` or `getChatFromPolling` response into thread previews and conversation messages.
 pub fn merge_previews(threads: &mut Vec<Thread>, resp: &Value) {
+    merge_previews_with_group_hint(threads, resp, false);
+}
+
+/// Like [`merge_previews`], with `default_in_group` set `true` for WebSocket group commands (`521`/`511`)
+/// whose items may omit an explicit `isGroup` or `grid` field.
+pub fn merge_previews_with_group_hint(
+    threads: &mut Vec<Thread>,
+    resp: &Value,
+    default_in_group: bool,
+) {
     let mut entries: Vec<(&Value, bool)> = Vec::new();
     let parsed_str_data: Option<Value> = resp
         .get("data")
@@ -8640,7 +8726,7 @@ pub fn merge_previews(threads: &mut Vec<Thread>, resp: &Value) {
 
     if let Some(arr) = data_node.as_array() {
         for item in arr {
-            entries.push((item, is_group_flag(item)));
+            entries.push((item, default_in_group || is_group_flag(item)));
         }
     } else if let Some(obj) = data_node.as_object() {
         let mut found_list = false;
@@ -8654,7 +8740,7 @@ pub fn merge_previews(threads: &mut Vec<Thread>, resp: &Value) {
         ] {
             if let Some(arr) = obj.get(key).and_then(Value::as_array) {
                 for item in arr {
-                    entries.push((item, is_grp || is_group_flag(item)));
+                    entries.push((item, default_in_group || is_grp || is_group_flag(item)));
                 }
                 found_list = true;
             }
@@ -8688,9 +8774,14 @@ pub fn merge_previews(threads: &mut Vec<Thread>, resp: &Value) {
             found_list = true;
         }
         if !found_list {
-            for (_, val) in obj {
-                if val.is_object() {
-                    entries.push((val, is_group_flag(val)));
+            if obj.contains_key("content") || obj.contains_key("msg") || obj.contains_key("msgId")
+            {
+                entries.push((data_node, default_in_group || is_group_flag(data_node)));
+            } else {
+                for (_, val) in obj {
+                    if val.is_object() {
+                        entries.push((val, default_in_group || is_group_flag(val)));
+                    }
                 }
             }
         }
@@ -10489,7 +10580,7 @@ pub async fn send_seen_v2(
 /// Request mobile message sync (`pullMobileMsg` @ `app.asar`, cmd `12000`, `file` endpoint, #68, #73).
 /// Sends a wake-up/sync signal with a 2048-bit RSA SPKI DER public key to the user's phone Zalo client.
 pub async fn request_phone_sync(s: &Session, public_key: &str) -> Result<Value> {
-    let temp_key = crate::history_sync::latest_mobile_temp_key();
+    let temp_key = crate::history_sync::take_latest_mobile_temp_key();
     request_phone_sync_with_temp_key(s, public_key, &temp_key).await
 }
 
@@ -10519,7 +10610,12 @@ pub async fn request_phone_sync_with_temp_key(
     );
     if let Ok(resp) = s.get_endpoint("file", &path).await {
         let dec = s.maybe_decrypt(resp, s.session_key_bytes()).await;
-        if dec.get("error_code").and_then(Value::as_i64) == Some(0) {
+        if let Some(code) = dec.get("error_code").and_then(Value::as_i64) {
+            crate::logger::log_sync_event(
+                "sync::v1_pull",
+                &format!("GET pull_mobile_msg error_code={code}"),
+                code != 0,
+            );
             return Ok(dec);
         }
     }
@@ -10529,7 +10625,14 @@ pub async fn request_phone_sync_with_temp_key(
         s.common_params()
     );
     let resp = s.post_form(&post_url, format!("params={params}")).await?;
-    Ok(s.maybe_decrypt(resp, s.session_key_bytes()).await)
+    let dec = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+    let code = dec.get("error_code").and_then(Value::as_i64);
+    crate::logger::log_sync_event(
+        "sync::v1_pull",
+        &format!("POST pull_mobile_msg error_code={code:?}"),
+        code.is_some_and(|c| c != 0),
+    );
+    Ok(dec)
 }
 
 /// Wake-up điện thoại cho Sync V2 (`cmd 592`). Zalo PC gửi wake-up TRƯỚC, chờ
@@ -10560,15 +10663,28 @@ pub async fn wake_phone_sync_v2(s: &Session) -> Result<String> {
     Ok(sync_id)
 }
 
+/// Maximum number of partition queries included in a single Sync V2 `cmd 590` frame.
+pub const MAX_SYNC_V2_QUERIES: usize = 50;
+
 /// Tạo payload cho SyncFull v2 request theo đúng Zalo PC (`shared-worker.js:282247` & `314736`).
 /// Khi `partitions` rỗng: gửi `type: "conversation"` với partition `"conversations"`.
-/// Khi `partitions` có phần tử: gửi `type: "message"` với queries tương ứng.
+/// Khi `partitions` có phần tử: gửi `type: "message"` với queries tương ứng (tối đa [`MAX_SYNC_V2_QUERIES`]).
 pub fn build_sync_v2_payload(
     s: &Session,
     sync_id: &str,
     partitions: &[String],
 ) -> Result<serde_json::Value> {
     let temp_key = crate::history_sync::latest_mobile_temp_key();
+    build_sync_v2_payload_with_temp_key(s, sync_id, partitions, &temp_key)
+}
+
+/// Like [`build_sync_v2_payload`], using an explicit `temp_key` (consumed once by the caller).
+pub fn build_sync_v2_payload_with_temp_key(
+    s: &Session,
+    sync_id: &str,
+    partitions: &[String],
+    temp_key: &str,
+) -> Result<serde_json::Value> {
     let keys = crate::history_sync::current_v2_keys()
         .map_err(|_| anyhow::anyhow!("chưa có khóa Sync V2 — gọi wake_phone_sync_v2 trước"))?;
     let (ik_pub, ek_pub) = (keys.ik_pub, keys.ek_pub);
@@ -10577,7 +10693,7 @@ pub fn build_sync_v2_payload(
         (
             "conversation",
             vec![json!({
-                "partition": "",
+                "partition": "conversations",
                 "from": 0,
                 "to": 9_007_199_254_740_991_i64,
                 "limit": 9_007_199_254_740_991_i64
@@ -10586,6 +10702,7 @@ pub fn build_sync_v2_payload(
     } else {
         let q: Vec<serde_json::Value> = partitions
             .iter()
+            .take(MAX_SYNC_V2_QUERIES)
             .map(|p| {
                 let partition_str = if p.starts_with("oneone/") || p.starts_with("group/") {
                     p.clone()
@@ -10675,11 +10792,18 @@ pub async fn resolve_thread_partitions(s: &Session, threads: &[Thread]) -> Vec<S
         .map(|l| l.send2me_id.trim().to_string())
         .unwrap_or_default();
 
+    let mut ordered_threads: Vec<&Thread> = threads.iter().collect();
+    ordered_threads.sort_by_key(|t| {
+        std::cmp::Reverse(t.messages.last().map(|m| m.ts).unwrap_or(0))
+    });
+
     let mut fids: Vec<String> = Vec::new();
     // (clean_numeric_gid, original_thread_id)
     let mut gids: Vec<(String, String)> = Vec::new();
+    // Preserve active order across 1-1 & group threads when capping partitions to MAX_SYNC_V2_QUERIES.
+    let mut ordered_targets: Vec<(bool, String)> = Vec::new();
 
-    for t in threads {
+    for t in ordered_threads {
         let tid = t.id.trim();
         if tid.is_empty() || (!send2me_id.is_empty() && tid == send2me_id) {
             continue;
@@ -10695,9 +10819,11 @@ pub async fn resolve_thread_partitions(s: &Session, threads: &[Thread]) -> Vec<S
                 && !gids.iter().any(|(c, _)| c == clean)
             {
                 gids.push((clean.to_string(), tid.to_string()));
+                ordered_targets.push((true, clean.to_string()));
             }
         } else if tid.bytes().all(|b| b.is_ascii_digit()) && !fids.iter().any(|u| u == tid) {
             fids.push(tid.to_string());
+            ordered_targets.push((false, tid.to_string()));
         }
     }
 
@@ -10799,16 +10925,8 @@ pub async fn resolve_thread_partitions(s: &Session, threads: &[Thread]) -> Vec<S
         }
     }
 
-    for fid in &fids {
-        if !own_uin.is_empty() && fid == &own_uin {
-            continue;
-        }
-        if let Some(gid) = resolved_users.get(fid) {
-            partitions.push(format!("oneone/{gid}"));
-            noised_to_real.push((gid.clone(), fid.clone(), false));
-        }
-    }
-
+    let mut resolved_groups: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     if !gids.is_empty() {
         let raw_gids: Vec<String> = gids.iter().map(|(c, _)| c.clone()).collect();
         if let Ok((info_map, _)) = fetch_group_profiles(s, &raw_gids).await {
@@ -10818,13 +10936,35 @@ pub async fn resolve_thread_partitions(s: &Session, threads: &[Thread]) -> Vec<S
                     .or_else(|| info_map.get(&format!("g{clean_gid}")))
                 {
                     if let Some(gid) = extract_gid(gval) {
-                        partitions.push(format!("group/{gid}"));
+                        resolved_groups.insert(clean_gid.clone(), gid.clone());
                         noised_to_real.push((gid, orig_tid.clone(), true));
                     }
                 }
             }
         }
     }
+
+    for (is_grp, id) in ordered_targets {
+        if is_grp {
+            if let Some(gid) = resolved_groups.get(&id) {
+                partitions.push(format!("group/{gid}"));
+            }
+        } else if !own_uin.is_empty() && id == own_uin {
+            continue;
+        } else if let Some(gid) = resolved_users.get(&id) {
+            partitions.push(format!("oneone/{gid}"));
+        }
+    }
+    // Note: keep 1-1 entries in noised_to_real even beyond the MAX_SYNC_V2_QUERIES cap.
+    for fid in &fids {
+        if !own_uin.is_empty() && fid == &own_uin {
+            continue;
+        }
+        if let Some(gid) = resolved_users.get(fid) {
+            noised_to_real.push((gid.clone(), fid.clone(), false));
+        }
+    }
+    partitions.truncate(MAX_SYNC_V2_QUERIES);
 
     if !noised_to_real.is_empty() {
         crate::history_sync::record_sync_v2_partition_map(&noised_to_real);
@@ -10845,18 +10985,49 @@ pub fn send_sync_v2_request_with_queries(
     sync_id: &str,
     noised_ids: &[String],
 ) -> Result<bool> {
-    let sync_data = build_sync_v2_payload(s, sync_id, noised_ids)?;
-    crate::logger::log_sync(&format!(
-        "590 payload: {}",
-        sync_data.to_string().chars().take(600).collect::<String>()
-    ));
+    let temp_key = crate::history_sync::take_latest_mobile_temp_key();
+    let has_temp_key = !temp_key.is_empty();
+    let sync_data = build_sync_v2_payload_with_temp_key(s, sync_id, noised_ids, &temp_key)?;
+    let req_type = sync_data
+        .pointer("/req/type")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let query_count = sync_data
+        .pointer("/req/queries")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
     let sent_ws = crate::socket::send_sync_message_ws_request(&sync_data);
-    crate::logger::log_sync(&format!(
-        "590 gửi: sync={} ws_590={}",
-        &sync_id.chars().take(8).collect::<String>(),
-        sent_ws
-    ));
+    crate::logger::log_sync_event(
+        "sync::cmd_590_send",
+        &format!(
+            "sync={} type={req_type} queries={query_count} has_temp_key={has_temp_key} sent={sent_ws}",
+            sync_id.chars().take(8).collect::<String>()
+        ),
+        !sent_ws,
+    );
     Ok(sent_ws)
+}
+
+/// Parse a WebSocket `cmd 590` (`CMD_SYNC_REQUEST`) server ACK payload for `error_code` / `err`.
+pub fn parse_sync_v2_cmd_ack(cmd: u16, payload: &Value) -> Option<(i64, String)> {
+    if cmd != crate::socket::CMD_SYNC_REQUEST {
+        return None;
+    }
+    let code = payload
+        .get("error_code")
+        .or_else(|| payload.get("err"))
+        .or_else(|| payload.pointer("/data/error_code"))
+        .or_else(|| payload.pointer("/data/err"))
+        .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()))?;
+    let msg = payload
+        .get("error_message")
+        .or_else(|| payload.get("message"))
+        .or_else(|| payload.pointer("/data/error_message"))
+        .or_else(|| payload.pointer("/data/message"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    Some((code, msg))
 }
 
 /// Cancel an active mobile message sync request (`cancelTransferMessage` @ `app.asar:14372356`, cmd `12700`, #68).
@@ -10906,11 +11077,11 @@ pub enum MobileSyncControlEvent {
     /// `act == "transfer_status"` (`status == 3`) — phone displayed confirmation prompt and is waiting for user tap!
     WaitingConfirmOnPhone { sync_id: String },
     /// `act == "user_confirm"` (`user_action == 1 | 3`) or `transfer_status` (`status == 4 | 5`) — user tapped "Đồng bộ" on their phone!
-    UserConfirmed,
+    UserConfirmed { sync_id: String },
     /// `act == "user_confirm"` (`user_action == 0`) or `transfer_status` (`status == 6 | 7`) — user declined sync on their phone.
-    UserRejected,
+    UserRejected { sync_id: String },
     /// `act == "user_confirm"` (`user_action == 2`) or `transfer_status` (`status == 8`) — phone is busy backing up/restoring (`BUSY_RESTORING`).
-    MobileBusyRestoring,
+    MobileBusyRestoring { sync_id: String },
     /// `act == "syncmsg_info"` or `act == "upload_batch"` — phone finished uploading backup package (`url`, `file_name`, `encrypted_key`).
     BackupReady {
         url: String,
@@ -11029,12 +11200,17 @@ pub fn extract_mobile_sync_controls(data_node: &Value) -> Vec<MobileSyncControlE
                     .get("user_action")
                     .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()))
                     .unwrap_or(-1);
+                let sid = parsed_data
+                    .get("syncId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
                 if ua == 1 || ua == 3 {
-                    out.push(MobileSyncControlEvent::UserConfirmed);
+                    out.push(MobileSyncControlEvent::UserConfirmed { sync_id: sid });
                 } else if ua == 2 {
-                    out.push(MobileSyncControlEvent::MobileBusyRestoring);
+                    out.push(MobileSyncControlEvent::MobileBusyRestoring { sync_id: sid });
                 } else if ua == 0 {
-                    out.push(MobileSyncControlEvent::UserRejected);
+                    out.push(MobileSyncControlEvent::UserRejected { sync_id: sid });
                 }
             }
             "transfer_status" => {
@@ -11050,9 +11226,9 @@ pub fn extract_mobile_sync_controls(data_node: &Value) -> Vec<MobileSyncControlE
                 match st {
                     2 => out.push(MobileSyncControlEvent::SyncV2MobileIdle { sync_id: sid }),
                     3 => out.push(MobileSyncControlEvent::WaitingConfirmOnPhone { sync_id: sid }),
-                    4 | 5 => out.push(MobileSyncControlEvent::UserConfirmed),
-                    6 | 7 => out.push(MobileSyncControlEvent::UserRejected),
-                    8 => out.push(MobileSyncControlEvent::MobileBusyRestoring),
+                    4 | 5 => out.push(MobileSyncControlEvent::UserConfirmed { sync_id: sid }),
+                    6 | 7 => out.push(MobileSyncControlEvent::UserRejected { sync_id: sid }),
+                    8 => out.push(MobileSyncControlEvent::MobileBusyRestoring { sync_id: sid }),
                     9 => out.push(MobileSyncControlEvent::SyncV2Error {
                         sync_id: sid,
                         err: 1105,
@@ -11123,7 +11299,7 @@ pub fn extract_mobile_sync_controls(data_node: &Value) -> Vec<MobileSyncControlE
                 } else if is_last && act_type == "transfer_sync2" {
                     out.push(MobileSyncControlEvent::SyncV2EmptyDone { sync_id: sid });
                 } else {
-                    out.push(MobileSyncControlEvent::MobileBusyRestoring);
+                    out.push(MobileSyncControlEvent::MobileBusyRestoring { sync_id: sid });
                 }
             }
             "transfer_error" => {
@@ -11135,6 +11311,7 @@ pub fn extract_mobile_sync_controls(data_node: &Value) -> Vec<MobileSyncControlE
                 let err = parsed_data
                     .get("errorCode")
                     .or_else(|| parsed_data.get("err"))
+                    .or_else(|| parsed_data.get("code"))
                     .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()))
                     .unwrap_or(-1);
                 let batch_type = parsed_data
@@ -11156,6 +11333,14 @@ pub fn extract_mobile_sync_controls(data_node: &Value) -> Vec<MobileSyncControlE
                     .and_then(Value::as_str)
                     .unwrap_or("Điện thoại báo lỗi đồng bộ")
                     .to_string();
+                crate::logger::log_sync_event(
+                    "sync::ctrl",
+                    &format!(
+                        "transfer_error sync={sid} err={err} isLast={is_last} batchType={batch_type} msg={message} raw={}",
+                        parsed_data.to_string().chars().take(240).collect::<String>()
+                    ),
+                    true,
+                );
                 out.push(MobileSyncControlEvent::SyncV2Error {
                     sync_id: sid,
                     err,
@@ -13056,7 +13241,12 @@ mod send_identity_tests {
                 temp_key: "tk_login_999".into()
             }
         );
-        assert_eq!(evs[1], MobileSyncControlEvent::UserConfirmed);
+        assert_eq!(
+            evs[1],
+            MobileSyncControlEvent::UserConfirmed {
+                sync_id: String::new()
+            }
+        );
         assert_eq!(
             evs[2],
             MobileSyncControlEvent::BackupReady {
@@ -13150,6 +13340,127 @@ mod send_identity_tests {
                 is_last: true,
             }
         );
+    }
+
+    #[test]
+    fn build_sync_v2_payload_uses_conversations_partition_and_caps_queries() {
+        let mut s = Session::new(false, false, false).unwrap();
+        s.login = Some(crate::session::LoginInfo {
+            uin: "1001".into(),
+            ..Default::default()
+        });
+        // ZprotoHost::load() may not exist on CI/Linux without Zalo PC WASM; inject dummy keys if needed.
+        if crate::history_sync::current_v2_keys().is_err() {
+            crate::history_sync::set_test_v2_keys_for_unit_tests();
+        }
+        let empty = build_sync_v2_payload_with_temp_key(&s, "sync123", &[], "tk1").unwrap();
+        assert_eq!(empty["req"]["type"], "conversation");
+        assert_eq!(empty["req"]["queries"][0]["partition"], "conversations");
+        assert_eq!(empty["tempKey"], "tk1");
+
+        let many: Vec<String> = (0..80).map(|i| format!("oneone/u{i}")).collect();
+        let capped = build_sync_v2_payload_with_temp_key(&s, "sync123", &many, "").unwrap();
+        assert_eq!(capped["req"]["type"], "message");
+        assert_eq!(
+            capped["req"]["queries"].as_array().unwrap().len(),
+            MAX_SYNC_V2_QUERIES
+        );
+    }
+
+    #[test]
+    fn extract_mobile_sync_controls_preserves_sync_id_on_confirm_reject_busy() {
+        let payload = json!({
+            "controls": [
+                {
+                    "content": {
+                        "act_type": "transfer_sync2",
+                        "act": "transfer_status",
+                        "data": { "syncId": "sid_a", "status": 4 }
+                    }
+                },
+                {
+                    "content": {
+                        "act_type": "transfer_sync2",
+                        "act": "transfer_status",
+                        "data": { "syncId": "sid_b", "status": 6 }
+                    }
+                },
+                {
+                    "content": {
+                        "act_type": "transfer_sync2",
+                        "act": "transfer_status",
+                        "data": { "syncId": "sid_c", "status": 8 }
+                    }
+                }
+            ]
+        });
+        let evs = extract_mobile_sync_controls(&payload);
+        assert_eq!(
+            evs,
+            vec![
+                MobileSyncControlEvent::UserConfirmed {
+                    sync_id: "sid_a".into()
+                },
+                MobileSyncControlEvent::UserRejected {
+                    sync_id: "sid_b".into()
+                },
+                MobileSyncControlEvent::MobileBusyRestoring {
+                    sync_id: "sid_c".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_sync_v2_cmd_ack_detects_server_rejection() {
+        let ok = json!({ "error_code": 0, "data": {} });
+        assert_eq!(parse_sync_v2_cmd_ack(590, &ok), Some((0, String::new())));
+        let err = json!({ "error_code": -1, "error_message": "bad sync payload" });
+        assert_eq!(
+            parse_sync_v2_cmd_ack(590, &err),
+            Some((-1, "bad sync payload".into()))
+        );
+        assert_eq!(parse_sync_v2_cmd_ack(501, &err), None);
+    }
+
+    #[test]
+    fn check_cloud_messages_response_surfaces_session_error_and_stop_retry() {
+        let ok = check_cloud_messages_response(json!({ "error_code": 0, "data": {} }));
+        assert!(ok.is_ok());
+
+        let stop = check_cloud_messages_response(json!({ "error_code": -69, "error_message": "stop" }))
+            .unwrap_err();
+        assert!(is_cloud_stop_retry(&stop));
+
+        let fail = check_cloud_messages_response(json!({ "error_code": 500, "error_message": "srv" }))
+            .unwrap_err();
+        assert!(!is_cloud_stop_retry(&fail));
+        assert_eq!(
+            fail.downcast_ref::<crate::session::SessionError>()
+                .map(|e| e.code),
+            Some(500)
+        );
+    }
+
+    #[test]
+    fn merge_previews_with_group_hint_routes_cmd_521_group_payload() {
+        let mut threads = Vec::new();
+        let cmd_521 = json!({
+            "data": {
+                "msgId": "9001",
+                "uidFrom": "2002",
+                "idTo": "778899",
+                "ts": "1760000001000",
+                "msgType": "webchat",
+                "content": "Tin nhóm realtime"
+            }
+        });
+        merge_previews_with_group_hint(&mut threads, &cmd_521, true);
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].id, "778899");
+        assert!(threads[0].is_group);
+        assert_eq!(threads[0].messages.len(), 1);
+        assert_eq!(threads[0].messages[0].text, "Tin nhóm realtime");
     }
 
     #[test]

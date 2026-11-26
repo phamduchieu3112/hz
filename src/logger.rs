@@ -172,6 +172,43 @@ pub fn log_sync(msg: &str) {
     }
 }
 
+/// Record a structured sync handshake, protocol, or error diagnostic to `sync_debug.log`
+/// and — when `--dev` is active — into the in-app DevTools log stream.
+pub fn log_sync_event(context: &str, detail: &str, is_error: bool) {
+    log_sync(&format!("{context}: {detail}"));
+    if !is_dev_mode() {
+        return;
+    }
+    let now = crate::login::unix_now();
+    let time_str = format!(
+        "{:02}:{:02}:{:02}",
+        (now / 3600) % 24,
+        (now / 60) % 60,
+        now % 60
+    );
+    let preview: String = detail.chars().take(500).collect();
+
+    if let Ok(mut state) = LOGGER.lock() {
+        state.counter += 1;
+        let entry = LogEntry {
+            id: state.counter,
+            timestamp: time_str,
+            method: if is_error { "SYNC-ERR" } else { "SYNC" }.to_string(),
+            url: context.to_string(),
+            status: None,
+            latency_ms: 0,
+            payload_preview: preview.clone(),
+            decrypted_preview: None,
+            is_error,
+            error_msg: is_error.then_some(preview),
+        };
+        state.entries.push(entry);
+        if state.entries.len() > state.max_entries {
+            state.entries.remove(0);
+        }
+    }
+}
+
 pub fn get_entries() -> Vec<LogEntry> {
     LOGGER.lock().map(|s| s.entries.clone()).unwrap_or_default()
 }

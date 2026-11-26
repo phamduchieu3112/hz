@@ -25,6 +25,7 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use futures_util::{SinkExt, StreamExt};
 use generic_array::typenum::U16;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
@@ -64,14 +65,58 @@ pub const CMD_SYNC_REQUEST: u16 = 590;
 pub const CMD_SYNC_ACK_DELETE: u16 = 591;
 pub const CMD_SYNC_MOBILE_WAKE_UP: u16 = 592;
 
-static WS_OUTBOUND_TX: std::sync::Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>> =
+static WS_OUTBOUND_GEN: AtomicU64 = AtomicU64::new(0);
+static WS_OUTBOUND_TX: std::sync::Mutex<Option<(u64, mpsc::UnboundedSender<Vec<u8>>)>> =
     std::sync::Mutex::new(None);
+
+struct ActiveOutboundGuard {
+    gen: u64,
+}
+
+impl Drop for ActiveOutboundGuard {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = WS_OUTBOUND_TX.lock() {
+            if matches!(*guard, Some((g, _)) if g == self.gen) {
+                *guard = None;
+            }
+        }
+    }
+}
+
+fn next_active_outbound_gen() -> u64 {
+    WS_OUTBOUND_GEN.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+fn install_active_outbound(
+    gen: u64,
+    tx: mpsc::UnboundedSender<Vec<u8>>,
+) -> Option<ActiveOutboundGuard> {
+    let mut guard = WS_OUTBOUND_TX.lock().ok()?;
+    if WS_OUTBOUND_GEN.load(Ordering::SeqCst) != gen || tx.is_closed() {
+        crate::logger::log_sync_event(
+            "ws::outbound",
+            &format!("ignored stale active outbound registration gen={gen}"),
+            false,
+        );
+        return None;
+    }
+    *guard = Some((gen, tx));
+    Some(ActiveOutboundGuard { gen })
+}
+
+/// True when an active `zpw_ws` outbound channel is registered and still open.
+pub fn is_ws_outbound_connected() -> bool {
+    WS_OUTBOUND_TX
+        .lock()
+        .map(|g| matches!(&*g, Some((_, tx)) if !tx.is_closed()))
+        .unwrap_or(false)
+}
 
 /// Send a raw encoded frame over the active `zpw_ws` WebSocket if connected.
 pub fn send_ws_frame(cmd: u16, sub_cmd: u8, version: u8, data: Option<&Value>) -> bool {
     let frame = encode_frame(cmd, sub_cmd, version, data);
     if let Ok(guard) = WS_OUTBOUND_TX.lock() {
-        if let Some(ref tx) = *guard {
+        if let Some((_, ref tx)) = *guard {
             return tx.send(frame).is_ok();
         }
     }
@@ -445,16 +490,35 @@ enum SocketRole {
 
 fn spawn_with_role(sess: Session, role: SocketRole) -> mpsc::UnboundedReceiver<WsEvent> {
     let (tx, rx) = mpsc::unbounded_channel();
+    let active_gen = match role {
+        SocketRole::Active => next_active_outbound_gen(),
+        SocketRole::Passive => 0,
+    };
     tokio::spawn(async move {
         let mut backoff = 2u64;
         let mut endpoint_idx = 0usize;
         loop {
-            match run_once(&sess, &tx, endpoint_idx, role).await {
-                Ok(reason) => trace(format!("closed: {reason}")),
-                Err(e) => trace(format!("error: {e:#}")),
-            }
-            if tx.is_closed() {
+            if role == SocketRole::Active && WS_OUTBOUND_GEN.load(Ordering::SeqCst) != active_gen {
                 break;
+            }
+            let reached_authed = match run_once(&sess, &tx, endpoint_idx, role, active_gen).await {
+                Ok((reason, authed)) => {
+                    trace(format!("closed: {reason}"));
+                    authed
+                }
+                Err(e) => {
+                    trace(format!("error: {e:#}"));
+                    false
+                }
+            };
+            if tx.is_closed()
+                || (role == SocketRole::Active
+                    && WS_OUTBOUND_GEN.load(Ordering::SeqCst) != active_gen)
+            {
+                break;
+            }
+            if reached_authed {
+                backoff = 2;
             }
             // `3002 NOT_FOUND_WORKER` means this shard does not host the session; rotate.
             endpoint_idx = endpoint_idx.wrapping_add(1);
@@ -473,7 +537,13 @@ async fn run_once(
     tx: &mpsc::UnboundedSender<WsEvent>,
     endpoint_idx: usize,
     role: SocketRole,
-) -> Result<String> {
+    active_gen: u64,
+) -> Result<(String, bool)> {
+    if tx.is_closed()
+        || (role == SocketRole::Active && WS_OUTBOUND_GEN.load(Ordering::SeqCst) != active_gen)
+    {
+        return Ok(("superseded before connect".into(), false));
+    }
     let url = build_url(sess, endpoint_idx);
     trace(format!("connect {url}"));
 
@@ -491,16 +561,21 @@ async fn run_once(
         h.insert(USER_AGENT, HeaderValue::from_static(UA));
     }
 
-    let (mut ws, resp) = match connect_async(req).await {
-        Ok(pair) => pair,
-        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
-            let mut detail = format!("handshake status {}", resp.status());
-            for (k, v) in resp.headers() {
-                detail.push_str(&format!("\n  {k}: {}", v.to_str().unwrap_or("<bin>")));
-            }
-            bail!("{detail}");
+    let (mut ws, resp) = tokio::select! {
+        _ = tx.closed() => {
+            return Ok(("receiver dropped during handshake".into(), false));
         }
-        Err(e) => return Err(e.into()),
+        res = connect_async(req) => match res {
+            Ok(pair) => pair,
+            Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
+                let mut detail = format!("handshake status {}", resp.status());
+                for (k, v) in resp.headers() {
+                    detail.push_str(&format!("\n  {k}: {}", v.to_str().unwrap_or("<bin>")));
+                }
+                bail!("{detail}");
+            }
+            Err(e) => return Err(e.into()),
+        }
     };
     trace(format!("handshake {}", resp.status()));
 
@@ -516,21 +591,24 @@ async fn run_once(
     // A passive socket keeps its sender private: `_out_tx` stays alive so `out_rx`
     // simply never yields, and the global outbound slot keeps pointing at the active socket.
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    let _out_tx = match role {
+    let (_out_tx, _active_guard) = match role {
         SocketRole::Active => {
-            if let Ok(mut g) = WS_OUTBOUND_TX.lock() {
-                *g = Some(out_tx);
+            if tx.is_closed() {
+                return Ok(("receiver dropped before outbound install".into(), false));
             }
-            None
+            let Some(guard) = install_active_outbound(active_gen, out_tx) else {
+                return Ok(("superseded by newer active socket".into(), false));
+            };
+            (None, Some(guard))
         }
-        SocketRole::Passive => Some(out_tx),
+        SocketRole::Passive => (Some(out_tx), None),
     };
     loop {
         tokio::select! {
             // The owner dropped the receiver (account switched or removed): close the
             // connection instead of keeping a second session alive for that account.
             _ = tx.closed() => {
-                return Ok("receiver dropped".into());
+                return Ok(("receiver dropped".into(), authed));
             }
             _ = ping.tick() => {
                 if authed {
@@ -553,7 +631,7 @@ async fn run_once(
             }
             incoming = ws.next() => {
                 let Some(incoming) = incoming else {
-                    return Ok("eof".into());
+                    return Ok(("eof".into(), authed));
                 };
                 let incoming = incoming?;
                 let buf = match incoming {
@@ -566,7 +644,7 @@ async fn run_once(
                         ws.send(Message::Pong(p)).await?;
                         continue;
                     }
-                    Message::Close(c) => return Ok(format!("close {c:?}")),
+                    Message::Close(c) => return Ok((format!("close {c:?}"), authed)),
                     _ => continue,
                 };
 
@@ -673,10 +751,24 @@ async fn run_once(
                     || cmd == CMD_SYNC_ACK_DELETE
                     || cmd == CMD_SYNC_MOBILE_WAKE_UP
                 {
-                    crate::logger::log_sync(&format!("WS về cmd={cmd}: {}", payload.to_string().chars().take(400).collect::<String>()));
+                    let err_code = payload
+                        .get("error_code")
+                        .or_else(|| payload.get("err"))
+                        .or_else(|| payload.pointer("/data/error_code"))
+                        .or_else(|| payload.pointer("/data/err"))
+                        .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()));
+                    let is_err = err_code.is_some_and(|c| c != 0);
+                    crate::logger::log_sync_event(
+                        "ws::sync_ack",
+                        &format!(
+                            "cmd={cmd} err={err_code:?} payload={}",
+                            truncate(&payload.to_string(), 400)
+                        ),
+                        is_err,
+                    );
                 }
                 if tx.send(WsEvent { cmd, sub_cmd, version, payload }).is_err() {
-                    return Ok("receiver dropped".into());
+                    return Ok(("receiver dropped".into(), authed));
                 }
             }
         }
@@ -733,5 +825,26 @@ mod tests {
     fn gcm_rejects_short_blob() {
         let err = gcm_decrypt(&[0u8; 32], &[0u8; 16]).unwrap_err().to_string();
         assert!(err.contains("too short"), "{err}");
+    }
+
+    #[test]
+    fn ws_outbound_generation_prevents_stale_socket_clobber() {
+        let gen1 = next_active_outbound_gen();
+        let gen2 = next_active_outbound_gen();
+        let (tx1, _rx1) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (tx2, mut rx2) = mpsc::unbounded_channel::<Vec<u8>>();
+
+        let guard2 = install_active_outbound(gen2, tx2).expect("newer gen2 installs");
+        assert!(
+            install_active_outbound(gen1, tx1).is_none(),
+            "stale gen1 must not clobber gen2"
+        );
+        assert!(is_ws_outbound_connected());
+        assert!(send_ws_frame(CMD_SYNC_REQUEST, 0, 1, Some(&json!({ "ok": true }))));
+        let frame = rx2.try_recv().expect("frame delivered to gen2");
+        assert!(!frame.is_empty());
+
+        drop(guard2);
+        assert!(!is_ws_outbound_connected());
     }
 }
