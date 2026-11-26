@@ -7,27 +7,35 @@
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use opus::{Channels as OpusChannels, Decoder, Encoder};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::UdpSocket;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU8, Ordering},
-    Arc, LazyLock, Mutex,
+    atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering},
+    mpsc, Arc, LazyLock, Mutex,
 };
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const SAMPLE_RATE: u32 = 16000;
 const FRAME_SAMPLES: usize = 320; // 20 ms @ 16 kHz
+const AUDIO_RING_CAPACITY: usize = 4096; // 256 ms @ 16 kHz (power of two)
+const AUDIO_MAX_OUTPUT_RING_SAMPLES: usize = FRAME_SAMPLES * 6; // 120 ms max playback queue
+
+struct CachedDevices {
+    mics: Vec<String>,
+    cams: Vec<String>,
+    updated_at: Instant,
+}
 
 static SELECTED_MIC_DEVICE: Mutex<String> = Mutex::new(String::new());
+static MIC_SELECTION_EPOCH: AtomicU64 = AtomicU64::new(1);
 static SELECTED_CAMERA_DEVICE: Mutex<String> = Mutex::new(String::new());
-static CACHED_DEVICES: Mutex<Option<(Vec<String>, Vec<String>)>> = Mutex::new(None);
+static CACHED_DEVICES: Mutex<Option<CachedDevices>> = Mutex::new(None);
 static DEVICES_SCANNING: AtomicBool = AtomicBool::new(false);
 static SHARED_CAM_H264: Mutex<(u64, Vec<u8>, Vec<u8>)> = Mutex::new((0, Vec::new(), Vec::new()));
-static MIC_GAIN_PERCENT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(100);
-static MIC_LEVEL_PERMILLE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-static REMOTE_AUDIO_ACTIVE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static MIC_GAIN_PERCENT: AtomicU32 = AtomicU32::new(100);
+static MIC_LEVEL_PERMILLE: AtomicU32 = AtomicU32::new(0);
+static REMOTE_AUDIO_ACTIVE: AtomicBool = AtomicBool::new(false);
 static CALL_VIDEO_FRAMES: LazyLock<Mutex<HashMap<String, Option<eframe::egui::ColorImage>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static CALL_VIDEO_DIRTY: AtomicBool = AtomicBool::new(false);
@@ -151,8 +159,25 @@ pub fn is_ignored_virtual_or_ir_device(name: &str) -> bool {
         || low.starts_with("monitor of ")
 }
 pub fn set_selected_mic_device(name: &str) {
-    if let Ok(mut g) = SELECTED_MIC_DEVICE.lock() {
-        *g = name.trim().to_string();
+    let normalized = name.trim().to_string();
+    let changed = if let Ok(mut g) = SELECTED_MIC_DEVICE.lock() {
+        if *g != normalized {
+            *g = normalized.clone();
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    if changed {
+        MIC_SELECTION_EPOCH.fetch_add(1, Ordering::AcqRel);
+        let label = if normalized.is_empty() {
+            "<default>"
+        } else {
+            &normalized
+        };
+        crate::logger::log_voip_event("audio::mic_select", &format!("selected={label}"), false);
     }
 }
 
@@ -174,6 +199,150 @@ pub fn selected_camera_device() -> String {
         .lock()
         .map(|g| g.clone())
         .unwrap_or_default()
+}
+
+enum AudioEnumReq {
+    EnumerateInputs {
+        reply: mpsc::Sender<Result<(Vec<String>, bool), String>>,
+    },
+    ResolveInputDevice {
+        preferred: String,
+        reply: mpsc::Sender<Result<(cpal::Device, String), String>>,
+    },
+    ResolveOutputDevice {
+        reply: mpsc::Sender<Result<(cpal::Device, String), String>>,
+    },
+}
+
+fn safe_cpal_device_name(d: &cpal::Device) -> Option<String> {
+    crate::logger::with_suppressed_panic_log(|| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| d.name().ok()))
+            .ok()
+            .flatten()
+    })
+}
+
+fn collect_input_names_on_host(host: &cpal::Host) -> Result<(Vec<String>, bool), String> {
+    let devs = host
+        .input_devices()
+        .map_err(|e| format!("input_devices: {e}"))?;
+    let mut mics = Vec::new();
+    for d in devs {
+        if let Some(name) = safe_cpal_device_name(&d) {
+            let trimmed = name.trim().to_string();
+            if !trimmed.is_empty()
+                && !is_ignored_virtual_or_ir_device(&trimmed)
+                && !mics.contains(&trimmed)
+            {
+                mics.push(trimmed);
+            }
+        }
+    }
+    let has_default = host.default_input_device().is_some();
+    Ok((mics, has_default))
+}
+
+fn find_input_device_on_host(
+    host: &cpal::Host,
+    preferred: &str,
+) -> Result<(cpal::Device, String), String> {
+    let pref = preferred.trim();
+    if !pref.is_empty() {
+        if let Ok(devs) = host.input_devices() {
+            for d in devs {
+                if let Some(name) = safe_cpal_device_name(&d) {
+                    let trimmed = name.trim().to_string();
+                    if trimmed == pref {
+                        return Ok((d, trimmed));
+                    }
+                }
+            }
+        }
+    }
+    let dev = host
+        .default_input_device()
+        .ok_or_else(|| "no default input device".to_string())?;
+    let actual = safe_cpal_device_name(&dev)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "default".to_string());
+    Ok((dev, actual))
+}
+
+fn find_output_device_on_host(host: &cpal::Host) -> Result<(cpal::Device, String), String> {
+    let dev = host
+        .default_output_device()
+        .ok_or_else(|| "no default output device".to_string())?;
+    let actual = safe_cpal_device_name(&dev)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "default".to_string());
+    Ok((dev, actual))
+}
+
+/// Process-lifetime dedicated COM/WASAPI audio enumerator thread.
+/// Keeping `cpal::default_host()` on a single non-exiting thread prevents `cpal 0.15.3`'s
+/// `OnceLock<Enumerator>` STA `CoUninitialize()` poisoning across short-lived scan threads.
+static AUDIO_ENUM_TX: LazyLock<mpsc::Sender<AudioEnumReq>> = LazyLock::new(|| {
+    let (tx, rx) = mpsc::channel::<AudioEnumReq>();
+    let _ = thread::Builder::new()
+        .name("hz-audio-enumerator".into())
+        .spawn(move || {
+            let host = cpal::default_host();
+            while let Ok(req) = rx.recv() {
+                match req {
+                    AudioEnumReq::EnumerateInputs { reply } => {
+                        let res = collect_input_names_on_host(&host);
+                        let _ = reply.send(res);
+                    }
+                    AudioEnumReq::ResolveInputDevice { preferred, reply } => {
+                        let res = find_input_device_on_host(&host, &preferred);
+                        let _ = reply.send(res);
+                    }
+                    AudioEnumReq::ResolveOutputDevice { reply } => {
+                        let res = find_output_device_on_host(&host);
+                        let _ = reply.send(res);
+                    }
+                }
+            }
+        });
+    tx
+});
+
+fn enumerate_input_devices_via_worker() -> Result<(Vec<String>, bool), String> {
+    let (reply_tx, reply_rx) = mpsc::channel();
+    AUDIO_ENUM_TX
+        .send(AudioEnumReq::EnumerateInputs { reply: reply_tx })
+        .map_err(|_| "hz-audio-enumerator channel closed".to_string())?;
+    reply_rx
+        .recv_timeout(Duration::from_secs(3))
+        .map_err(|e| format!("hz-audio-enumerator timeout: {e}"))?
+}
+
+/// Resolve a `cpal` input device matching `preferred` (or system default) via the persistent
+/// `"hz-audio-enumerator"` thread so Windows COM/WASAPI remains healthy.
+pub fn resolve_input_device(preferred: &str) -> Result<(cpal::Device, String), String> {
+    let (reply_tx, reply_rx) = mpsc::channel();
+    AUDIO_ENUM_TX
+        .send(AudioEnumReq::ResolveInputDevice {
+            preferred: preferred.trim().to_string(),
+            reply: reply_tx,
+        })
+        .map_err(|_| "hz-audio-enumerator channel closed".to_string())?;
+    reply_rx
+        .recv_timeout(Duration::from_secs(3))
+        .map_err(|e| format!("hz-audio-enumerator timeout: {e}"))?
+}
+
+/// Resolve the system default `cpal` output device via the persistent `"hz-audio-enumerator"` thread.
+pub fn resolve_output_device() -> Result<(cpal::Device, String), String> {
+    let (reply_tx, reply_rx) = mpsc::channel();
+    AUDIO_ENUM_TX
+        .send(AudioEnumReq::ResolveOutputDevice { reply: reply_tx })
+        .map_err(|_| "hz-audio-enumerator channel closed".to_string())?;
+    reply_rx
+        .recv_timeout(Duration::from_secs(3))
+        .map_err(|e| format!("hz-audio-enumerator timeout: {e}"))?
 }
 
 /// Check whether `ffmpeg` is installed and reachable in `PATH` (cached after first probe).
@@ -222,61 +391,108 @@ pub fn is_ffmpeg_available_nonblocking() -> Option<bool> {
     }
     None
 }
-fn probe_media_devices_sync() -> (Vec<String>, Vec<String>) {
-    let mut mics = Vec::new();
-    let host = cpal::default_host();
-    if let Ok(devs) = host.input_devices() {
-        for d in devs {
-            if let Ok(name) = d.name() {
-                let trimmed = name.trim().to_string();
-                if !trimmed.is_empty()
-                    && !is_ignored_virtual_or_ir_device(&trimmed)
-                    && !mics.contains(&trimmed)
-                {
-                    mics.push(trimmed);
-                }
-            }
+/// Merge a fresh microphone enumeration result against the previously cached list so a transient
+/// COM/WASAPI error or empty glitch never wipes previously valid microphones from the UI dropdown.
+/// Returns `(merged_mics, preserved_on_fault)`.
+fn merge_mic_scan_result(
+    prev: &[String],
+    scan: Result<(Vec<String>, bool), &str>,
+) -> (Vec<String>, bool) {
+    match scan {
+        Ok((new_mics, _has_default)) if !new_mics.is_empty() => (new_mics, false),
+        Ok((_empty, true)) if !prev.is_empty() => (prev.to_vec(), true),
+        Ok((empty, _)) => (empty, false),
+        Err(_) => (prev.to_vec(), true),
+    }
+}
+
+fn probe_media_devices_sync(prev_mics: &[String]) -> (Vec<String>, Vec<String>) {
+    let scan = enumerate_input_devices_via_worker();
+    let (mics, preserved_on_fault) = match &scan {
+        Ok((list, has_default)) => {
+            merge_mic_scan_result(prev_mics, Ok((list.clone(), *has_default)))
+        }
+        Err(err) => merge_mic_scan_result(prev_mics, Err(err.as_str())),
+    };
+    match &scan {
+        Ok((found, has_default)) => {
+            crate::logger::log_voip_event(
+                "audio::device_scan",
+                &format!(
+                    "mics_found={} cached_mics={} has_default={has_default} preserved={preserved_on_fault}",
+                    found.len(),
+                    mics.len()
+                ),
+                preserved_on_fault,
+            );
+        }
+        Err(err) => {
+            crate::logger::log_voip_event(
+                "audio::device_scan",
+                &format!("scan_err={err} preserved_mics={}", mics.len()),
+                true,
+            );
         }
     }
     let cams = enumerate_ffmpeg_cameras();
     (mics, cams)
 }
+
 /// Return cached `(mic_devices, camera_devices)` or enumerate once (with `refresh=true` to rescan).
 pub fn list_media_devices(refresh: bool) -> (Vec<String>, Vec<String>) {
+    let prev_mics = CACHED_DEVICES
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|c| c.mics.clone()))
+        .unwrap_or_default();
     if !refresh {
         if let Ok(g) = CACHED_DEVICES.lock() {
             if let Some(ref cached) = *g {
-                return cached.clone();
+                return (cached.mics.clone(), cached.cams.clone());
             }
         }
     }
-    let pair = probe_media_devices_sync();
+    let (mics, cams) = probe_media_devices_sync(&prev_mics);
     if let Ok(mut g) = CACHED_DEVICES.lock() {
-        *g = Some(pair.clone());
+        *g = Some(CachedDevices {
+            mics: mics.clone(),
+            cams: cams.clone(),
+            updated_at: Instant::now(),
+        });
     }
-    pair
+    (mics, cams)
 }
 
 /// Return cached `(mics, cams, is_scanning)` immediately without blocking the UI thread.
-/// Spawns a background scan on cold cache or when `refresh` is true.
-pub fn list_media_devices_nonblocking(refresh: bool) -> (Vec<String>, Vec<String>, bool) {
-    let cached = CACHED_DEVICES
+/// Spawns a background scan on cold cache, when `refresh` is true, or when `auto_refresh_ttl` has elapsed.
+pub fn list_media_devices_with_ttl(
+    refresh: bool,
+    auto_refresh_ttl: Option<Duration>,
+) -> (Vec<String>, Vec<String>, bool) {
+    let snapshot = CACHED_DEVICES
         .lock()
         .ok()
-        .and_then(|g| g.clone());
-    if !refresh {
-        if let Some(pair) = cached {
-            return (pair.0, pair.1, DEVICES_SCANNING.load(Ordering::Acquire));
-        }
+        .and_then(|g| g.as_ref().map(|c| (c.mics.clone(), c.cams.clone(), c.updated_at)));
+    let needs_scan = match (&snapshot, auto_refresh_ttl) {
+        _ if refresh => true,
+        (None, _) => true,
+        (Some((_, _, updated_at)), Some(ttl)) => updated_at.elapsed() >= ttl,
+        (Some(_), None) => false,
+    };
+    let (mics, cams) = snapshot
+        .map(|(m, c, _)| (m, c))
+        .unwrap_or_default();
+    if !needs_scan {
+        return (mics, cams, DEVICES_SCANNING.load(Ordering::Acquire));
     }
-    let (mics, cams) = cached.unwrap_or_default();
     if DEVICES_SCANNING
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_ok()
     {
+        let prev_mics = mics.clone();
         let spawned = std::thread::Builder::new()
-            .name("media-device-scan".into())
-            .spawn(|| {
+            .name("hz-media-scan".into())
+            .spawn(move || {
                 struct ScanResetGuard;
                 impl Drop for ScanResetGuard {
                     fn drop(&mut self) {
@@ -284,9 +500,13 @@ pub fn list_media_devices_nonblocking(refresh: bool) -> (Vec<String>, Vec<String
                     }
                 }
                 let _guard = ScanResetGuard;
-                let pair = probe_media_devices_sync();
+                let (new_mics, new_cams) = probe_media_devices_sync(&prev_mics);
                 if let Ok(mut g) = CACHED_DEVICES.lock() {
-                    *g = Some(pair);
+                    *g = Some(CachedDevices {
+                        mics: new_mics,
+                        cams: new_cams,
+                        updated_at: Instant::now(),
+                    });
                 }
             });
         if spawned.is_err() {
@@ -294,6 +514,12 @@ pub fn list_media_devices_nonblocking(refresh: bool) -> (Vec<String>, Vec<String
         }
     }
     (mics, cams, DEVICES_SCANNING.load(Ordering::Acquire))
+}
+
+/// Return cached `(mics, cams, is_scanning)` immediately without blocking the UI thread.
+/// Spawns a background scan on cold cache or when `refresh` is true.
+pub fn list_media_devices_nonblocking(refresh: bool) -> (Vec<String>, Vec<String>, bool) {
+    list_media_devices_with_ttl(refresh, None)
 }
 
 fn enumerate_ffmpeg_cameras() -> Vec<String> {
@@ -840,6 +1066,7 @@ fn au_has_idr(au: &[u8]) -> bool {
 }
 
 /// True if the access unit can start decoding: it carries an IDR slice (5) or an SPS (7).
+#[cfg(test)]
 fn au_is_sync_point(au: &[u8]) -> bool {
     au_has_nal_type(au, &[5, 7])
 }
@@ -882,8 +1109,223 @@ fn packetize_zalo_au(au: &[u8], max_payload: usize) -> Vec<(u8, Vec<u8>)> {
         .collect()
 }
 
-/// Feed one video RTP payload to the decoder channel. Dispatch is by content (unambiguous: RFC 6184
-/// never starts with byte `0x00` and never uses FU type 0): Annex-B access unit, Zalo fragment, else RFC 6184.
+/// Resolve which remote SSRC should receive RTCP video feedback (`PLI` / `REMB` / `RR`).
+/// Never allows audio SSRC to clobber a known video SSRC.
+fn resolve_video_feedback_ssrc(peer_video_ssrc: u32, peer_audio_ssrc: u32) -> Option<u32> {
+    if peer_video_ssrc != 0 {
+        Some(peer_video_ssrc)
+    } else if peer_audio_ssrc != 0 {
+        Some(peer_audio_ssrc)
+    } else {
+        None
+    }
+}
+
+/// True when an incoming RTP packet carries video media rather than Opus audio, PCMU, RTCP, or FEC.
+fn is_incoming_video_rtp(pt: u8, outer_byte: u8, payload: &[u8]) -> bool {
+    if pt == 112 || pt == 0 || (200..=207).contains(&pt) {
+        return false;
+    }
+    if matches!(pt, 96 | 97 | VIDEO_PT_FRAG | 121 | 122) {
+        return true;
+    }
+    outer_byte == 0x0E && (is_annexb(payload) || is_zalo_frag(payload))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FragMode {
+    None,
+    Zalo,
+    FuA,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DepacketizeResult {
+    Ready(Vec<u8>),
+    Buffering,
+    DroppedCorrupt,
+    Ignored,
+}
+
+/// Stateful RTP H.264 depacketizer supporting Zalo Annex-B / `0x1C` fragments and RFC 6184
+/// Single NAL / STAP-A / FU-A with strict RTP `seq`/`ts` continuity validation.
+struct VideoDepacketizer {
+    buf: Vec<u8>,
+    mode: FragMode,
+    last_seq: Option<u16>,
+    frag_ts: Option<u32>,
+    corrupt_frags_dropped: u64,
+}
+
+impl Default for VideoDepacketizer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VideoDepacketizer {
+    fn new() -> Self {
+        Self {
+            buf: Vec::with_capacity(65536),
+            mode: FragMode::None,
+            last_seq: None,
+            frag_ts: None,
+            corrupt_frags_dropped: 0,
+        }
+    }
+
+    fn reset_frag(&mut self) {
+        self.buf.clear();
+        self.mode = FragMode::None;
+        self.last_seq = None;
+        self.frag_ts = None;
+    }
+
+    fn push(&mut self, seq: u16, ts: u32, payload: &[u8]) -> DepacketizeResult {
+        if payload.is_empty() {
+            return DepacketizeResult::Ignored;
+        }
+        if is_annexb(payload) {
+            self.reset_frag();
+            return DepacketizeResult::Ready(payload.to_vec());
+        }
+        if is_zalo_frag(payload) {
+            let flags = payload[1];
+            let start_bit = (flags & 0x80) != 0;
+            let end_bit = (flags & 0x40) != 0;
+            let body = &payload[2..];
+            if start_bit {
+                self.reset_frag();
+                self.buf.extend_from_slice(body);
+                if self.buf.len() > ZALO_FRAG_BUF_MAX {
+                    self.reset_frag();
+                    self.corrupt_frags_dropped += 1;
+                    return DepacketizeResult::DroppedCorrupt;
+                }
+                if end_bit {
+                    let done = std::mem::take(&mut self.buf);
+                    return if done.is_empty() {
+                        DepacketizeResult::Ignored
+                    } else {
+                        DepacketizeResult::Ready(done)
+                    };
+                }
+                self.mode = FragMode::Zalo;
+                self.last_seq = Some(seq);
+                self.frag_ts = Some(ts);
+                return DepacketizeResult::Buffering;
+            }
+            let seq_ok = self.last_seq == Some(seq.wrapping_sub(1));
+            let ts_ok = self.frag_ts == Some(ts);
+            if self.mode != FragMode::Zalo || !seq_ok || !ts_ok || self.buf.is_empty() {
+                self.reset_frag();
+                self.corrupt_frags_dropped += 1;
+                return DepacketizeResult::DroppedCorrupt;
+            }
+            self.buf.extend_from_slice(body);
+            if self.buf.len() > ZALO_FRAG_BUF_MAX {
+                self.reset_frag();
+                self.corrupt_frags_dropped += 1;
+                return DepacketizeResult::DroppedCorrupt;
+            }
+            self.last_seq = Some(seq);
+            if end_bit {
+                let done = std::mem::take(&mut self.buf);
+                self.reset_frag();
+                return if done.is_empty() {
+                    DepacketizeResult::Ignored
+                } else {
+                    DepacketizeResult::Ready(done)
+                };
+            }
+            return DepacketizeResult::Buffering;
+        }
+        self.push_rfc6184(seq, ts, payload)
+    }
+
+    fn push_rfc6184(&mut self, seq: u16, ts: u32, payload: &[u8]) -> DepacketizeResult {
+        let nal_type = payload[0] & 0x1F;
+        match nal_type {
+            1..=23 => {
+                self.reset_frag();
+                let mut annexb = Vec::with_capacity(4 + payload.len());
+                annexb.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+                annexb.extend_from_slice(payload);
+                DepacketizeResult::Ready(annexb)
+            }
+            24 => {
+                self.reset_frag();
+                let mut idx = 1usize;
+                let mut annexb = Vec::new();
+                while idx + 2 <= payload.len() {
+                    let sz = u16::from_be_bytes([payload[idx], payload[idx + 1]]) as usize;
+                    idx += 2;
+                    if sz > 0 && idx + sz <= payload.len() {
+                        annexb.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+                        annexb.extend_from_slice(&payload[idx..idx + sz]);
+                        idx += sz;
+                    } else {
+                        break;
+                    }
+                }
+                if annexb.is_empty() {
+                    DepacketizeResult::Ignored
+                } else {
+                    DepacketizeResult::Ready(annexb)
+                }
+            }
+            28 if payload.len() >= 2 => {
+                let fu_ind = payload[0];
+                let fu_hdr = payload[1];
+                let start_bit = (fu_hdr & 0x80) != 0;
+                let end_bit = (fu_hdr & 0x40) != 0;
+                let orig_nal_hdr = (fu_ind & 0xE0) | (fu_hdr & 0x1F);
+                if start_bit {
+                    self.reset_frag();
+                    self.buf
+                        .extend_from_slice(&[0x00, 0x00, 0x00, 0x01, orig_nal_hdr]);
+                    self.buf.extend_from_slice(&payload[2..]);
+                    if self.buf.len() > ZALO_FRAG_BUF_MAX {
+                        self.reset_frag();
+                        self.corrupt_frags_dropped += 1;
+                        return DepacketizeResult::DroppedCorrupt;
+                    }
+                    if end_bit {
+                        let done = std::mem::take(&mut self.buf);
+                        return DepacketizeResult::Ready(done);
+                    }
+                    self.mode = FragMode::FuA;
+                    self.last_seq = Some(seq);
+                    self.frag_ts = Some(ts);
+                    return DepacketizeResult::Buffering;
+                }
+                let seq_ok = self.last_seq == Some(seq.wrapping_sub(1));
+                let ts_ok = self.frag_ts == Some(ts);
+                if self.mode != FragMode::FuA || !seq_ok || !ts_ok || self.buf.is_empty() {
+                    self.reset_frag();
+                    self.corrupt_frags_dropped += 1;
+                    return DepacketizeResult::DroppedCorrupt;
+                }
+                self.buf.extend_from_slice(&payload[2..]);
+                if self.buf.len() > ZALO_FRAG_BUF_MAX {
+                    self.reset_frag();
+                    self.corrupt_frags_dropped += 1;
+                    return DepacketizeResult::DroppedCorrupt;
+                }
+                self.last_seq = Some(seq);
+                if end_bit {
+                    let done = std::mem::take(&mut self.buf);
+                    self.reset_frag();
+                    return DepacketizeResult::Ready(done);
+                }
+                DepacketizeResult::Buffering
+            }
+            _ => DepacketizeResult::Ignored,
+        }
+    }
+}
+
+#[cfg(test)]
 fn depacketize_h264(
     payload: &[u8],
     frag_buf: &mut Vec<u8>,
@@ -906,7 +1348,7 @@ fn depacketize_h264(
         } else if !frag_buf.is_empty() {
             frag_buf.extend_from_slice(body);
         } else {
-            return; // first fragment lost: drop the rest of this access unit
+            return;
         }
         if frag_buf.len() > ZALO_FRAG_BUF_MAX {
             frag_buf.clear();
@@ -1398,11 +1840,8 @@ fn strip_leading_aud(au: &[u8]) -> Vec<u8> {
     }
 }
 
-/// Normalize an H.264 Annex-B Access Unit so that:
-/// 1) Both 3-byte (`00 00 01`) and 4-byte (`00 00 00 01`) start codes are parsed.
-/// 2) AUD (`nal_type == 9`) and SEI (`nal_type == 6`) NAL units are stripped.
-/// 3) Every remaining NAL unit (`SPS=7`, `PPS=8`, `IDR=5`, `Slice=1`) is prefixed with a 4-byte `00 00 00 01` start code.
-fn normalize_annexb_au_4byte(au: &[u8]) -> Vec<u8> {
+/// Extract raw NAL slices from an Annex-B buffer (3- or 4-byte start codes), filtering SEI (6) & AUD (9).
+fn extract_annexb_nals(au: &[u8]) -> Vec<&[u8]> {
     let mut nal_ranges: Vec<(usize, usize)> = Vec::new();
     let mut i = 0usize;
     let mut cur_start: Option<usize> = None;
@@ -1431,23 +1870,137 @@ fn normalize_annexb_au_4byte(au: &[u8]) -> Vec<u8> {
             nal_ranges.push((s, au.len()));
         }
     }
-    if nal_ranges.is_empty() {
+    nal_ranges
+        .into_iter()
+        .filter_map(|(s, e)| {
+            let nal = &au[s..e];
+            if nal.is_empty() {
+                return None;
+            }
+            let nal_type = nal[0] & 0x1F;
+            if nal_type == 6 || nal_type == 9 {
+                None
+            } else {
+                Some(nal)
+            }
+        })
+        .collect()
+}
+
+/// Normalize an H.264 Annex-B Access Unit so that:
+/// 1) Both 3-byte (`00 00 01`) and 4-byte (`00 00 00 01`) start codes are parsed.
+/// 2) AUD (`nal_type == 9`) and SEI (`nal_type == 6`) NAL units are stripped.
+/// 3) Every remaining NAL unit (`SPS=7`, `PPS=8`, `IDR=5`, `Slice=1`) is prefixed with a 4-byte `00 00 00 01` start code.
+fn normalize_annexb_au_4byte(au: &[u8]) -> Vec<u8> {
+    let nals = extract_annexb_nals(au);
+    if nals.is_empty() {
         return au.to_vec();
     }
-    let mut out = Vec::with_capacity(au.len() + nal_ranges.len() * 2);
-    for (s, e) in nal_ranges {
-        let nal = &au[s..e];
-        if nal.is_empty() {
-            continue;
-        }
-        let nal_type = nal[0] & 0x1F;
-        if nal_type == 6 || nal_type == 9 {
-            continue;
-        }
+    let mut out = Vec::with_capacity(au.len() + nals.len() * 2);
+    for nal in nals {
         out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
         out.extend_from_slice(nal);
     }
     out
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PreparedAu {
+    ParamSetOnly,
+    MissingParamsForIdr,
+    DroppedPreSync,
+    Keyframe(Vec<u8>),
+    DeltaFrame(Vec<u8>),
+}
+
+/// Caches out-of-band SPS/PPS packets from mobile peers so standalone SPS/PPS never get separated
+/// from the following IDR by a premature `H264_AUD`, and bare IDRs automatically receive cached SPS/PPS.
+#[derive(Default)]
+struct H264AccessUnitPreparer {
+    cached_sps: Option<Vec<u8>>,
+    cached_pps: Option<Vec<u8>>,
+    synced: bool,
+}
+
+impl H264AccessUnitPreparer {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn reset_sync(&mut self) {
+        self.synced = false;
+    }
+
+    fn has_params(&self) -> bool {
+        self.cached_sps.is_some() && self.cached_pps.is_some()
+    }
+
+    fn prepare(&mut self, raw_au: &[u8]) -> PreparedAu {
+        let nals = extract_annexb_nals(raw_au);
+        if nals.is_empty() {
+            return PreparedAu::ParamSetOnly;
+        }
+        let mut has_sps = false;
+        let mut has_pps = false;
+        let mut has_idr = false;
+        let mut has_vcl = false;
+        for nal in &nals {
+            match nal[0] & 0x1F {
+                7 => {
+                    has_sps = true;
+                    self.cached_sps = Some(nal.to_vec());
+                }
+                8 => {
+                    has_pps = true;
+                    self.cached_pps = Some(nal.to_vec());
+                }
+                5 => {
+                    has_idr = true;
+                    has_vcl = true;
+                }
+                1..=4 => {
+                    has_vcl = true;
+                }
+                _ => {}
+            }
+        }
+        if !has_vcl {
+            return PreparedAu::ParamSetOnly;
+        }
+        if has_idr {
+            let sps_needed = (!has_sps).then_some(self.cached_sps.as_deref()).flatten();
+            let pps_needed = (!has_pps).then_some(self.cached_pps.as_deref()).flatten();
+            if (!has_sps && sps_needed.is_none()) || (!has_pps && pps_needed.is_none()) {
+                return PreparedAu::MissingParamsForIdr;
+            }
+            let mut out = Vec::with_capacity(raw_au.len() + 64);
+            if let Some(sps) = sps_needed {
+                out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+                out.extend_from_slice(sps);
+            }
+            if let Some(pps) = pps_needed {
+                out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+                out.extend_from_slice(pps);
+            }
+            for nal in nals {
+                out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+                out.extend_from_slice(nal);
+            }
+            out.extend_from_slice(H264_AUD);
+            self.synced = true;
+            return PreparedAu::Keyframe(out);
+        }
+        if !self.synced {
+            return PreparedAu::DroppedPreSync;
+        }
+        let mut out = Vec::with_capacity(raw_au.len() + 16);
+        for nal in nals {
+            out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+            out.extend_from_slice(nal);
+        }
+        out.extend_from_slice(H264_AUD);
+        PreparedAu::DeltaFrame(out)
+    }
 }
 
 static GROUP_SRTP_KEY: Mutex<Option<(String, bool)>> = Mutex::new(None);
@@ -1593,10 +2146,14 @@ fn run_local_preview_decoder(
         "-hide_banner",
         "-loglevel",
         "error",
+        "-fflags",
+        "nobuffer",
         "-flags",
         "low_delay",
+        "-threads",
+        "1",
         "-probesize",
-        "32",
+        "32768",
         "-analyzeduration",
         "0",
         "-f",
@@ -1746,10 +2303,642 @@ fn extract_rtp_opus_payload(rtp: &[u8]) -> Option<&[u8]> {
     }
 }
 
+#[inline]
+fn i16_to_f32(v: i16) -> f32 {
+    v as f32 / 32768.0
+}
+
+#[inline]
+fn u16_to_f32(v: u16) -> f32 {
+    (v as f32 - 32768.0) / 32768.0
+}
+
+#[inline]
+fn f32_to_i16(v: f32) -> i16 {
+    (v.clamp(-1.0, 1.0) * 32767.0).round() as i16
+}
+
+#[inline]
+fn f32_to_u16(v: f32) -> u16 {
+    ((v.clamp(-1.0, 1.0) * 32767.0).round() as i32 + 32768).clamp(0, 65535) as u16
+}
+
+/// Wait-free, zero-`unsafe` SPSC lock-free ring buffer for `f32` PCM samples.
+/// Producer updates `head` only; consumer updates `tail` only.
+struct AudioRingBuffer {
+    buf: Box<[AtomicU32]>,
+    mask: usize,
+    head: AtomicUsize,
+    tail: AtomicUsize,
+}
+
+impl AudioRingBuffer {
+    fn new(capacity_pow2: usize) -> Self {
+        let cap = capacity_pow2.max(64).next_power_of_two();
+        let buf: Vec<AtomicU32> = (0..cap).map(|_| AtomicU32::new(0)).collect();
+        Self {
+            buf: buf.into_boxed_slice(),
+            mask: cap - 1,
+            head: AtomicUsize::new(0),
+            tail: AtomicUsize::new(0),
+        }
+    }
+
+    #[cfg(test)]
+    fn capacity(&self) -> usize {
+        self.buf.len()
+    }
+
+    fn len(&self) -> usize {
+        let h = self.head.load(Ordering::Acquire);
+        let t = self.tail.load(Ordering::Acquire);
+        h.wrapping_sub(t)
+    }
+
+    fn push(&self, sample: f32) -> bool {
+        let h = self.head.load(Ordering::Relaxed);
+        let t = self.tail.load(Ordering::Acquire);
+        if h.wrapping_sub(t) >= self.buf.len() {
+            return false;
+        }
+        self.buf[h & self.mask].store(sample.to_bits(), Ordering::Relaxed);
+        self.head.store(h.wrapping_add(1), Ordering::Release);
+        true
+    }
+
+    fn pop(&self) -> Option<f32> {
+        let t = self.tail.load(Ordering::Relaxed);
+        let h = self.head.load(Ordering::Acquire);
+        if t == h {
+            return None;
+        }
+        let bits = self.buf[t & self.mask].load(Ordering::Relaxed);
+        self.tail.store(t.wrapping_add(1), Ordering::Release);
+        Some(f32::from_bits(bits))
+    }
+
+    /// Consumer-only: discard up to `n` oldest buffered samples to bound latency.
+    fn discard(&self, n: usize) {
+        let t = self.tail.load(Ordering::Relaxed);
+        let h = self.head.load(Ordering::Acquire);
+        let avail = h.wrapping_sub(t);
+        let drop_n = n.min(avail);
+        if drop_n > 0 {
+            self.tail.store(t.wrapping_add(drop_n), Ordering::Release);
+        }
+    }
+}
+
+/// 2nd-order Butterworth low-pass biquad (Direct Form II Transposed) for anti-aliasing / anti-imaging.
+struct BiquadLpf {
+    b0: f64,
+    b1: f64,
+    b2: f64,
+    a1: f64,
+    a2: f64,
+    z1: f64,
+    z2: f64,
+}
+
+impl BiquadLpf {
+    fn new(cutoff_hz: f64, sample_rate: f64) -> Self {
+        let fs = sample_rate.max(1000.0);
+        let fc = cutoff_hz.clamp(100.0, fs * 0.48);
+        let omega = 2.0 * std::f64::consts::PI * fc / fs;
+        let sin_w = omega.sin();
+        let cos_w = omega.cos();
+        let q = std::f64::consts::FRAC_1_SQRT_2;
+        let alpha = sin_w / (2.0 * q);
+        let a0 = 1.0 + alpha;
+        let b0 = ((1.0 - cos_w) * 0.5) / a0;
+        let b1 = (1.0 - cos_w) / a0;
+        let b2 = b0;
+        let a1 = (-2.0 * cos_w) / a0;
+        let a2 = (1.0 - alpha) / a0;
+        Self {
+            b0,
+            b1,
+            b2,
+            a1,
+            a2,
+            z1: 0.0,
+            z2: 0.0,
+        }
+    }
+
+    #[inline]
+    fn process(&mut self, x: f32) -> f32 {
+        let xd = x as f64;
+        let y = self.b0 * xd + self.z1;
+        self.z1 = self.b1 * xd - self.a1 * y + self.z2;
+        self.z2 = self.b2 * xd - self.a2 * y;
+        y as f32
+    }
+}
+
+#[inline]
+fn hermite4(y0: f32, y1: f32, y2: f32, y3: f32, t: f32) -> f32 {
+    let c0 = y1;
+    let c1 = 0.5 * (y2 - y0);
+    let c2 = y0 - 2.5 * y1 + 2.0 * y2 - 0.5 * y3;
+    let c3 = 0.5 * (y3 - y0) + 1.5 * (y1 - y2);
+    ((c3 * t + c2) * t + c1) * t + c0
+}
+
+/// Phase-continuous, anti-aliased mono audio resampler supporting arbitrary sample rates
+/// (including 8 kHz Bluetooth HFP, 16 kHz, 44.1 kHz, and 48 kHz) without over-drain or drift.
+struct AudioResampler {
+    in_rate: u32,
+    out_rate: u32,
+    step: f64,
+    pos: f64,
+    history: VecDeque<f32>,
+    lpf: Option<BiquadLpf>,
+    underrun_last: f32,
+}
+
+impl AudioResampler {
+    fn new(in_rate: u32, out_rate: u32) -> Self {
+        let ir = in_rate.max(8000);
+        let or = out_rate.max(8000);
+        let lpf = if ir == or {
+            None
+        } else {
+            let max_rate = ir.max(or) as f64;
+            let min_rate = ir.min(or) as f64;
+            Some(BiquadLpf::new(0.45 * min_rate, max_rate))
+        };
+        let mut history = VecDeque::with_capacity(512);
+        history.push_back(0.0); // lookbehind y0 for index 1
+        Self {
+            in_rate: ir,
+            out_rate: or,
+            step: ir as f64 / or as f64,
+            pos: 1.0,
+            history,
+            lpf,
+            underrun_last: 0.0,
+        }
+    }
+
+    fn process_capture(&mut self, mono_in: &[f32], mut emit: impl FnMut(f32)) {
+        if self.in_rate == self.out_rate {
+            for &s in mono_in {
+                emit(s);
+            }
+            return;
+        }
+        if self.in_rate > self.out_rate {
+            if let Some(ref mut lpf) = self.lpf {
+                for &s in mono_in {
+                    self.history.push_back(lpf.process(s));
+                }
+            }
+        } else {
+            self.history.extend(mono_in.iter().copied());
+        }
+        while self.pos + 2.0 < self.history.len() as f64 {
+            let i = self.pos.floor() as usize;
+            let t = (self.pos - i as f64) as f32;
+            let mut s = hermite4(
+                self.history[i - 1],
+                self.history[i],
+                self.history[i + 1],
+                self.history[i + 2],
+                t,
+            );
+            if self.in_rate < self.out_rate {
+                if let Some(ref mut lpf) = self.lpf {
+                    s = lpf.process(s);
+                }
+            }
+            emit(s);
+            self.pos += self.step;
+        }
+        let drop_n = (self.pos.floor() as usize)
+            .saturating_sub(1)
+            .min(self.history.len().saturating_sub(1));
+        if drop_n > 0 {
+            self.history.drain(..drop_n);
+            self.pos -= drop_n as f64;
+        }
+    }
+
+    fn fill_playback(&mut self, src: &AudioRingBuffer, out_mono: &mut [f32]) {
+        if src.len() > AUDIO_MAX_OUTPUT_RING_SAMPLES {
+            src.discard(src.len() - AUDIO_MAX_OUTPUT_RING_SAMPLES);
+        }
+        if self.in_rate == self.out_rate {
+            for dst in out_mono.iter_mut() {
+                if let Some(s) = src.pop() {
+                    self.underrun_last = s;
+                    *dst = s;
+                } else {
+                    self.underrun_last *= 0.92;
+                    if self.underrun_last.abs() < 1e-5 {
+                        self.underrun_last = 0.0;
+                    }
+                    *dst = self.underrun_last;
+                }
+            }
+            return;
+        }
+        let needed_len = (self.pos + out_mono.len() as f64 * self.step).ceil() as usize + 3;
+        while self.history.len() < needed_len {
+            let Some(raw) = src.pop() else {
+                break;
+            };
+            let pushed = if self.in_rate > self.out_rate {
+                self.lpf.as_mut().map_or(raw, |f| f.process(raw))
+            } else {
+                raw
+            };
+            self.history.push_back(pushed);
+        }
+        for dst in out_mono.iter_mut() {
+            if self.pos + 2.0 < self.history.len() as f64 {
+                let i = self.pos.floor() as usize;
+                let t = (self.pos - i as f64) as f32;
+                let mut s = hermite4(
+                    self.history[i - 1],
+                    self.history[i],
+                    self.history[i + 1],
+                    self.history[i + 2],
+                    t,
+                );
+                if self.in_rate < self.out_rate {
+                    if let Some(ref mut lpf) = self.lpf {
+                        s = lpf.process(s);
+                    }
+                }
+                self.underrun_last = s;
+                *dst = s;
+                self.pos += self.step;
+            } else {
+                self.underrun_last *= 0.92;
+                if self.underrun_last.abs() < 1e-5 {
+                    self.underrun_last = 0.0;
+                }
+                *dst = self.underrun_last;
+            }
+        }
+        let drop_n = (self.pos.floor() as usize)
+            .saturating_sub(1)
+            .min(self.history.len().saturating_sub(1));
+        if drop_n > 0 {
+            self.history.drain(..drop_n);
+            self.pos -= drop_n as f64;
+        }
+    }
+}
+
+/// 1st-order 80 Hz high-pass filter removing DC offset, wind rumble, and desk vibration.
+struct HighPassFilter80Hz {
+    alpha: f32,
+    prev_x: f32,
+    prev_y: f32,
+}
+
+impl HighPassFilter80Hz {
+    fn new(sample_rate: u32) -> Self {
+        let dt = 1.0 / sample_rate.max(1000) as f32;
+        let rc = 1.0 / (2.0 * std::f32::consts::PI * 80.0);
+        Self {
+            alpha: rc / (rc + dt),
+            prev_x: 0.0,
+            prev_y: 0.0,
+        }
+    }
+
+    #[inline]
+    fn process(&mut self, x: f32) -> f32 {
+        let y = self.alpha * (self.prev_y + x - self.prev_x);
+        self.prev_x = x;
+        self.prev_y = y;
+        y
+    }
+}
+
+/// Smooth soft-knee limiter avoiding harsh digital clipping past `±0.85`.
+#[inline]
+fn soft_limit(x: f32) -> f32 {
+    let abs = x.abs();
+    if abs <= 0.85 {
+        x
+    } else {
+        x.signum() * (0.85 + 0.13 * ((abs - 0.85) / 0.13).tanh())
+    }
+}
+
+/// Configure Opus VoIP encoder defaults (32 kbps VBR, Voice signal, complexity 8, in-band FEC + 10% loss).
+fn configure_voip_opus_encoder(encoder: &mut Encoder) {
+    let _ = encoder.set_bitrate(opus::Bitrate::Bits(32_000));
+    let _ = encoder.set_vbr(true);
+    let _ = encoder.set_vbr_constraint(true);
+    let _ = encoder.set_complexity(8);
+    let _ = encoder.set_signal(opus::Signal::Voice);
+    let _ = encoder.set_inband_fec(true);
+    let _ = encoder.set_packet_loss_perc(10);
+    let _ = encoder.set_dtx(false);
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum JitterPop {
+    Buffering,
+    Packet(Vec<u8>),
+    FecFromNext(Vec<u8>),
+    Plc,
+    Silence,
+}
+
+/// Adaptive ordered Opus jitter buffer (40–80 ms adaptive target, 200 ms max cap) with FEC & PLC.
+struct AudioJitterBuffer {
+    packets: BTreeMap<i64, Vec<u8>>,
+    highest_unwrapped: i64,
+    next_play_seq: i64,
+    has_seen_packet: bool,
+    primed: bool,
+    target_packets: usize,
+    max_packets: usize,
+    consecutive_plc: usize,
+    clean_streak: u32,
+    rx_pushed: u64,
+    played_normal: u64,
+    fec_recovered: u64,
+    plc_concealed: u64,
+    late_dropped: u64,
+    overflow_dropped: u64,
+    reordered: u64,
+}
+
+impl Default for AudioJitterBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AudioJitterBuffer {
+    fn new() -> Self {
+        Self {
+            packets: BTreeMap::new(),
+            highest_unwrapped: 0,
+            next_play_seq: 0,
+            has_seen_packet: false,
+            primed: false,
+            target_packets: 3, // 60 ms initial target (adapts between 40..=80 ms)
+            max_packets: 10,   // 200 ms hard latency cap
+            consecutive_plc: 0,
+            clean_streak: 0,
+            rx_pushed: 0,
+            played_normal: 0,
+            fec_recovered: 0,
+            plc_concealed: 0,
+            late_dropped: 0,
+            overflow_dropped: 0,
+            reordered: 0,
+        }
+    }
+
+    fn push(&mut self, seq: u16, payload: Vec<u8>) {
+        self.rx_pushed += 1;
+        if !self.has_seen_packet {
+            self.has_seen_packet = true;
+            let s = seq as i64;
+            self.highest_unwrapped = s;
+            self.next_play_seq = s;
+            self.packets.insert(s, payload);
+            return;
+        }
+        let ref_seq = (self.highest_unwrapped & 0xFFFF) as u16;
+        let delta = seq.wrapping_sub(ref_seq) as i16 as i64;
+        let unwrapped = self.highest_unwrapped + delta;
+        if unwrapped - self.highest_unwrapped > 250 || self.highest_unwrapped - unwrapped > 250 {
+            // Stream reset / SSRC jump
+            self.packets.clear();
+            self.highest_unwrapped = unwrapped;
+            self.next_play_seq = unwrapped;
+            self.primed = false;
+            self.consecutive_plc = 0;
+            self.packets.insert(unwrapped, payload);
+            return;
+        }
+        if self.primed && unwrapped < self.next_play_seq {
+            self.late_dropped += 1;
+            self.clean_streak = 0;
+            if self.target_packets < 4 {
+                self.target_packets += 1;
+            }
+            return;
+        }
+        if unwrapped < self.highest_unwrapped {
+            self.reordered += 1;
+        } else {
+            self.highest_unwrapped = unwrapped;
+        }
+        self.packets.insert(unwrapped, payload);
+        while self.packets.len() > self.max_packets {
+            if let Some((dropped_seq, _)) = self.packets.pop_first() {
+                self.overflow_dropped += 1;
+                if self.next_play_seq <= dropped_seq {
+                    if let Some(&first_rem) = self.packets.keys().next() {
+                        self.next_play_seq = first_rem;
+                    }
+                }
+            }
+        }
+    }
+
+    fn pop_next(&mut self) -> JitterPop {
+        if !self.primed {
+            if self.packets.len() < self.target_packets {
+                return JitterPop::Buffering;
+            }
+            self.primed = true;
+            if let Some(&first_seq) = self.packets.keys().next() {
+                self.next_play_seq = first_seq;
+            }
+        }
+        if let Some(pkt) = self.packets.remove(&self.next_play_seq) {
+            self.next_play_seq += 1;
+            self.consecutive_plc = 0;
+            self.played_normal += 1;
+            self.clean_streak += 1;
+            if self.clean_streak >= 150 && self.target_packets > 2 {
+                self.target_packets -= 1;
+                self.clean_streak = 0;
+            }
+            return JitterPop::Packet(pkt);
+        }
+        if self.packets.is_empty() && self.consecutive_plc >= 5 {
+            self.primed = false;
+            return JitterPop::Silence;
+        }
+        if let Some(next_pkt) = self.packets.get(&(self.next_play_seq + 1)).cloned() {
+            self.next_play_seq += 1;
+            self.consecutive_plc += 1;
+            self.fec_recovered += 1;
+            self.clean_streak = 0;
+            if self.target_packets < 4 {
+                self.target_packets += 1;
+            }
+            JitterPop::FecFromNext(next_pkt)
+        } else {
+            self.next_play_seq += 1;
+            self.consecutive_plc += 1;
+            self.plc_concealed += 1;
+            self.clean_streak = 0;
+            if self.target_packets < 4 {
+                self.target_packets += 1;
+            }
+            JitterPop::Plc
+        }
+    }
+}
+
+fn build_typed_call_input_stream<T: cpal::SizedSample + Send + 'static>(
+    input_dev: &cpal::Device,
+    cfg: &cpal::StreamConfig,
+    in_rate: u32,
+    in_channels: usize,
+    ring: Arc<AudioRingBuffer>,
+    err_flag: Arc<AtomicBool>,
+    to_f32: fn(T) -> f32,
+) -> Result<cpal::Stream, String> {
+    let mut resampler = AudioResampler::new(in_rate, SAMPLE_RATE);
+    let mut mono_scratch = Vec::<f32>::with_capacity(2048);
+    let stream = input_dev
+        .build_input_stream(
+            cfg,
+            move |data: &[T], _| {
+                let total_frames = data.len() / in_channels;
+                if total_frames == 0 {
+                    return;
+                }
+                mono_scratch.clear();
+                mono_scratch.reserve(total_frames);
+                for f in 0..total_frames {
+                    let mut sum = 0.0_f32;
+                    for ch in 0..in_channels {
+                        sum += to_f32(data[f * in_channels + ch]);
+                    }
+                    mono_scratch.push(sum / in_channels as f32);
+                }
+                resampler.process_capture(&mono_scratch, |s| {
+                    let _ = ring.push(s);
+                });
+            },
+            move |e| {
+                err_flag.store(true, Ordering::Relaxed);
+                eprintln!("input stream err {e}");
+            },
+            None,
+        )
+        .map_err(|e| format!("build input stream: {e}"))?;
+    stream
+        .play()
+        .map_err(|e| format!("play input stream: {e}"))?;
+    Ok(stream)
+}
+
+fn build_call_input_stream(
+    input_dev: &cpal::Device,
+    ring: Arc<AudioRingBuffer>,
+    err_flag: Arc<AtomicBool>,
+) -> Result<(cpal::Stream, u32, usize, cpal::SampleFormat), String> {
+    let in_cfg = input_dev
+        .default_input_config()
+        .map_err(|e| format!("default_input_config: {e}"))?;
+    let in_rate = in_cfg.sample_rate().0.max(8000);
+    let in_channels = (in_cfg.channels() as usize).max(1);
+    let fmt = in_cfg.sample_format();
+    let cfg: cpal::StreamConfig = in_cfg.into();
+    let stream = match fmt {
+        cpal::SampleFormat::F32 => {
+            build_typed_call_input_stream::<f32>(input_dev, &cfg, in_rate, in_channels, ring, err_flag, |v| v)?
+        }
+        cpal::SampleFormat::I16 => {
+            build_typed_call_input_stream::<i16>(input_dev, &cfg, in_rate, in_channels, ring, err_flag, i16_to_f32)?
+        }
+        cpal::SampleFormat::U16 => {
+            build_typed_call_input_stream::<u16>(input_dev, &cfg, in_rate, in_channels, ring, err_flag, u16_to_f32)?
+        }
+        other => return Err(format!("unsupported input sample format: {other:?}")),
+    };
+    Ok((stream, in_rate, in_channels, fmt))
+}
+
+fn build_typed_call_output_stream<T: cpal::SizedSample + Send + 'static>(
+    output_dev: &cpal::Device,
+    cfg: &cpal::StreamConfig,
+    out_rate: u32,
+    out_channels: usize,
+    ring: Arc<AudioRingBuffer>,
+    err_flag: Arc<AtomicBool>,
+    from_f32: fn(f32) -> T,
+) -> Result<cpal::Stream, String> {
+    let mut resampler = AudioResampler::new(SAMPLE_RATE, out_rate);
+    let mut mono_scratch = Vec::<f32>::with_capacity(2048);
+    let stream = output_dev
+        .build_output_stream(
+            cfg,
+            move |data: &mut [T], _| {
+                let out_frames = data.len() / out_channels;
+                if out_frames == 0 {
+                    return;
+                }
+                mono_scratch.resize(out_frames, 0.0);
+                resampler.fill_playback(&ring, &mut mono_scratch);
+                for (i, &s) in mono_scratch.iter().enumerate() {
+                    let val = from_f32(soft_limit(s));
+                    for ch in 0..out_channels {
+                        data[i * out_channels + ch] = val;
+                    }
+                }
+            },
+            move |e| {
+                err_flag.store(true, Ordering::Relaxed);
+                eprintln!("output stream err {e}");
+            },
+            None,
+        )
+        .map_err(|e| format!("build output stream: {e}"))?;
+    stream
+        .play()
+        .map_err(|e| format!("play output stream: {e}"))?;
+    Ok(stream)
+}
+
+fn build_call_output_stream(
+    output_dev: &cpal::Device,
+    ring: Arc<AudioRingBuffer>,
+    err_flag: Arc<AtomicBool>,
+) -> Result<(cpal::Stream, u32, usize, cpal::SampleFormat), String> {
+    let out_cfg = output_dev
+        .default_output_config()
+        .map_err(|e| format!("default_output_config: {e}"))?;
+    let out_rate = out_cfg.sample_rate().0.max(8000);
+    let out_channels = (out_cfg.channels() as usize).max(1);
+    let fmt = out_cfg.sample_format();
+    let cfg: cpal::StreamConfig = out_cfg.into();
+    let stream = match fmt {
+        cpal::SampleFormat::F32 => {
+            build_typed_call_output_stream::<f32>(output_dev, &cfg, out_rate, out_channels, ring, err_flag, |v| v)?
+        }
+        cpal::SampleFormat::I16 => {
+            build_typed_call_output_stream::<i16>(output_dev, &cfg, out_rate, out_channels, ring, err_flag, f32_to_i16)?
+        }
+        cpal::SampleFormat::U16 => {
+            build_typed_call_output_stream::<u16>(output_dev, &cfg, out_rate, out_channels, ring, err_flag, f32_to_u16)?
+        }
+        other => return Err(format!("unsupported output sample format: {other:?}")),
+    };
+    Ok((stream, out_rate, out_channels, fmt))
+}
+
 struct ExtraVideoStream {
     ssrc: u32,
     tex_key: String,
-    fu_a_buf: Vec<u8>,
+    depacketizer: VideoDepacketizer,
     tx: std::sync::mpsc::SyncSender<Vec<u8>>,
     last_rx: Option<std::time::Instant>,
     _handle: JoinHandle<()>,
@@ -1808,139 +2997,80 @@ fn run_media_loop(
     } else {
         None
     };
-    let mut fu_a_buf: Vec<u8> = Vec::with_capacity(65536);
-    let host = cpal::default_host();
-    let preferred_mic = selected_mic_device();
-    let input_dev = host
-        .input_devices()
-        .ok()
-        .and_then(|mut ds| {
-            if preferred_mic.is_empty() {
-                None
-            } else {
-                ds.find(|d| d.name().map(|n| n.trim() == preferred_mic).unwrap_or(false))
+    let mut primary_depacketizer = VideoDepacketizer::new();
+    let (_output_name, out_dev) = match resolve_output_device() {
+        Ok((d, name)) => (name, d),
+        Err(e) => {
+            eprintln!("media: no output device ({e})");
+            return;
+        }
+    };
+    let output_ring = Arc::new(AudioRingBuffer::new(AUDIO_RING_CAPACITY));
+    let out_err_flag = Arc::new(AtomicBool::new(false));
+    let (output_stream, out_rate, out_channels, out_fmt) =
+        match build_call_output_stream(&out_dev, output_ring.clone(), out_err_flag.clone()) {
+            Ok(res) => res,
+            Err(e) => {
+                eprintln!("media: output stream err {e}");
+                return;
             }
-        })
-        .or_else(|| host.default_input_device());
-    let input_dev = match input_dev {
-        Some(d) => d,
-        None => {
-            eprintln!("media: no input device");
-            return;
-        }
-    };
-    let output_dev = match host.default_output_device() {
-        Some(d) => d,
-        None => {
-            eprintln!("media: no output device");
-            return;
-        }
-    };
+        };
 
-    let in_cfg = match input_dev.default_input_config() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("media: input config err {e}");
-            return;
-        }
-    };
-    let out_cfg = match output_dev.default_output_config() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("media: output config err {e}");
-            return;
-        }
-    };
-    let in_rate = in_cfg.sample_rate().0.max(8000);
-    let in_channels = (in_cfg.channels() as usize).max(1);
-    let out_rate = out_cfg.sample_rate().0.max(8000);
-    let out_channels = (out_cfg.channels() as usize).max(1);
-
-    // Shared 16kHz mono buffers
-    let input_buf: Arc<Mutex<Vec<f32>>> =
-        Arc::new(Mutex::new(Vec::with_capacity(FRAME_SAMPLES * 8)));
-    let output_buf: Arc<Mutex<Vec<f32>>> =
-        Arc::new(Mutex::new(Vec::with_capacity(FRAME_SAMPLES * 8)));
-    let ib = input_buf.clone();
-
-    // Input stream: downmix stereo -> mono and downsample `in_rate` -> 16000 Hz
-    let input_stream = match input_dev.build_input_stream(
-        &in_cfg.into(),
-        move |data: &[f32], _| {
-            if let Ok(mut b) = ib.lock() {
-                let total_frames = data.len() / in_channels;
-                let step = (in_rate as f32 / SAMPLE_RATE as f32).max(1.0);
-                let out_frames = (total_frames as f32 / step) as usize;
-                for i in 0..out_frames {
-                    let src_idx = ((i as f32 * step) as usize).min(total_frames.saturating_sub(1));
-                    let mut sum = 0.0_f32;
-                    for ch in 0..in_channels {
-                        sum += data[src_idx * in_channels + ch];
-                    }
-                    b.push(sum / in_channels as f32);
-                }
-                if b.len() > FRAME_SAMPLES * 25 {
-                    let drop_n = b.len() - FRAME_SAMPLES * 25;
-                    b.drain(0..drop_n);
-                }
+    let mut last_mic_epoch = MIC_SELECTION_EPOCH.load(Ordering::Acquire);
+    let mut input_ring = Arc::new(AudioRingBuffer::new(AUDIO_RING_CAPACITY));
+    let mic_err_flag = Arc::new(AtomicBool::new(false));
+    let mut active_mic_name = String::new();
+    let mut active_mic_stream: Option<cpal::Stream> = None;
+    let open_mic_stream = |desired: &str,
+                           ring: Arc<AudioRingBuffer>,
+                           err_flag: Arc<AtomicBool>|
+     -> Result<(cpal::Stream, String, u32, usize, cpal::SampleFormat), String> {
+        let primary = resolve_input_device(desired);
+        let (dev, actual_name) = match primary {
+            Ok(pair) => pair,
+            Err(first_err) if !desired.trim().is_empty() => {
+                resolve_input_device("").map_err(|e| format!("{first_err}; fallback: {e}"))?
             }
-        },
-        |e| eprintln!("input stream err {e}"),
-        None,
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("media: build input err {e}");
-            return;
+            Err(e) => return Err(e),
+        };
+        match build_call_input_stream(&dev, ring.clone(), err_flag.clone()) {
+            Ok((stream, rate, ch, fmt)) => Ok((stream, actual_name, rate, ch, fmt)),
+            Err(first_err) if !desired.trim().is_empty() => {
+                let (fb_dev, fb_name) = resolve_input_device("")
+                    .map_err(|e| format!("{first_err}; fallback_resolve: {e}"))?;
+                let (stream, rate, ch, fmt) = build_call_input_stream(&fb_dev, ring, err_flag)?;
+                Ok((stream, fb_name, rate, ch, fmt))
+            }
+            Err(e) => Err(e),
         }
     };
-    if let Err(e) = input_stream.play() {
-        eprintln!("media: play input err {e}");
+
+    let initial_pref_mic = selected_mic_device();
+    match open_mic_stream(&initial_pref_mic, input_ring.clone(), mic_err_flag.clone()) {
+        Ok((stream, actual_name, rate, ch, fmt)) => {
+            active_mic_name = actual_name.clone();
+            active_mic_stream = Some(stream);
+            crate::logger::log_voip_event(
+                "audio::mic_switch",
+                &format!("reason=init from=<none> to={actual_name} rate={rate} ch={ch} fmt={fmt:?}"),
+                false,
+            );
+            crate::voip_log::line(
+                "AUDIO",
+                format!(
+                    "init mic={actual_name} ({rate}Hz/{ch}ch/{fmt:?}) out={_output_name} ({out_rate}Hz/{out_channels}ch/{out_fmt:?})"
+                ),
+            );
+        }
+        Err(e) => {
+            crate::logger::log_voip_event(
+                "audio::mic_switch",
+                &format!("reason=init_failed pref={} err={e}", if initial_pref_mic.is_empty() { "<default>" } else { &initial_pref_mic }),
+                true,
+            );
+        }
     }
-
-    // Output stream: upsample 16000 Hz mono -> `out_rate` and duplicate across `out_channels`
-    let ob2 = output_buf.clone();
-    let output_stream = match output_dev.build_output_stream(
-        &out_cfg.into(),
-        move |data: &mut [f32], _| {
-            if let Ok(mut b) = ob2.lock() {
-                let out_frames = data.len() / out_channels;
-                let step = SAMPLE_RATE as f32 / out_rate as f32;
-                let mut consumed = 0usize;
-                for i in 0..out_frames {
-                    let src_idx = (i as f32 * step) as usize;
-                    let sample = if src_idx < b.len() {
-                        consumed = consumed.max(src_idx + 1);
-                        b[src_idx]
-                    } else {
-                        0.0
-                    };
-                    for ch in 0..out_channels {
-                        data[i * out_channels + ch] = sample;
-                    }
-                }
-                if consumed > 0 {
-                    let drain_n = consumed.min(b.len());
-                    b.drain(0..drain_n);
-                }
-            } else {
-                for s in data.iter_mut() {
-                    *s = 0.0;
-                }
-            }
-        },
-        |e| eprintln!("output stream err {e}"),
-        None,
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("media: build output err {e}");
-            return;
-        }
-    };
-    if let Err(e) = output_stream.play() {
-        eprintln!("media: play output err {e}");
-    }
+    let mut last_mic_attempt = Instant::now();
 
     // Opus codecs
     let mut encoder = match Encoder::new(SAMPLE_RATE, OpusChannels::Mono, opus::Application::Voip) {
@@ -1950,6 +3080,7 @@ fn run_media_loop(
             return;
         }
     };
+    configure_voip_opus_encoder(&mut encoder);
     let mut decoder = match Decoder::new(SAMPLE_RATE, OpusChannels::Mono) {
         Ok(d) => d,
         Err(e) => {
@@ -1957,6 +3088,10 @@ fn run_media_loop(
             return;
         }
     };
+    let mut tx_hpf = HighPassFilter80Hz::new(SAMPLE_RATE);
+    let mut jitter_buf = AudioJitterBuffer::new();
+    let mut next_rx_playout = Instant::now();
+    let mut last_audio_stats_log = Instant::now();
 
     let mut seq: u16 = 0;
     let mut ts: u32 = 0;
@@ -1967,34 +3102,34 @@ fn run_media_loop(
     };
     let rtp_sock_addr = rtp_addr.parse::<std::net::SocketAddr>().ok();
     let rtcp_sock_addr = rtcp_addr.parse::<std::net::SocketAddr>().ok();
-    let mut last_rtcp = std::time::Instant::now() - Duration::from_secs(2);
-    let mut last_rtp_tx = std::time::Instant::now();
-    let mut last_video_tx = std::time::Instant::now();
+    let mut last_rtcp = Instant::now() - Duration::from_secs(2);
+    let mut last_rtp_tx = Instant::now();
+    let mut last_video_tx = Instant::now();
     let mut vid_seq: u16 = 0;
     let mut vid_ts: u32 = 0;
     let mut vid_frame_no: u32 = 0;
     let mut vid_gop_pos: usize = 0;
     let mut vid_idr_parity: u8 = 0;
     clear_rtcp_inbox();
-    // Reception stats for the peer's audio/video streams (they share one SSRC but have separate seq spaces),
-    // and the last Sender Report seen (for LSR/DLSR in our report blocks).
+    // Reception stats for the peer's audio/video streams (tracked separately so audio packets never clobber video SSRC).
     let mut rx_audio = RxStats::default();
     let mut rx_video = RxStats::default();
-    let mut peer_ssrc: u32 = 0;
-    let mut last_peer_sr: Option<(u32, std::time::Instant)> = None;
+    let mut peer_audio_ssrc: u32 = 0;
+    let mut peer_video_ssrc: u32 = 0;
+    let mut last_peer_sr: Option<(u32, Instant)> = None;
     let mut vid_pkts_tx: u32 = 0;
     let mut vid_octets_tx: u32 = 0;
     let mut wl = crate::voip_log::WireLog::new();
     // Send outcome counters + longest main-loop stall, reported as `TXST` every 5 s.
     let mut txs = TxStats::default();
-    let mut last_txst = std::time::Instant::now();
-    let mut last_iter = std::time::Instant::now();
+    let mut last_txst = Instant::now();
+    let mut last_iter = Instant::now();
     let mut max_loop_gap = Duration::ZERO;
     // Peer video that cannot be decoded yet (no SPS/IDR seen) or has a hole -> we ask for a keyframe (PLI).
     // `video_synced` is set by the decoder feeder when the first SPS/IDR access unit arrives.
     let mut pli_gap = false;
     let mut pli_sent: u32 = 0;
-    let mut last_pli = std::time::Instant::now() - Duration::from_secs(10);
+    let mut last_pli = Instant::now() - Duration::from_secs(10);
     crate::voip_log::line(
         "CALL",
         format!(
@@ -2008,13 +3143,12 @@ fn run_media_loop(
         .ok()
         .and_then(|g| g.clone())
         .and_then(|(k, no_seq)| SrtpContext::from_ascii_key(&k, no_seq));
-    let mut recent_vid_seqs: std::collections::VecDeque<(u32, u16)> =
-        std::collections::VecDeque::with_capacity(64);
+    let mut recent_vid_seqs: VecDeque<(u32, u16)> = VecDeque::with_capacity(64);
     let mut nego_seq: u32 = 1;
     let mut last_cam_idr: Option<Vec<u8>> = None;
     let mut last_shared_cam_seq: u64 = 0;
     let mut primary_video_ssrc: u32 = 0;
-    let mut last_primary_vid_rx: Option<std::time::Instant> = None;
+    let mut last_primary_vid_rx: Option<Instant> = None;
     let mut extra_vid_streams: Vec<ExtraVideoStream> = Vec::new();
     let mut room_partners: Vec<u32> = Vec::new();
     let mut tx_layer_byte: u8 = 0x00;
@@ -2023,32 +3157,111 @@ fn run_media_loop(
     }
 
     while !stop.load(Ordering::Relaxed) {
-        // --- Capture: take 320 samples (or emit comfort-noise every 20ms so peer never sees 0kbps) ---
-        let mut frame: Vec<f32> = {
-            let mut b = input_buf.lock().unwrap_or_else(|e| e.into_inner());
-            if b.len() >= FRAME_SAMPLES {
-                b.drain(0..FRAME_SAMPLES).collect()
-            } else {
-                Vec::new()
-            }
+        // --- Live Mic Switching & Hot-Plug Recovery ---
+        let cur_mic_epoch = MIC_SELECTION_EPOCH.load(Ordering::Acquire);
+        let mic_switch_reason = if cur_mic_epoch != last_mic_epoch {
+            last_mic_epoch = cur_mic_epoch;
+            Some("user_switch")
+        } else if mic_err_flag.swap(false, Ordering::AcqRel)
+            && last_mic_attempt.elapsed() >= Duration::from_millis(500)
+        {
+            Some("stream_error_recover")
+        } else if active_mic_stream.is_none()
+            && last_mic_attempt.elapsed() >= Duration::from_secs(2)
+        {
+            Some("retry")
+        } else {
+            None
         };
-        if frame.is_empty() && last_rtp_tx.elapsed() >= Duration::from_millis(20) {
-            frame = vec![0.0_f32; FRAME_SAMPLES];
+        if let Some(reason) = mic_switch_reason {
+            last_mic_attempt = Instant::now();
+            let prev_name = if active_mic_name.is_empty() {
+                "<none>".to_string()
+            } else {
+                active_mic_name.clone()
+            };
+            if let Some(old_stream) = active_mic_stream.take() {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    drop(old_stream)
+                }));
+            }
+            input_ring = Arc::new(AudioRingBuffer::new(AUDIO_RING_CAPACITY));
+            tx_hpf = HighPassFilter80Hz::new(SAMPLE_RATE);
+            let desired = selected_mic_device();
+            match open_mic_stream(&desired, input_ring.clone(), mic_err_flag.clone()) {
+                Ok((stream, actual_name, rate, ch, fmt)) => {
+                    active_mic_name = actual_name.clone();
+                    active_mic_stream = Some(stream);
+                    crate::logger::log_voip_event(
+                        "audio::mic_switch",
+                        &format!(
+                            "reason={reason} from={prev_name} to={actual_name} rate={rate} ch={ch} fmt={fmt:?}"
+                        ),
+                        false,
+                    );
+                    crate::voip_log::line(
+                        "AUDIO",
+                        format!(
+                            "mic switch ({reason}) from={prev_name} to={actual_name} ({rate}Hz/{ch}ch/{fmt:?})"
+                        ),
+                    );
+                }
+                Err(e) => {
+                    active_mic_name.clear();
+                    crate::logger::log_voip_event(
+                        "audio::mic_switch",
+                        &format!("reason={reason} from={prev_name} err={e}"),
+                        true,
+                    );
+                }
+            }
         }
-        if frame.len() == FRAME_SAMPLES {
-            last_rtp_tx = std::time::Instant::now();
+
+        // --- Capture: drain full 320-sample frames from lock-free ring (never inject silence when 319 samples wait) ---
+        if input_ring.len() > FRAME_SAMPLES * 12 {
+            input_ring.discard(input_ring.len() - FRAME_SAMPLES * 4);
+        }
+        let mut tx_burst = 0usize;
+        while tx_burst < 2 {
+            let mut frame: Vec<f32> = if input_ring.len() >= FRAME_SAMPLES {
+                let mut f = Vec::with_capacity(FRAME_SAMPLES);
+                for _ in 0..FRAME_SAMPLES {
+                    if let Some(s) = input_ring.pop() {
+                        f.push(s);
+                    }
+                }
+                f
+            } else if tx_burst == 0
+                && ((active_mic_stream.is_none()
+                    && last_rtp_tx.elapsed() >= Duration::from_millis(20))
+                    || last_rtp_tx.elapsed() >= Duration::from_millis(60))
+            {
+                vec![0.0_f32; FRAME_SAMPLES]
+            } else {
+                break;
+            };
+            if frame.len() != FRAME_SAMPLES {
+                break;
+            }
+            tx_burst += 1;
+            last_rtp_tx = Instant::now();
             let gain = (MIC_GAIN_PERCENT.load(Ordering::Relaxed) as f32 / 100.0).clamp(0.0, 2.0);
             let mut peak = 0.0_f32;
             if mic_muted.load(Ordering::Relaxed) || gain <= 0.001 {
                 frame.fill(0.0);
             } else {
                 for s in &mut frame {
-                    *s = (*s * gain).clamp(-1.0, 1.0);
-                    peak = peak.max(s.abs());
+                    let filtered = tx_hpf.process(*s);
+                    let scaled = soft_limit(filtered * gain);
+                    *s = scaled;
+                    peak = peak.max(scaled.abs());
                 }
             }
             MIC_LEVEL_PERMILLE.store((peak * 1000.0).clamp(0.0, 1000.0) as u32, Ordering::Relaxed);
             mix_peer_bridge_audio(slot_idx, &mut frame);
+            for s in &mut frame {
+                *s = soft_limit(*s);
+            }
             let mut out = vec![0u8; 4000];
             match encoder.encode_float(&frame, &mut out) {
                 Ok(n) => {
@@ -2101,7 +3314,7 @@ fn run_media_loop(
         if (is_video || cam_enabled.load(Ordering::Relaxed))
             && last_video_tx.elapsed() >= Duration::from_millis(66)
         {
-            last_video_tx = std::time::Instant::now();
+            last_video_tx = Instant::now();
             let force_kf = vid_frame_no == 0
                 || vid_gop_pos >= H264_PSLICES.len()
                 || vid_frame_no % VIDEO_IDR_INTERVAL_FRAMES == 0
@@ -2216,7 +3429,7 @@ fn run_media_loop(
             }
         }
         if last_rtcp.elapsed() >= Duration::from_secs(2) {
-            last_rtcp = std::time::Instant::now();
+            last_rtcp = Instant::now();
             if let (Some(ref rtcp_s), Some(target)) = (&udp_rtcp_sock, rtcp_sock_addr) {
                 // LSR/DLSR of the peer's last SR (RFC 3550 6.4.1); DLSR is in 1/65536 s.
                 let (lsr, dlsr) = match last_peer_sr {
@@ -2227,7 +3440,7 @@ fn run_media_loop(
                 // Audio: RR (`0x05` = `initZRTPPacketAudio` with `isRtcp=true`) from our audio SSRC.
                 let mut rr = vec![0x80u8, 201, 0, 1];
                 rr.extend_from_slice(&ssrc.to_be_bytes());
-                if let Some(b) = rx_audio.block(peer_ssrc, lsr, dlsr) {
+                if let Some(b) = rx_audio.block(peer_audio_ssrc, lsr, dlsr) {
                     rr[0] = 0x81;
                     rr[2..4].copy_from_slice(&7u16.to_be_bytes());
                     rr.extend_from_slice(&b);
@@ -2235,18 +3448,19 @@ fn run_media_loop(
                 pkts.push((0x05, rr));
                 // Video: SR + SDES + REMB (`0x0F` = `initZRTPPacketVideo` with `isRtcp=true`) from our video SSRC.
                 if is_video || cam_enabled.load(Ordering::Relaxed) {
+                    let fb_ssrc = resolve_video_feedback_ssrc(peer_video_ssrc, peer_audio_ssrc);
                     let sr = build_sender_report(
                         vid_ssrc,
                         ntp_now(),
                         vid_ts,
                         vid_pkts_tx,
                         vid_octets_tx,
-                        rx_video.block(peer_ssrc, lsr, dlsr),
+                        fb_ssrc.and_then(|s| rx_video.block(s, lsr, dlsr)),
                     );
                     let mut c = sr;
                     c.extend_from_slice(&build_sdes_empty(vid_ssrc));
-                    if peer_ssrc != 0 {
-                        c.extend_from_slice(&build_remb(vid_ssrc, peer_ssrc, 1_500_000));
+                    if let Some(v_ssrc) = fb_ssrc {
+                        c.extend_from_slice(&build_remb(vid_ssrc, v_ssrc, 1_500_000));
                     }
                     pkts.push((0x0F, c));
                 }
@@ -2454,7 +3668,7 @@ fn run_media_loop(
                 // RTCP (RFC 5761 range 200..=207): react to PLI / FIR by forcing a keyframe.
                 if matches!(inner_rtp.get(1), Some(b) if (200..=207).contains(b)) {
                     if let Some(m) = sr_middle_ntp(inner_rtp) {
-                        last_peer_sr = Some((m, std::time::Instant::now()));
+                        last_peer_sr = Some((m, Instant::now()));
                     }
                     if wl.rtcp("<", via, raw_pkt[0], n, &peer_s, inner_rtp) {
                         want_keyframe.store(true, Ordering::Relaxed);
@@ -2468,7 +3682,21 @@ fn run_media_loop(
                 let pt = inner_rtp.get(1).map(|b| b & 0x7F).unwrap_or(0);
                 wl.rtp("<", raw_pkt[0], n, &peer_s, inner_rtp);
                 let parsed_h = crate::voip_log::parse_rtp(inner_rtp);
-                if matches!(pt, 96 | 97 | VIDEO_PT_FRAG | 121 | 122) || raw_pkt[0] == 0x0E {
+                let is_group_sfu = rtp_addr.ends_with(":3000") || rtcp_addr.ends_with(":3500");
+                let raw_payload_opt: Option<Vec<u8>> = if is_group_sfu {
+                    if let Some(ref srtp) = srtp_ctx {
+                        srtp.decrypt_rtp_payload(inner_rtp)
+                    } else {
+                        extract_rtp_opus_payload(inner_rtp).map(|s| s.to_vec())
+                    }
+                } else {
+                    extract_rtp_opus_payload(inner_rtp).map(|s| s.to_vec())
+                };
+                let is_video_pkt = raw_payload_opt
+                    .as_deref()
+                    .is_some_and(|p| is_incoming_video_rtp(pt, raw_pkt[0], p));
+
+                if is_video_pkt {
                     if let Some(ref h) = parsed_h {
                         let key = (h.ssrc, h.seq);
                         if recent_vid_seqs.contains(&key) {
@@ -2483,16 +3711,19 @@ fn run_media_loop(
                 if let Some(ref h) = parsed_h {
                     if pt == 112 {
                         rx_audio.update(h.seq);
-                        peer_ssrc = h.ssrc;
-                    } else if matches!(pt, 96 | 97 | VIDEO_PT_FRAG | 121 | 122) {
+                        if h.ssrc != 0 {
+                            peer_audio_ssrc = h.ssrc;
+                        }
+                    } else if is_video_pkt {
                         if rx_video.update(h.seq) {
                             pli_gap = true; // hole in the peer's video: ask for a keyframe
                         }
-                        peer_ssrc = h.ssrc;
+                        if h.ssrc != 0 {
+                            peer_video_ssrc = h.ssrc;
+                        }
                     }
                 }
-                static LOGGED_RX: std::sync::atomic::AtomicUsize =
-                    std::sync::atomic::AtomicUsize::new(0);
+                static LOGGED_RX: AtomicUsize = AtomicUsize::new(0);
                 let cnt = LOGGED_RX.fetch_add(1, Ordering::Relaxed);
                 if cnt < 16 || cnt % 100 == 0 {
                     crate::call::trace_line(
@@ -2500,46 +3731,29 @@ fn run_media_loop(
                         format!("from={peer_s} len={n} outer=0x{:02x} pt={pt}", raw_pkt[0]),
                     );
                 }
-                let is_group_sfu = rtp_addr.ends_with(":3000") || rtcp_addr.ends_with(":3500");
                 if pt == 112 {
-                    let dec_payload: Option<Vec<u8>> = if is_group_sfu {
-                        if let Some(ref srtp) = srtp_ctx {
-                            srtp.decrypt_rtp_payload(inner_rtp)
-                        } else {
-                            extract_rtp_opus_payload(inner_rtp).map(|s| s.to_vec())
-                        }
-                    } else {
-                        extract_rtp_opus_payload(inner_rtp).map(|s| s.to_vec())
-                    };
-                    if let Some(payload) = dec_payload.as_deref() {
-                        let mut pcm = vec![0f32; FRAME_SAMPLES];
-                        if decoder.decode_float(payload, &mut pcm, false).is_ok() {
-                            let r_peak = pcm.iter().fold(0.0_f32, |m, v| m.max(v.abs()));
-                            REMOTE_AUDIO_ACTIVE.store(r_peak > 0.025, Ordering::Relaxed);
-                            push_peer_bridge_audio(slot_idx, &pcm);
-                            if let Ok(mut b) = output_buf.lock() {
-                                b.extend_from_slice(&pcm);
-                            }
-                        }
+                    if let (Some(payload), Some(ref h)) = (raw_payload_opt, parsed_h) {
+                        jitter_buf.push(h.seq, payload);
                     }
-                } else if matches!(pt, 96 | 97 | VIDEO_PT_FRAG | 121 | 122) || raw_pkt[0] == 0x0E {
+                } else if is_video_pkt {
                     let pkt_ssrc = parsed_h.as_ref().map(|h| h.ssrc).unwrap_or(0);
-                    let dec_vid_payload: Option<Vec<u8>> = if is_group_sfu {
-                        if let Some(ref srtp) = srtp_ctx {
-                            srtp.decrypt_rtp_payload(inner_rtp)
-                        } else {
-                            extract_rtp_opus_payload(inner_rtp).map(|s| s.to_vec())
-                        }
-                    } else {
-                        extract_rtp_opus_payload(inner_rtp).map(|s| s.to_vec())
-                    };
+                    let pkt_seq = parsed_h.as_ref().map(|h| h.seq).unwrap_or(0);
+                    let pkt_ts = parsed_h.as_ref().map(|h| h.ts).unwrap_or(0);
                     if primary_video_ssrc == 0 || pkt_ssrc == 0 || pkt_ssrc == primary_video_ssrc {
                         if pkt_ssrc != 0 {
                             primary_video_ssrc = pkt_ssrc;
                         }
-                        last_primary_vid_rx = Some(std::time::Instant::now());
-                        if let Some(payload) = dec_vid_payload.as_deref() {
-                            depacketize_h264(payload, &mut fu_a_buf, &h264_tx);
+                        last_primary_vid_rx = Some(Instant::now());
+                        if let Some(payload) = raw_payload_opt.as_deref() {
+                            match primary_depacketizer.push(pkt_seq, pkt_ts, payload) {
+                                DepacketizeResult::Ready(au) => {
+                                    let _ = h264_tx.try_send(au);
+                                }
+                                DepacketizeResult::DroppedCorrupt => {
+                                    pli_gap = true;
+                                }
+                                DepacketizeResult::Buffering | DepacketizeResult::Ignored => {}
+                            }
                         }
                     } else if slot_idx == 0 {
                         let stream_pos = extra_vid_streams
@@ -2552,7 +3766,7 @@ fn run_media_loop(
                                 let stream_num = extra_vid_streams.len() + 1;
                                 let tex_key = format!("call_remote_video_{stream_num}");
                                 let tex_key_cl = tex_key.clone();
-                                let (tx_n, rx_n) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
+                                let (tx_n, rx_n) = mpsc::sync_channel::<Vec<u8>>(64);
                                 let stop_vn = stop.clone();
                                 let synced_vn = Arc::new(AtomicBool::new(false));
                                 let handle = thread::spawn(move || {
@@ -2563,7 +3777,7 @@ fn run_media_loop(
                                 extra_vid_streams.push(ExtraVideoStream {
                                     ssrc: pkt_ssrc,
                                     tex_key,
-                                    fu_a_buf: Vec::with_capacity(65536),
+                                    depacketizer: VideoDepacketizer::new(),
                                     tx: tx_n,
                                     last_rx: None,
                                     _handle: handle,
@@ -2576,16 +3790,59 @@ fn run_media_loop(
                             None
                         };
                         if let Some(i) = idx {
-                            if let Some(payload) = dec_vid_payload.as_deref() {
+                            if let Some(payload) = raw_payload_opt.as_deref() {
                                 let stream = &mut extra_vid_streams[i];
-                                stream.last_rx = Some(std::time::Instant::now());
-                                depacketize_h264(payload, &mut stream.fu_a_buf, &stream.tx);
+                                stream.last_rx = Some(Instant::now());
+                                match stream.depacketizer.push(pkt_seq, pkt_ts, payload) {
+                                    DepacketizeResult::Ready(au) => {
+                                        let _ = stream.tx.try_send(au);
+                                    }
+                                    DepacketizeResult::DroppedCorrupt => {
+                                        pli_gap = true;
+                                    }
+                                    DepacketizeResult::Buffering | DepacketizeResult::Ignored => {}
+                                }
                             }
                         }
                     }
                 }
             }
         }
+
+        // --- RX Audio Jitter Buffer Playout (20 ms cadence with Opus FEC & PLC) ---
+        let mut rx_play_burst = 0usize;
+        let now_rx = Instant::now();
+        if now_rx.duration_since(next_rx_playout) > Duration::from_millis(120) {
+            next_rx_playout = now_rx;
+        }
+        while next_rx_playout <= now_rx && rx_play_burst < 3 {
+            next_rx_playout += Duration::from_millis(20);
+            rx_play_burst += 1;
+            let mut pcm = [0.0_f32; FRAME_SAMPLES];
+            let dec_res = match jitter_buf.pop_next() {
+                JitterPop::Packet(p) => decoder.decode_float(&p, &mut pcm, false),
+                JitterPop::FecFromNext(p) => decoder.decode_float(&p, &mut pcm, true),
+                JitterPop::Plc => decoder.decode_float(&[], &mut pcm, false),
+                JitterPop::Buffering | JitterPop::Silence => {
+                    REMOTE_AUDIO_ACTIVE.store(false, Ordering::Relaxed);
+                    continue;
+                }
+            };
+            if let Ok(decoded_n) = dec_res {
+                let slice = &mut pcm[..decoded_n.min(FRAME_SAMPLES)];
+                let mut r_peak = 0.0_f32;
+                for s in slice.iter_mut() {
+                    *s = soft_limit(*s);
+                    r_peak = r_peak.max(s.abs());
+                }
+                REMOTE_AUDIO_ACTIVE.store(r_peak > 0.025, Ordering::Relaxed);
+                push_peer_bridge_audio(slot_idx, slice);
+                for &s in slice.iter() {
+                    let _ = output_ring.push(s);
+                }
+            }
+        }
+
         // Clear frozen remote video texture if a peer stops sending video RTP for > 1.8s (camera turned off)
         if let Some(t) = last_primary_vid_rx {
             if t.elapsed() >= Duration::from_millis(1800) {
@@ -2614,65 +3871,96 @@ fn run_media_loop(
         }
         wl.tick();
         // --- PLI towards the peer: its video is undecodable until a keyframe (SPS/IDR) reaches the decoder ---
-        // Live log (call at 18:28 UTC): the peer sent only P frames, no SPS/IDR ever arrived, ffmpeg printed
-        // "non-existing PPS 0 referenced" for all of them and decoded 0 frames; we never sent a PLI back.
-        if (is_video || cam_enabled.load(Ordering::Relaxed))
-            && decoder_active
-            && (rx_video.started || rx_audio.started)
-            && peer_ssrc != 0
-            && (!video_synced.load(Ordering::Relaxed) || pli_gap)
-            && last_pli.elapsed() >= Duration::from_millis(500)
+        if let Some(target_video_ssrc) =
+            resolve_video_feedback_ssrc(peer_video_ssrc, peer_audio_ssrc)
         {
-            last_pli = std::time::Instant::now();
-            pli_gap = false;
-            if let (Some(ref rtcp_s), Some(target)) = (&udp_rtcp_sock, rtcp_sock_addr) {
-                let rtcp_sender = udp_rtp_sock.as_ref().unwrap_or(rtcp_s);
-                // Compound packet: empty RR first (RFC 3550 6.1), then the PLI.
-                let mut pkt = vec![0x80u8, 201, 0, 1];
-                pkt.extend_from_slice(&ssrc.to_be_bytes());
-                pkt.extend_from_slice(&build_pli(ssrc, peer_ssrc));
-                if relay_token != 0 {
-                    let rtcp_type: u8 = 0x0F; // `ZRTPPacket::initZRTPPacketVideo` (`isRtcp=true`)
-                    let mut wire = Vec::with_capacity(5 + pkt.len());
-                    wire.push(rtcp_type);
-                    wire.extend_from_slice(&relay_token.to_le_bytes());
-                    wire.extend_from_slice(&pkt);
-                    send_dgram(rtcp_sender, &wire, target, &mut txs);
-                    if let Some(rtarget) = rtp_sock_addr {
-                        if rtarget != target {
-                            send_dgram(rtcp_sender, &wire, rtarget, &mut txs);
+            if (is_video || cam_enabled.load(Ordering::Relaxed))
+                && decoder_active
+                && (rx_video.started || rx_audio.started)
+                && (!video_synced.load(Ordering::Relaxed) || pli_gap)
+                && last_pli.elapsed() >= Duration::from_millis(500)
+            {
+                last_pli = Instant::now();
+                let was_gap = pli_gap;
+                pli_gap = false;
+                if let (Some(ref rtcp_s), Some(target)) = (&udp_rtcp_sock, rtcp_sock_addr) {
+                    let rtcp_sender = udp_rtp_sock.as_ref().unwrap_or(rtcp_s);
+                    // Compound packet: empty RR first (RFC 3550 6.1), then the PLI.
+                    let mut pkt = vec![0x80u8, 201, 0, 1];
+                    pkt.extend_from_slice(&ssrc.to_be_bytes());
+                    pkt.extend_from_slice(&build_pli(ssrc, target_video_ssrc));
+                    if relay_token != 0 {
+                        let rtcp_type: u8 = 0x0F; // `ZRTPPacket::initZRTPPacketVideo` (`isRtcp=true`)
+                        let mut wire = Vec::with_capacity(5 + pkt.len());
+                        wire.push(rtcp_type);
+                        wire.extend_from_slice(&relay_token.to_le_bytes());
+                        wire.extend_from_slice(&pkt);
+                        send_dgram(rtcp_sender, &wire, target, &mut txs);
+                        if let Some(rtarget) = rtp_sock_addr {
+                            if rtarget != target {
+                                send_dgram(rtcp_sender, &wire, rtarget, &mut txs);
+                            }
                         }
+                        wl.rtcp(
+                            ">",
+                            crate::voip_log::Via::RtcpSock,
+                            rtcp_type,
+                            wire.len(),
+                            &rtcp_addr,
+                            &pkt,
+                        );
+                    } else {
+                        send_dgram(rtcp_sender, &pkt, target, &mut txs);
+                        wl.rtcp(
+                            ">",
+                            crate::voip_log::Via::RtcpSock,
+                            pkt[0],
+                            pkt.len(),
+                            &rtcp_addr,
+                            &pkt,
+                        );
                     }
-                    wl.rtcp(
-                        ">",
-                        crate::voip_log::Via::RtcpSock,
-                        rtcp_type,
-                        wire.len(),
-                        &rtcp_addr,
-                        &pkt,
-                    );
-                } else {
-                    send_dgram(rtcp_sender, &pkt, target, &mut txs);
-                    wl.rtcp(
-                        ">",
-                        crate::voip_log::Via::RtcpSock,
-                        pkt[0],
-                        pkt.len(),
-                        &rtcp_addr,
-                        &pkt,
+                    pli_sent += 1;
+                    crate::logger::log_voip_event(
+                        "video::pli_sent",
+                        &format!(
+                            "target_ssrc={target_video_ssrc:#010x} video_ssrc={peer_video_ssrc:#010x} audio_ssrc={peer_audio_ssrc:#010x} count={pli_sent} synced={} gap={was_gap}",
+                            video_synced.load(Ordering::Relaxed)
+                        ),
+                        false,
                     );
                 }
-                pli_sent += 1;
             }
+        }
+        if last_audio_stats_log.elapsed() >= Duration::from_secs(5) {
+            last_audio_stats_log = Instant::now();
+            crate::logger::log_voip_event(
+                "audio::quality_stats",
+                &format!(
+                    "jb_target_ms={} jb_depth={} rx_pkts={} played={} fec={} plc={} late={} overflow={} reordered={} in_ring={} out_ring={}",
+                    jitter_buf.target_packets * 20,
+                    jitter_buf.packets.len(),
+                    jitter_buf.rx_pushed,
+                    jitter_buf.played_normal,
+                    jitter_buf.fec_recovered,
+                    jitter_buf.plc_concealed,
+                    jitter_buf.late_dropped,
+                    jitter_buf.overflow_dropped,
+                    jitter_buf.reordered,
+                    input_ring.len(),
+                    output_ring.len(),
+                ),
+                false,
+            );
         }
         // --- send-side health: result counters of every UDP send + longest stall of this loop ---
         let gap = last_iter.elapsed();
-        last_iter = std::time::Instant::now();
+        last_iter = Instant::now();
         if gap > max_loop_gap {
             max_loop_gap = gap;
         }
         if last_txst.elapsed() >= Duration::from_secs(5) {
-            last_txst = std::time::Instant::now();
+            last_txst = Instant::now();
             crate::voip_log::line(
                 "TXST",
                 format!(
@@ -2689,7 +3977,7 @@ fn run_media_loop(
             );
             max_loop_gap = Duration::ZERO;
         }
-        thread::sleep(Duration::from_millis(5));
+        thread::sleep(Duration::from_millis(2));
     }
     crate::voip_log::line("CALL", "media stop");
 
@@ -2708,11 +3996,14 @@ fn run_media_loop(
     for h in extra_handles {
         let _ = h.join();
     }
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(input_stream)));
+    if let Some(mic_stream) = active_mic_stream.take() {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(mic_stream)));
+    }
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(output_stream)));
 }
 
 /// Reassemble RFC 6184 H.264 RTP payloads (Single NAL 1..23, STAP-A 24, FU-A 28) into Annex-B (`00 00 00 01`) byte stream.
+#[cfg(test)]
 fn depacketize_rfc6184_h264(
     payload: &[u8],
     fu_a_buf: &mut Vec<u8>,
@@ -2848,22 +4139,25 @@ fn run_h264_ffmpeg_decoder(
 ) {
     use std::io::{Read, Write};
     use std::process::{Child, Command, Stdio};
-    use std::sync::atomic::AtomicU64;
 
     const VID_W: usize = 640;
     const VID_H: usize = 480;
     const FRAME_BYTES: usize = VID_W * VID_H * 4;
 
-    fn spawn_ffmpeg_h264_child() -> Option<Child> {
+    fn spawn_ffmpeg_h264_child(tex_key: &str) -> Option<Child> {
         let mut cmd = Command::new("ffmpeg");
         cmd.args([
             "-hide_banner",
             "-loglevel",
             "warning",
+            "-fflags",
+            "nobuffer",
             "-flags",
             "low_delay",
+            "-threads",
+            "1",
             "-probesize",
-            "32",
+            "32768",
             "-analyzeduration",
             "0",
             "-f",
@@ -2894,15 +4188,27 @@ fn run_h264_ffmpeg_decoder(
             Ok(c) => Some(c),
             Err(e) => {
                 crate::voip_log::line("VDEC", format!("ffmpeg spawn failed: {e}"));
+                crate::logger::log_voip_event(
+                    "video::decoder_error",
+                    &format!("ffmpeg spawn failed for {tex_key}: {e}"),
+                    true,
+                );
                 None
             }
         }
     }
 
     let decoded_counter = Arc::new(AtomicU64::new(0));
+    let mut preparer = H264AccessUnitPreparer::new();
+    let mut restarts = 0u64;
+    let mut keyframes_seen = 0u64;
+    let mut dropped_pre_sync = 0u64;
+    let mut first_frame_logged = false;
+
     while !stop.load(Ordering::Relaxed) {
         synced.store(false, Ordering::Relaxed);
-        let Some(child) = spawn_ffmpeg_h264_child() else {
+        preparer.reset_sync();
+        let Some(child) = spawn_ffmpeg_h264_child(&tex_key) else {
             return;
         };
         let mut child_guard = ChildGuard::new(child);
@@ -2941,10 +4247,17 @@ fn run_h264_ffmpeg_decoder(
             while !stop_reader.load(Ordering::Relaxed) {
                 if stdout.read_exact(&mut raw_frame).is_ok() {
                     let total_dec = dec_cnt_r.fetch_add(1, Ordering::Relaxed) + 1;
-                    if total_dec == 1 || total_dec % 100 == 0 {
+                    if total_dec == 1 || total_dec.is_multiple_of(100) {
                         crate::voip_log::line("VDEC", format!("decoded frame #{total_dec}"));
                     }
                     let (cw, ch, cropped) = trim_black_borders(&raw_frame, VID_W, VID_H);
+                    if total_dec == 1 {
+                        crate::logger::log_voip_event(
+                            "video::first_frame",
+                            &format!("tex={tex_key_r} size={cw}x{ch}"),
+                            false,
+                        );
+                    }
                     let color_img =
                         eframe::egui::ColorImage::from_rgba_unmultiplied([cw, ch], &cropped);
                     publish_call_video_frame(&tex_key_r, color_img);
@@ -2956,71 +4269,164 @@ fn run_h264_ffmpeg_decoder(
         });
 
         let mut fed = 0u64;
-        let mut dropped = 0u64;
         let mut last_seen_dec = decoded_counter.load(Ordering::Relaxed);
-        let mut fed_without_decode = 0u64;
+        let mut last_decode_progress_at = Instant::now();
+        let mut fed_since_progress = 0u64;
+        let mut sync_at: Option<Instant> = None;
+        let mut soft_pli_requested_for_stall = false;
+        let mut last_stat_log = Instant::now();
         let mut restart_decoder = false;
 
         while !stop.load(Ordering::Relaxed) {
+            let cur_dec_check = decoded_counter.load(Ordering::Relaxed);
+            if cur_dec_check > last_seen_dec {
+                if !first_frame_logged {
+                    first_frame_logged = true;
+                    if let Some(t_sync) = sync_at {
+                        crate::logger::log_voip_event(
+                            "video::first_frame",
+                            &format!(
+                                "tex={tex_key} first_frame_latency_ms={} fed={fed}",
+                                t_sync.elapsed().as_millis()
+                            ),
+                            false,
+                        );
+                    }
+                }
+                last_seen_dec = cur_dec_check;
+                last_decode_progress_at = Instant::now();
+                fed_since_progress = 0;
+                soft_pli_requested_for_stall = false;
+            }
+
+            if last_stat_log.elapsed() >= Duration::from_secs(5) {
+                last_stat_log = Instant::now();
+                crate::logger::log_voip_event(
+                    "video::decode_stats",
+                    &format!(
+                        "tex={tex_key} fed={fed} decoded={cur_dec_check} keyframes={keyframes_seen} dropped_pre_sync={dropped_pre_sync} restarts={restarts} params_cached={} synced={}",
+                        preparer.has_params(),
+                        synced.load(Ordering::Relaxed)
+                    ),
+                    false,
+                );
+            }
+
             match h264_rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(nal) => {
-                    if !synced.load(Ordering::Relaxed) {
-                        if au_is_sync_point(&nal) {
-                            synced.store(true, Ordering::Relaxed);
-                            last_seen_dec = decoded_counter.load(Ordering::Relaxed);
-                            fed_without_decode = 0;
-                            crate::voip_log::line(
-                                "VDEC",
-                                format!(
-                                    "first SPS/IDR access unit after {dropped} undecodable ones ({} bytes)",
-                                    nal.len()
-                                ),
+                Ok(raw_au) => {
+                    let bytes_to_feed = match preparer.prepare(&raw_au) {
+                        PreparedAu::ParamSetOnly => {
+                            crate::logger::log_voip_event(
+                                "video::keyframe",
+                                &format!("tex={tex_key} cached_param_set bytes={}", raw_au.len()),
+                                false,
                             );
-                        } else {
-                            dropped += 1;
-                            if dropped == 1 || dropped % 100 == 0 {
+                            continue;
+                        }
+                        PreparedAu::MissingParamsForIdr => {
+                            dropped_pre_sync += 1;
+                            synced.store(false, Ordering::Relaxed);
+                            if dropped_pre_sync == 1 || dropped_pre_sync.is_multiple_of(30) {
+                                crate::logger::log_voip_event(
+                                    "video::keyframe",
+                                    &format!("tex={tex_key} idr_missing_sps_pps dropped={dropped_pre_sync}"),
+                                    true,
+                                );
+                            }
+                            continue;
+                        }
+                        PreparedAu::DroppedPreSync => {
+                            dropped_pre_sync += 1;
+                            if dropped_pre_sync == 1 || dropped_pre_sync.is_multiple_of(100) {
                                 crate::voip_log::line(
                                     "VDEC",
                                     format!(
-                                        "waiting for SPS/IDR, dropped {dropped} P access units"
+                                        "waiting for SPS/IDR, dropped {dropped_pre_sync} P access units"
                                     ),
                                 );
                             }
                             continue;
                         }
-                    }
-
-                    let cur_dec = decoded_counter.load(Ordering::Relaxed);
-                    if cur_dec > last_seen_dec {
-                        last_seen_dec = cur_dec;
-                        fed_without_decode = 0;
-                    } else {
-                        fed_without_decode += 1;
-                        if fed_without_decode >= 22 {
+                        PreparedAu::Keyframe(bytes) => {
+                            keyframes_seen += 1;
+                            synced.store(true, Ordering::Relaxed);
+                            if sync_at.is_none() {
+                                sync_at = Some(Instant::now());
+                            }
+                            if fed_since_progress == 0 {
+                                last_decode_progress_at = Instant::now();
+                            }
                             crate::voip_log::line(
                                 "VDEC",
-                                format!("decoder stalled ({fed_without_decode} AUs with 0 output frames), requesting PLI & restarting ffmpeg"),
+                                format!(
+                                    "keyframe #{keyframes_seen} after {dropped_pre_sync} pre-sync AUs ({} bytes)",
+                                    bytes.len()
+                                ),
                             );
-                            synced.store(false, Ordering::Relaxed);
-                            restart_decoder = true;
-                            break;
+                            crate::logger::log_voip_event(
+                                "video::keyframe",
+                                &format!(
+                                    "tex={tex_key} keyframe=#{keyframes_seen} bytes={} pre_sync_dropped={dropped_pre_sync}",
+                                    bytes.len()
+                                ),
+                                false,
+                            );
+                            bytes
                         }
+                        PreparedAu::DeltaFrame(bytes) => bytes,
+                    };
+
+                    if fed_since_progress >= 10
+                        && last_decode_progress_at.elapsed() >= Duration::from_millis(1500)
+                        && !soft_pli_requested_for_stall
+                    {
+                        soft_pli_requested_for_stall = true;
+                        synced.store(false, Ordering::Relaxed);
+                        crate::logger::log_voip_event(
+                            "video::stall",
+                            &format!(
+                                "tex={tex_key} soft_pli_request fed_since_progress={fed_since_progress} elapsed_ms={}",
+                                last_decode_progress_at.elapsed().as_millis()
+                            ),
+                            false,
+                        );
+                    }
+                    if fed_since_progress >= 30
+                        && last_decode_progress_at.elapsed() >= Duration::from_secs(4)
+                    {
+                        restarts += 1;
+                        crate::voip_log::line(
+                            "VDEC",
+                            format!(
+                                "decoder stalled ({fed_since_progress} AUs over {}ms with 0 output frames), requesting PLI & restarting ffmpeg",
+                                last_decode_progress_at.elapsed().as_millis()
+                            ),
+                        );
+                        crate::logger::log_voip_event(
+                            "video::stall",
+                            &format!(
+                                "tex={tex_key} restarting_ffmpeg fed_since_progress={fed_since_progress} restarts={restarts}"
+                            ),
+                            true,
+                        );
+                        synced.store(false, Ordering::Relaxed);
+                        restart_decoder = true;
+                        break;
                     }
 
-                    let norm_nal = normalize_annexb_au_4byte(&nal);
-                    // Write the normalized access unit followed by an AUD delimiter so ffmpeg's
-                    // H.264 parser knows the access unit is complete and emits the frame immediately.
-                    if stdin.write_all(&norm_nal).is_err() || stdin.write_all(H264_AUD).is_err() {
+                    if stdin.write_all(&bytes_to_feed).is_err() {
                         crate::voip_log::line(
                             "VDEC",
                             format!("ffmpeg stdin closed after {fed} access units"),
                         );
+                        restarts += 1;
                         restart_decoder = true;
                         break;
                     }
                     let _ = stdin.flush();
                     fed += 1;
-                    if fed == 1 || fed % 100 == 0 {
+                    fed_since_progress += 1;
+                    if fed == 1 || fed.is_multiple_of(100) {
                         crate::voip_log::line("VDEC", format!("fed {fed} access units to ffmpeg"));
                     }
                 }
@@ -3058,9 +4464,8 @@ pub fn play_notification_chime() {
     let tx = CHIME_TX.get_or_init(|| {
         let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
         thread::spawn(move || {
-            let host = cpal::default_host();
             while rx.recv().is_ok() {
-                let Some(out_dev) = host.default_output_device() else {
+                let Ok((out_dev, _)) = resolve_output_device() else {
                     continue;
                 };
                 let Ok(cfg) = out_dev.default_output_config() else {
@@ -3631,5 +5036,282 @@ mod tests {
             g.kill_and_reap();
             assert!(g.0.is_none());
         }
+    }
+
+    #[test]
+    fn merge_mic_scan_result_preserves_cache_on_error_and_merges_hotplug() {
+        let prev = vec!["Microphone (Realtek)".to_string()];
+        // Error must preserve previous cache
+        let (merged, preserved) = merge_mic_scan_result(&prev, Err("COMSTA error"));
+        assert!(preserved);
+        assert_eq!(merged, prev);
+
+        // Empty list while default exists must preserve previous cache
+        let (merged2, preserved2) = merge_mic_scan_result(&prev, Ok((Vec::new(), true)));
+        assert!(preserved2);
+        assert_eq!(merged2, prev);
+
+        // Hot-plugged headset appears alongside existing mic
+        let hotplug = vec![
+            "Microphone (Realtek)".to_string(),
+            "Headset (UGREEN HiTune)".to_string(),
+        ];
+        let (merged3, preserved3) = merge_mic_scan_result(&prev, Ok((hotplug.clone(), true)));
+        assert!(!preserved3);
+        assert_eq!(merged3, hotplug);
+    }
+
+    #[test]
+    fn pcm_integer_sample_conversions_roundtrip_accurately() {
+        assert!((i16_to_f32(0)).abs() < 1e-6);
+        assert!((i16_to_f32(i16::MAX) - 1.0).abs() < 1e-4);
+        assert!((i16_to_f32(i16::MIN) + 1.0).abs() < 1e-4);
+        assert_eq!(f32_to_i16(0.0), 0);
+        assert_eq!(f32_to_i16(1.5), i16::MAX);
+        assert_eq!(f32_to_i16(-1.5), -i16::MAX);
+
+        assert!((u16_to_f32(32768)).abs() < 1e-6);
+        assert!((u16_to_f32(u16::MAX) - 1.0).abs() < 1e-4);
+        assert!((u16_to_f32(0) + 1.0).abs() < 1e-4);
+        assert_eq!(f32_to_u16(0.0), 32768);
+        assert_eq!(f32_to_u16(1.5), 65535);
+        assert_eq!(f32_to_u16(-1.5), 1);
+    }
+
+    #[test]
+    fn video_feedback_ssrc_is_not_clobbered_by_audio_ssrc() {
+        assert_eq!(resolve_video_feedback_ssrc(0x2222_3333, 0xAAAA_BBBB), Some(0x2222_3333));
+        assert_eq!(resolve_video_feedback_ssrc(0, 0xAAAA_BBBB), Some(0xAAAA_BBBB));
+        assert_eq!(resolve_video_feedback_ssrc(0, 0), None);
+    }
+
+    #[test]
+    fn is_incoming_video_rtp_rejects_fec_on_0x0e_and_accepts_h264() {
+        assert!(!is_incoming_video_rtp(112, 0x0E, &[0, 0, 0, 1, 0x65]));
+        assert!(!is_incoming_video_rtp(118, 0x0E, &[0xDE, 0xAD, 0xBE, 0xEF]));
+        assert!(is_incoming_video_rtp(97, 0x0E, &[0x41, 0x9A]));
+        assert!(is_incoming_video_rtp(98, 0x0E, &[0x1C, 0x80, 0, 0, 0, 1, 0x65]));
+        assert!(is_incoming_video_rtp(99, 0x0E, &[0, 0, 0, 1, 0x67, 0x42]));
+    }
+
+    #[test]
+    fn video_depacketizer_handles_fu_a_single_se_and_drops_seq_or_ts_breaks() {
+        let mut dep = VideoDepacketizer::new();
+
+        // Single-packet FU-A with both S and E set must emit immediately
+        let single_fua = [0x7C, 0xC5, 0xAA, 0xBB];
+        assert_eq!(
+            dep.push(10, 9000, &single_fua),
+            DepacketizeResult::Ready(vec![0, 0, 0, 1, 0x65, 0xAA, 0xBB])
+        );
+
+        // Multi-packet FU-A with sequence gap must drop corrupt fragment
+        assert_eq!(dep.push(20, 12000, &[0x7C, 0x85, 0x11]), DepacketizeResult::Buffering);
+        assert_eq!(
+            dep.push(22, 12000, &[0x7C, 0x45, 0x22]),
+            DepacketizeResult::DroppedCorrupt
+        );
+        assert_eq!(dep.corrupt_frags_dropped, 1);
+
+        // Zalo 0x1C fragment with timestamp jump must drop corrupt fragment
+        assert_eq!(
+            dep.push(30, 15000, &[0x1C, 0x80, 0, 0, 0, 1, 0x41]),
+            DepacketizeResult::Buffering
+        );
+        assert_eq!(
+            dep.push(31, 18000, &[0x1C, 0x40, 0x9A]),
+            DepacketizeResult::DroppedCorrupt
+        );
+        assert_eq!(dep.corrupt_frags_dropped, 2);
+
+        // Valid contiguous Zalo 0x1C reassembly
+        assert_eq!(
+            dep.push(40, 21000, &[0x1C, 0x80, 0, 0, 0, 1, 0x65]),
+            DepacketizeResult::Buffering
+        );
+        assert_eq!(
+            dep.push(41, 21000, &[0x1C, 0x40, 0x88, 0x84]),
+            DepacketizeResult::Ready(vec![0, 0, 0, 1, 0x65, 0x88, 0x84])
+        );
+    }
+
+    #[test]
+    fn h264_au_preparer_caches_sps_pps_without_splitting_aud_and_prepends_to_idr() {
+        let mut prep = H264AccessUnitPreparer::new();
+
+        // P-frame before keyframe must be dropped
+        assert_eq!(
+            prep.prepare(&annexb_au(&[H264_PSLICE])),
+            PreparedAu::DroppedPreSync
+        );
+
+        // Standalone SPS + PPS packet is cached without emitting a premature AUD
+        assert_eq!(
+            prep.prepare(&annexb_au(&[H264_SPS, H264_PPS])),
+            PreparedAu::ParamSetOnly
+        );
+        assert!(prep.has_params());
+
+        // Subsequent bare IDR receives cached SPS + PPS and trailing AUD
+        let PreparedAu::Keyframe(kf) = prep.prepare(&annexb_au(&[H264_IDR])) else {
+            panic!("expected Keyframe with cached SPS/PPS");
+        };
+        assert!(au_has_nal_type(&kf, &[7]));
+        assert!(au_has_nal_type(&kf, &[8]));
+        assert!(au_has_nal_type(&kf, &[5]));
+        assert!(kf.ends_with(H264_AUD));
+
+        // Delta frame passes through after sync
+        let PreparedAu::DeltaFrame(df) = prep.prepare(&annexb_au(&[H264_PSLICE])) else {
+            panic!("expected DeltaFrame");
+        };
+        assert!(df.ends_with(H264_AUD));
+
+        // After reset_sync (e.g. decoder restart), cached SPS/PPS remain available for bare IDR
+        prep.reset_sync();
+        assert_eq!(
+            prep.prepare(&annexb_au(&[H264_PSLICE])),
+            PreparedAu::DroppedPreSync
+        );
+        assert!(matches!(
+            prep.prepare(&annexb_au(&[H264_IDR_ALT])),
+            PreparedAu::Keyframe(_)
+        ));
+    }
+
+    #[test]
+    fn voip_opus_encoder_config_enables_fec_bitrate_complexity_and_voice() {
+        let mut enc = Encoder::new(SAMPLE_RATE, OpusChannels::Mono, opus::Application::Voip)
+            .expect("opus encoder");
+        configure_voip_opus_encoder(&mut enc);
+        assert_eq!(enc.get_bitrate().unwrap(), opus::Bitrate::Bits(32_000));
+        assert!(enc.get_inband_fec().unwrap());
+        assert_eq!(enc.get_packet_loss_perc().unwrap(), 10);
+        assert_eq!(enc.get_complexity().unwrap(), 8);
+        assert_eq!(enc.get_signal().unwrap(), opus::Signal::Voice);
+        assert!(!enc.get_dtx().unwrap());
+    }
+
+    #[test]
+    fn audio_resampler_preserves_rate_and_sine_clarity_across_8k_44k1_48k() {
+        // 1. Capture downsampling 48 kHz -> 16 kHz (100 ms of 440 Hz sine)
+        let mut cap_48 = AudioResampler::new(48_000, 16_000);
+        let in_48: Vec<f32> = (0..4800)
+            .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 48_000.0).sin() * 0.5)
+            .collect();
+        let mut out_16 = Vec::new();
+        for chunk in in_48.chunks(480) {
+            cap_48.process_capture(chunk, |s| out_16.push(s));
+        }
+        assert!(
+            (1595..=1602).contains(&out_16.len()),
+            "48k->16k len={}",
+            out_16.len()
+        );
+        let peak_16 = out_16[100..].iter().fold(0.0_f32, |m, v| m.max(v.abs()));
+        assert!(peak_16 > 0.42 && peak_16 < 0.56, "peak_16={peak_16}");
+
+        // 2. Capture upsampling 8 kHz Bluetooth HFP -> 16 kHz (no 2x speed bug!)
+        let mut cap_8 = AudioResampler::new(8_000, 16_000);
+        let in_8: Vec<f32> = (0..800)
+            .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 8_000.0).sin() * 0.5)
+            .collect();
+        let mut out_from_8 = Vec::new();
+        for chunk in in_8.chunks(80) {
+            cap_8.process_capture(chunk, |s| out_from_8.push(s));
+        }
+        assert!(
+            (1590..=1602).contains(&out_from_8.len()),
+            "8k->16k len={}",
+            out_from_8.len()
+        );
+
+        // 3. Playback upsampling 16 kHz -> 44.1 kHz via ring buffer (zero over-drain)
+        let ring = AudioRingBuffer::new(4096);
+        for i in 0..1600 {
+            let s = (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16_000.0).sin() * 0.5;
+            assert!(ring.push(s));
+        }
+        let mut play_441 = AudioResampler::new(16_000, 44_100);
+        let mut rendered = vec![0.0_f32; 4410];
+        for chunk in rendered.chunks_mut(441) {
+            play_441.fill_playback(&ring, chunk);
+        }
+        let peak_441 = rendered[300..].iter().fold(0.0_f32, |m, v| m.max(v.abs()));
+        assert!(peak_441 > 0.42 && peak_441 < 0.58, "peak_441={peak_441}");
+    }
+
+    #[test]
+    fn audio_ring_buffer_is_fifo_bounded_and_wraparound_safe() {
+        let rb = AudioRingBuffer::new(64);
+        assert_eq!(rb.capacity(), 64);
+        for round in 0..5 {
+            for i in 0..50 {
+                assert!(rb.push((round * 100 + i) as f32));
+            }
+            assert_eq!(rb.len(), 50);
+            for i in 0..50 {
+                assert_eq!(rb.pop(), Some((round * 100 + i) as f32));
+            }
+            assert_eq!(rb.pop(), None);
+        }
+        // Capacity bound
+        for i in 0..64 {
+            assert!(rb.push(i as f32));
+        }
+        assert!(!rb.push(999.0));
+        rb.discard(10);
+        assert_eq!(rb.len(), 54);
+        assert_eq!(rb.pop(), Some(10.0));
+    }
+
+    #[test]
+    fn audio_jitter_buffer_reorders_invokes_fec_and_plc_and_caps_latency() {
+        let mut jb = AudioJitterBuffer::new();
+        // Push out-of-order packets 100, 102, 101 -> should prime at 3 packets and play 100, 101, 102 in order
+        jb.push(100, vec![100]);
+        assert_eq!(jb.pop_next(), JitterPop::Buffering);
+        jb.push(102, vec![102]);
+        assert_eq!(jb.pop_next(), JitterPop::Buffering);
+        jb.push(101, vec![101]);
+        assert_eq!(jb.reordered, 1);
+
+        assert_eq!(jb.pop_next(), JitterPop::Packet(vec![100]));
+        assert_eq!(jb.pop_next(), JitterPop::Packet(vec![101]));
+        assert_eq!(jb.pop_next(), JitterPop::Packet(vec![102]));
+
+        // Packet 103 lost, 104 present -> FEC recovery from packet 104, then normal 104
+        jb.push(104, vec![104]);
+        assert_eq!(jb.pop_next(), JitterPop::FecFromNext(vec![104]));
+        assert_eq!(jb.pop_next(), JitterPop::Packet(vec![104]));
+        assert_eq!(jb.fec_recovered, 1);
+
+        // Missing 105 with no 106 -> PLC
+        assert_eq!(jb.pop_next(), JitterPop::Plc);
+        assert_eq!(jb.plc_concealed, 1);
+
+        // Latency cap: pushing 20 packets caps queue at max_packets (10)
+        for s in 200..220u16 {
+            jb.push(s, vec![s as u8]);
+        }
+        assert!(jb.packets.len() <= jb.max_packets);
+        assert!(jb.overflow_dropped > 0);
+    }
+
+    #[test]
+    fn hpf_80hz_blocks_dc_and_soft_limiter_bounds_peaks() {
+        let mut hpf = HighPassFilter80Hz::new(16_000);
+        let mut last = 1.0_f32;
+        for _ in 0..400 {
+            last = hpf.process(0.75);
+        }
+        assert!(last.abs() < 0.01, "DC offset leaked through HPF: {last}");
+
+        assert_eq!(soft_limit(0.5), 0.5);
+        assert_eq!(soft_limit(-0.5), -0.5);
+        let pos = soft_limit(3.0);
+        let neg = soft_limit(-3.0);
+        assert!(pos > 0.85 && pos < 1.0, "pos={pos}");
+        assert!(neg < -0.85 && neg > -1.0, "neg={neg}");
     }
 }

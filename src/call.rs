@@ -2141,7 +2141,7 @@ pub fn build_pure_rust_invite_fields_with_probe(
         "srtcp": 0,
         "srtpMode": 0,
         "supportCallBusy": 1,
-        "supportHevcDecode": if crate::media::is_ffmpeg_available() { 1 } else { 0 },
+        "supportHevcDecode": 0,
         "tpType": 0,
         "video": {
             "codec": [
@@ -2215,7 +2215,7 @@ pub fn build_callee_extend_data(
         "srtcp": 0,
         "srtpMode": 0,
         "supportCallBusy": 1,
-        "supportHevcDecode": if crate::media::is_ffmpeg_available() { 1 } else { 0 },
+        "supportHevcDecode": 0,
         "tpType": 0,
         "video": {
             "codec": [
@@ -5513,5 +5513,25 @@ mod tests {
             !got_connected,
             "Call must not connect on intermediate status 5"
         );
+    }
+
+    #[test]
+    fn invite_and_callee_extend_data_disable_hevc_and_advertise_h264() {
+        let resp_401 = json!({
+            "rtpIP": "171.244.25.121:4200",
+            "rtcpIP": "171.244.25.121:4200",
+            "sessId": "sess_hevc_check"
+        });
+        let (_rtp, _rtcp, _sess, _codec, invite_ext) =
+            build_pure_rust_invite_fields_with_probe(&resp_401, true, None, None);
+        let invite_val: Value = serde_json::from_str(invite_ext.trim()).unwrap();
+        assert_eq!(invite_val["supportHevcDecode"], 0);
+        assert_eq!(invite_val["video"]["codec"][0]["name"], "h264");
+
+        let callee_ext =
+            build_callee_extend_data("171.244.25.121:4200", "171.244.25.121:4200", true, None, None);
+        let callee_val: Value = serde_json::from_str(callee_ext.trim()).unwrap();
+        assert_eq!(callee_val["supportHevcDecode"], 0);
+        assert_eq!(callee_val["video"]["codec"][0]["name"], "h264");
     }
 }

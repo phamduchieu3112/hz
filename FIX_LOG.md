@@ -186,3 +186,55 @@ Tracking completed fixes from `bug_analysis_report.md` (branch `clean-release`, 
 3. **Standard Timeline Post Types & Protocol Tab (`#156`):**
    - With a test SQLite DB containing `timeline_feed_1` / `user_feed` posts (`ZALO_TIMELINE_DB`), verify text-only posts, single photos, multi-photo albums, video cards (play badge + duration + click to open URL), link preview cards, shared/reposted cards, locations, and inline comments all render cleanly without blocking the UI thread.
    - Confirm `"Giao thức Feed (Cmd 1230)"` is hidden in normal `hz.exe --gui` mode and visible only in `hz.exe --gui --dev` with the corrected `CMD_FEED_TIMELINE = 1230` / `ERR_FEED_NO_NETWORK = 50001` explanation.
+
+---
+
+## Batch 5 — VoIP Audio/Video Reliability & Quality Fixes (`2026-11-26`)
+
+### Completed Items
+
+| Bug ID | Upstream Issue(s) | Chosen Option | Status | Summary |
+| :--- | :--- | :--- | :---: | :--- |
+| **HZ-08** | `#170` (Audio input) | **Option A** (Persistent COM audio enumerator + fault-safe cache + mid-call stream hot-reload + `F32`/`I16`/`U16`) | **Fixed** | Moved all `cpal` host enumeration and device resolution onto a process-lifetime `"hz-audio-enumerator"` thread so `cpal 0.15.3`'s WASAPI `OnceLock<Enumerator>` STA COM apartment is never torn down across short-lived scans (also wired `play_notification_chime` and `VoiceRecorder::start`); added `merge_mic_scan_result` + `catch_unwind` device name reads so transient errors or empty WASAPI glitches never wipe previously listed mics; added `list_media_devices_with_ttl` (`5s` auto-refresh in Settings and Call Overlay without blocking egui); added `MIC_SELECTION_EPOCH`, `build_call_input_stream`/`build_call_output_stream` (`F32`/`I16`/`U16` for Bluetooth HFP), and live `run_media_loop` input-stream drop/rebuild on mic switch or stream error recovery; added `--dev` `audio::mic_select`, `audio::mic_switch`, `audio::device_scan`, and `audio::voice_recorder_open` telemetry. |
+| **HZ-09** | `#170` (Incoming video) | **Option A** (Disable false HEVC negotiation + split audio/video SSRC + validated depacketizer + SPS/PPS cache + FFmpeg low-delay fix) | **Fixed** | Set `"supportHevcDecode": 0` in `build_pure_rust_invite_fields_with_probe` and `build_callee_extend_data` (`src/call.rs`) so Android/iPhone peers negotiate H.264 instead of sending undecodable HEVC; split `peer_ssrc` into `peer_audio_ssrc` and `peer_video_ssrc` (`resolve_video_feedback_ssrc`) so audio packets never hijack `PLI`/`REMB`/`RR` targets; guarded `0x0E` vs non-video/FEC payloads (`is_incoming_video_rtp`); replaced raw fragment buffers with `VideoDepacketizer` enforcing RTP `seq`/`ts` continuity, single-packet `S && E` FU-A handling, and `pli_gap` recovery on corrupt fragments; added `H264AccessUnitPreparer` to cache out-of-band SPS/PPS without splitting them from IDRs via premature `H264_AUD`; updated `spawn_ffmpeg_h264_child` & `run_local_preview_decoder` (`-fflags nobuffer -flags low_delay -threads 1 -probesize 32768 -analyzeduration 0`) and replaced the 22-AU kill loop with a 4s stall threshold + soft PLI retry; added `--dev` `video::pli_sent`, `video::keyframe`, `video::first_frame`, `video::stall`, and `video::decode_stats` telemetry. |
+| **HZ-15** | `#160` (Audio quality) | **Option A** (VoIP Opus FEC/bitrate/complexity + anti-aliased Hermite resampler + lock-free SPSC ring buffers + adaptive jitter buffer + HPF & soft limiter) | **Fixed** | Configured Opus VoIP encoder (`32 kbps` constrained VBR, `Signal::Voice`, complexity `8`, in-band FEC enabled, `10%` loss hint); replaced point-sampled mutex resampling with zero-`unsafe` lock-free SPSC `AudioRingBuffer`s and phase-continuous `AudioResampler` (2nd-order Butterworth `BiquadLpf` + 4-point Catmull-Rom Hermite across 8/16/44.1/48 kHz without 8 kHz 2× speed bugs or playback over-drain crackles, plus smooth underrun decay); added 80 Hz `HighPassFilter80Hz` and smooth `tanh` `soft_limit`; added ordered adaptive `AudioJitterBuffer` (40–80 ms adaptive target, 200 ms cap) invoking Opus LBRR FEC (`decode_float(..., true)`) and PLC (`decode_float(&[], ..., false)`) on a 20 ms playout ticker; fixed the 319-sample TX silence-injection bug and added `--dev` `audio::quality_stats` telemetry. |
+
+### Modified Files
+- `src/logger.rs` — Added `log_voip_event`, shared `push_dev_log_entry`, serialized logger tests with `TEST_LOGGER_LOCK`, and added unit test (`HZ-08`, `HZ-09`, `HZ-15`).
+- `src/call.rs` — Set `"supportHevcDecode": 0` in invite/callee `extendData` builders and added unit test (`HZ-09`).
+- `src/audio.rs` — Updated `VoiceRecorder::start()` to resolve `selected_mic_device()` via `crate::media::resolve_input_device` with `--dev` telemetry (`HZ-08`).
+- `src/gui/modals.rs` — Updated Settings Audio/Video and Call Overlay device queries to `list_media_devices_with_ttl(false, Some(Duration::from_secs(5)))` (`HZ-08`).
+- `src/media.rs` — Added persistent `"hz-audio-enumerator"`, fault-safe cache merge + TTL refresh, `MIC_SELECTION_EPOCH` live mic switching, `F32`/`I16`/`U16` stream builders, `AudioRingBuffer`, `BiquadLpf` + `AudioResampler`, `HighPassFilter80Hz`, `soft_limit`, `configure_voip_opus_encoder`, `AudioJitterBuffer`, `resolve_video_feedback_ssrc`, `is_incoming_video_rtp`, `VideoDepacketizer`, `H264AccessUnitPreparer`, FFmpeg low-delay flags + 4s stall recovery, `--dev` VoIP telemetry, and 11 new unit tests (`HZ-08`, `HZ-09`, `HZ-15`).
+
+### Verification Results
+- `cargo check --all-targets`: **PASS** (0 errors, 0 new warnings)
+- `cargo clippy --all-targets -j 2`: **PASS** (0 errors, 0 new warnings)
+- `cargo test -j 2`: **PASS** — **559 passed; 0 failed; 1 ignored** (2.24s)
+  - New tests passing (13 added in Batch 5):
+    - `logger::tests::log_voip_event_records_only_in_dev_mode`
+    - `call::tests::invite_and_callee_extend_data_disable_hevc_and_advertise_h264`
+    - `media::tests::merge_mic_scan_result_preserves_cache_on_error_and_merges_hotplug`
+    - `media::tests::pcm_integer_sample_conversions_roundtrip_accurately`
+    - `media::tests::video_feedback_ssrc_is_not_clobbered_by_audio_ssrc`
+    - `media::tests::is_incoming_video_rtp_rejects_fec_on_0x0e_and_accepts_h264`
+    - `media::tests::video_depacketizer_handles_fu_a_single_se_and_drops_seq_or_ts_breaks`
+    - `media::tests::h264_au_preparer_caches_sps_pps_without_splitting_aud_and_prepends_to_idr`
+    - `media::tests::voip_opus_encoder_config_enables_fec_bitrate_complexity_and_voice`
+    - `media::tests::audio_resampler_preserves_rate_and_sine_clarity_across_8k_44k1_48k`
+    - `media::tests::audio_ring_buffer_is_fifo_bounded_and_wraparound_safe`
+    - `media::tests::audio_jitter_buffer_reorders_invokes_fec_and_plc_and_caps_latency`
+    - `media::tests::hpf_80hz_blocks_dc_and_soft_limiter_bounds_peaks`
+
+### Windows 10/11 `--gui` Manual QA Steps
+1. **HZ-08 (`#170` Live Microphone Switching & Hot-Plug):**
+   - Launch `hz.exe --gui --dev`, open **Settings → Âm thanh & Video cuộc gọi**, and confirm built-in mics appear.
+   - Start a voice/video call on the built-in mic, then connect a Bluetooth headset (e.g., `UGREEN HiTune` HFP `I16` mode) or USB mic mid-call.
+   - Wait up to 5s (or click Refresh `⟳`) in the Call Overlay or Settings → verify **both** the built-in mic and the newly connected headset appear (unselected mics do **not** vanish).
+   - Switch between mics live during the call and test recording a Voice Message → inspect `--dev` DevTools (`VOIP` logs `audio::device_scan`, `audio::mic_switch`, `audio::voice_recorder_open`) and confirm the peer immediately hears the newly selected mic without restarting `Hz`.
+2. **HZ-09 (`#170` Incoming Video Call on Windows PC):**
+   - With `ffmpeg` installed in `PATH`, place a 1-1 video call from `hz.exe --gui --dev` to **Android** and **iPhone** (both outgoing and incoming directions).
+   - Confirm remote video renders inside the main call canvas within ~2 seconds (no black screen) alongside the local PIP preview, and stays stable when toggling remote camera off/on.
+   - Inspect `--dev` DevTools (`VOIP` logs `video::pli_sent`, `video::keyframe`, `video::first_frame`, `video::decode_stats`) and `voip.log` to verify H.264 negotiation, clean SPS/PPS caching, and `0` continuous FFmpeg restart loops.
+3. **HZ-15 (`#160` Call Audio Quality vs Official Zalo):**
+   - Run a 5-minute call on Windows 10/11 (`hz.exe --gui --dev`) using (a) a 48 kHz / 44.1 kHz built-in/USB mic and (b) an 8 kHz / 16 kHz Bluetooth HFP headset, comparing speech clarity side-by-side against official Zalo Desktop.
+   - Confirm clear voice with no metallic aliasing, no 2× chipmunk speed on 8 kHz Bluetooth, no buffer-overdrain crackles, and graceful recovery under brief Wi-Fi packet loss (`VOIP` `audio::quality_stats` showing `jb_target_ms`, `fec`, and `plc` activity).

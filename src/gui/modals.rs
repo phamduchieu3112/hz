@@ -1912,7 +1912,7 @@ impl ZaloGuiApp {
                                                 .rounding(Rounding::same(8.0))
                                                 .inner_margin(Margin::symmetric(14.0, 12.0))
                                                 .show(ui, |ui| {
-                                                    let (mics, cams, devices_scanning) = crate::media::list_media_devices_nonblocking(false);
+                                                    let (mics, cams, devices_scanning) = crate::media::list_media_devices_with_ttl(false, Some(Duration::from_secs(5)));
                                                     if devices_scanning {
                                                         ctx.request_repaint_after(Duration::from_millis(120));
                                                     }
@@ -5899,7 +5899,8 @@ impl ZaloGuiApp {
                             pill_fg,
                         );
 
-                        let (mics, cams, call_dev_scanning) = crate::media::list_media_devices_nonblocking(false);
+                        let (mics, cams, call_dev_scanning) =
+                            crate::media::list_media_devices_with_ttl(false, Some(Duration::from_secs(5)));
                         if call_dev_scanning {
                             ctx.request_repaint_after(Duration::from_millis(120));
                         }

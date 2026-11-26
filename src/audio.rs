@@ -280,14 +280,25 @@ impl Drop for VoiceRecorder {
 }
 
 impl VoiceRecorder {
-    /// Mở mic mặc định và bắt đầu thu. Lỗi (không mic / không quyền macOS /
+    /// Mở mic đã chọn (hoặc mic mặc định hệ thống) và bắt đầu thu. Lỗi (không mic / không quyền macOS /
     /// thiết bị bận) trả `Err` message thân thiện để GUI toast — không panic.
     pub fn start() -> Result<Self> {
-        use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-        let host = cpal::default_host();
-        let input_dev = host.default_input_device().ok_or_else(|| {
-            anyhow::anyhow!("Không tìm thấy micro trên máy. Hãy cắm micro rồi thử lại.")
-        })?;
+        use cpal::traits::{DeviceTrait, StreamTrait};
+        let preferred_mic = crate::media::selected_mic_device();
+        let (input_dev, actual_mic) = crate::media::resolve_input_device(&preferred_mic)
+            .map_err(|_| anyhow::anyhow!("Không tìm thấy micro trên máy. Hãy cắm micro rồi thử lại."))?;
+        crate::logger::log_voip_event(
+            "audio::voice_recorder_open",
+            &format!(
+                "preferred={} actual={actual_mic}",
+                if preferred_mic.is_empty() {
+                    "<default>"
+                } else {
+                    &preferred_mic
+                }
+            ),
+            false,
+        );
         let in_cfg = input_dev
             .default_input_config()
             .map_err(|e| mic_friendly_error("Không mở được micro", &e.to_string()))?;

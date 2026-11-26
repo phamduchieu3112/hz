@@ -176,6 +176,26 @@ pub fn log_sync(msg: &str) {
 /// and — when `--dev` is active — into the in-app DevTools log stream.
 pub fn log_sync_event(context: &str, detail: &str, is_error: bool) {
     log_sync(&format!("{context}: {detail}"));
+    push_dev_log_entry(
+        if is_error { "SYNC-ERR" } else { "SYNC" },
+        context,
+        detail,
+        is_error,
+    );
+}
+
+/// Record a structured VoIP audio/video diagnostic into the in-app `--dev` DevTools log stream.
+/// No-op in production mode (zero allocation or lock).
+pub fn log_voip_event(context: &str, detail: &str, is_error: bool) {
+    push_dev_log_entry(
+        if is_error { "VOIP-ERR" } else { "VOIP" },
+        context,
+        detail,
+        is_error,
+    );
+}
+
+fn push_dev_log_entry(method: &str, context: &str, detail: &str, is_error: bool) {
     if !is_dev_mode() {
         return;
     }
@@ -193,7 +213,7 @@ pub fn log_sync_event(context: &str, detail: &str, is_error: bool) {
         let entry = LogEntry {
             id: state.counter,
             timestamp: time_str,
-            method: if is_error { "SYNC-ERR" } else { "SYNC" }.to_string(),
+            method: method.to_string(),
             url: context.to_string(),
             status: None,
             latency_ms: 0,
@@ -383,8 +403,11 @@ pub fn append_crash_log(entry: &str) -> Option<std::path::PathBuf> {
 mod tests {
     use super::*;
 
+    static TEST_LOGGER_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn test_log_error_records_entry() {
+        let _guard = TEST_LOGGER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         init(true);
         clear_entries();
         log_error("test_context", "test_error_message");
@@ -394,6 +417,27 @@ mod tests {
         assert_eq!(last.url, "test_context");
         assert_eq!(last.error_msg.as_deref(), Some("test_error_message"));
         assert!(last.is_error);
+    }
+
+    #[test]
+    fn log_voip_event_records_only_in_dev_mode() {
+        let _guard = TEST_LOGGER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        init(false);
+        clear_entries();
+        log_voip_event("audio::mic_switch", "ignored when prod", false);
+        assert!(get_entries().is_empty());
+
+        init(true);
+        log_voip_event("audio::mic_switch", "from=A to=B", false);
+        log_voip_event("video::stall", "restarting ffmpeg", true);
+        let entries = get_entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].method, "VOIP");
+        assert_eq!(entries[0].url, "audio::mic_switch");
+        assert!(!entries[0].is_error);
+        assert_eq!(entries[1].method, "VOIP-ERR");
+        assert_eq!(entries[1].url, "video::stall");
+        assert!(entries[1].is_error);
     }
 
     #[test]
