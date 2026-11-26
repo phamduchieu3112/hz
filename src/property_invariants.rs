@@ -483,6 +483,8 @@ fn test_target_decode_max_dim_bounds_avatars_and_hd_photos() {
     assert_eq!(crate::gui::worker::target_decode_max_dim("avt_abc123"), 128);
     assert_eq!(crate::gui::worker::target_decode_max_dim("ava_abc123"), 128);
     assert_eq!(crate::gui::worker::target_decode_max_dim("hd_abc123"), 2048);
-    assert_eq!(crate::gui::worker::target_decode_max_dim("thumb_abc123"), 720);
-    assert_eq!(crate::gui::worker::target_decode_max_dim("stk_123_456"), 720);
+    assert_eq!(crate::gui::worker::target_decode_max_dim("cov_abc123"), 720);
+    assert_eq!(crate::gui::worker::target_decode_max_dim("fmed_abc123"), 720);
+    assert_eq!(crate::gui::worker::target_decode_max_dim("thumb_abc123"), 480);
+    assert_eq!(crate::gui::worker::target_decode_max_dim("stk_123_456"), 480);
 }

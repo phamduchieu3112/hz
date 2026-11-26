@@ -263,6 +263,85 @@ pub fn scan_logs() -> Vec<ScanFinding> {
     findings
 }
 
+thread_local! {
+    static PANIC_LOG_SUPPRESS_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Returns `true` when the current thread is inside [`with_suppressed_panic_log`].
+pub fn is_panic_log_suppressed() -> bool {
+    PANIC_LOG_SUPPRESS_DEPTH.with(|c| c.get() > 0)
+}
+
+/// Suppresses `crash.log` writes from the global panic hook on the current thread while `f` runs
+/// (e.g. probing potentially corrupt external font bytes inside `catch_unwind`).
+pub fn with_suppressed_panic_log<R>(f: impl FnOnce() -> R) -> R {
+    struct ResetGuard;
+    impl Drop for ResetGuard {
+        fn drop(&mut self) {
+            PANIC_LOG_SUPPRESS_DEPTH.with(|c| {
+                c.set(c.get().saturating_sub(1));
+            });
+        }
+    }
+    PANIC_LOG_SUPPRESS_DEPTH.with(|c| {
+        c.set(c.get().saturating_add(1));
+    });
+    let _guard = ResetGuard;
+    f()
+}
+
+pub(crate) fn append_crash_log_to_candidates(
+    candidates: &[std::path::PathBuf],
+    entry: &str,
+) -> Option<std::path::PathBuf> {
+    use std::io::Write;
+    for path in candidates {
+        if let Some(parent) = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+        {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            if f.write_all(entry.as_bytes()).is_ok() {
+                let _ = f.flush();
+                return Some(path.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Append a crash or fatal-startup diagnostic entry to `crash.log`, falling back to a writable
+/// per-user or temp path when the current working directory is read-only.
+pub fn append_crash_log(entry: &str) -> Option<std::path::PathBuf> {
+    let mut candidates = vec![std::path::PathBuf::from("crash.log")];
+    #[cfg(target_os = "windows")]
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        candidates.push(std::path::PathBuf::from(local).join("Hz").join("crash.log"));
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
+            candidates.push(std::path::PathBuf::from(xdg).join("hz").join("crash.log"));
+        } else if let Some(home) = std::env::var_os("HOME") {
+            candidates.push(
+                std::path::PathBuf::from(home)
+                    .join(".local")
+                    .join("share")
+                    .join("hz")
+                    .join("crash.log"),
+            );
+        }
+    }
+    candidates.push(std::env::temp_dir().join("hz-crash.log"));
+    append_crash_log_to_candidates(&candidates, entry)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,5 +357,36 @@ mod tests {
         assert_eq!(last.url, "test_context");
         assert_eq!(last.error_msg.as_deref(), Some("test_error_message"));
         assert!(last.is_error);
+    }
+
+    #[test]
+    fn append_crash_log_falls_back_to_next_writable_candidate() {
+        let dir = std::env::temp_dir().join(format!("hz_crash_log_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A directory path cannot be opened as a file, simulating an unwritable first candidate.
+        let unwritable_first = dir.clone();
+        let fallback = dir.join("nested").join("crash.log");
+        let written = append_crash_log_to_candidates(
+            &[unwritable_first, fallback.clone()],
+            "[1] TEST_ENTRY\n",
+        );
+        assert_eq!(written.as_deref(), Some(fallback.as_path()));
+        let text = std::fs::read_to_string(&fallback).unwrap();
+        assert_eq!(text, "[1] TEST_ENTRY\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn panic_log_suppression_guard_restores_on_unwind() {
+        assert!(!is_panic_log_suppressed());
+        let res = std::panic::catch_unwind(|| {
+            with_suppressed_panic_log(|| {
+                assert!(is_panic_log_suppressed());
+                panic!("expected unwind");
+            });
+        });
+        assert!(res.is_err());
+        assert!(!is_panic_log_suppressed());
     }
 }

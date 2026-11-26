@@ -7,11 +7,11 @@
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use opus::{Channels as OpusChannels, Decoder, Encoder};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::UdpSocket;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
+    atomic::{AtomicBool, AtomicU8, Ordering},
+    Arc, LazyLock, Mutex,
 };
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -28,6 +28,93 @@ static MIC_GAIN_PERCENT: std::sync::atomic::AtomicU32 = std::sync::atomic::Atomi
 static MIC_LEVEL_PERMILLE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static REMOTE_AUDIO_ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+static CALL_VIDEO_FRAMES: LazyLock<Mutex<HashMap<String, Option<eframe::egui::ColorImage>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static CALL_VIDEO_DIRTY: AtomicBool = AtomicBool::new(false);
+static FFMPEG_PROBE_STATE: AtomicU8 = AtomicU8::new(0); // 0 = unknown, 1 = missing, 2 = available
+static FFMPEG_PROBING: AtomicBool = AtomicBool::new(false);
+
+/// Publish the latest decoded video frame for `key`, coalescing any unconsumed older frame
+/// so video queues never grow unbounded when the UI renders slower than the decoder.
+pub fn publish_call_video_frame(key: &str, image: eframe::egui::ColorImage) {
+    let mut guard = CALL_VIDEO_FRAMES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    guard.insert(key.to_owned(), Some(image));
+    CALL_VIDEO_DIRTY.store(true, Ordering::Release);
+}
+
+/// Mark a call video texture slot as cleared (e.g. remote camera paused/stopped).
+pub fn clear_call_video_frame(key: &str) {
+    let mut guard = CALL_VIDEO_FRAMES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    guard.insert(key.to_owned(), None);
+    CALL_VIDEO_DIRTY.store(true, Ordering::Release);
+}
+
+/// Drop all pending call video frames (called on call teardown / app exit).
+pub fn clear_all_call_video_frames() {
+    let mut guard = CALL_VIDEO_FRAMES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    guard.clear();
+    CALL_VIDEO_DIRTY.store(false, Ordering::Release);
+}
+
+/// Drain the latest frame (or clear tombstone) per call video stream without blocking.
+pub fn drain_call_video_frames() -> Vec<(String, Option<eframe::egui::ColorImage>)> {
+    if !CALL_VIDEO_DIRTY.swap(false, Ordering::AcqRel) {
+        return Vec::new();
+    }
+    let mut guard = CALL_VIDEO_FRAMES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    guard.drain().collect()
+}
+
+/// RAII guard for external `ffmpeg` child processes: closes stdio pipes, kills the child,
+/// and performs a bounded reap loop so cameras are released and no zombie processes remain.
+struct ChildGuard(Option<std::process::Child>);
+
+impl ChildGuard {
+    fn new(child: std::process::Child) -> Self {
+        Self(Some(child))
+    }
+
+    fn take_stdin(&mut self) -> Option<std::process::ChildStdin> {
+        self.0.as_mut().and_then(|c| c.stdin.take())
+    }
+
+    fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+        self.0.as_mut().and_then(|c| c.stdout.take())
+    }
+
+    fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
+        self.0.as_mut().and_then(|c| c.stderr.take())
+    }
+
+    fn kill_and_reap(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            drop(child.stdin.take());
+            drop(child.stdout.take());
+            drop(child.stderr.take());
+            let _ = child.kill();
+            for _ in 0..50 {
+                match child.try_wait() {
+                    Ok(Some(_)) | Err(_) => break,
+                    Ok(None) => thread::sleep(Duration::from_millis(10)),
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        self.kill_and_reap();
+    }
+}
 
 /// Set real-time microphone input gain (`0..=200` percent, `100` = unity gain).
 pub fn set_mic_gain_percent(pct: u32) {
@@ -102,9 +189,38 @@ pub fn is_ffmpeg_available() -> bool {
             use std::os::windows::process::CommandExt;
             cmd.creation_flags(0x08000000);
         }
-        cmd.status().map(|s| s.success()).unwrap_or(false)
+        let ok = cmd.status().map(|s| s.success()).unwrap_or(false);
+        FFMPEG_PROBE_STATE.store(if ok { 2 } else { 1 }, Ordering::Release);
+        ok
     });
-    *FFMPEG_OK
+    let ok = *FFMPEG_OK;
+    FFMPEG_PROBE_STATE.store(if ok { 2 } else { 1 }, Ordering::Release);
+    ok
+}
+
+/// Non-blocking check for `ffmpeg` availability on the UI thread; returns `None` while the
+/// background probe is still running so the GUI never stalls spawning a subprocess.
+pub fn is_ffmpeg_available_nonblocking() -> Option<bool> {
+    match FFMPEG_PROBE_STATE.load(Ordering::Acquire) {
+        1 => return Some(false),
+        2 => return Some(true),
+        _ => {}
+    }
+    if FFMPEG_PROBING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        let spawned = std::thread::Builder::new()
+            .name("hz-ffmpeg-probe".into())
+            .spawn(|| {
+                let _ = is_ffmpeg_available();
+                FFMPEG_PROBING.store(false, Ordering::Release);
+            });
+        if spawned.is_err() {
+            FFMPEG_PROBING.store(false, Ordering::Release);
+        }
+    }
+    None
 }
 fn probe_media_devices_sync() -> (Vec<String>, Vec<String>) {
     let mut mics = Vec::new();
@@ -378,6 +494,10 @@ impl MediaHandle {
             cam_enabled,
             threads,
         })
+    }
+
+    pub fn request_stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
     }
 
     pub fn set_mic_muted(&self, muted: bool) {
@@ -1026,13 +1146,13 @@ fn spawn_camera_capture_thread(
     cam_au_tx: std::sync::mpsc::SyncSender<Vec<u8>>,
     gui_tx: Option<crate::gui::GuiTx>,
     egui_ctx: Option<eframe::egui::Context>,
-) {
+) -> JoinHandle<()> {
     thread::spawn(move || {
         use std::io::Read;
         use std::process::{Command, Stdio};
 
         let mut current_dev = String::new();
-        let mut child_opt: Option<std::process::Child> = None;
+        let mut child_opt: Option<(ChildGuard, std::process::ChildStdout)> = None;
         let mut failed_devs: Vec<String> = Vec::new();
         let mut read_buf = [0u8; 8192];
         let mut stream_acc: Vec<u8> = Vec::with_capacity(65536);
@@ -1040,17 +1160,18 @@ fn spawn_camera_capture_thread(
 
         // Optional local preview decoder (`ffmpeg` H.264 -> 240x180 RGBA)
         let (prev_tx, prev_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(15);
-        if let (Some(gtx), Some(ctx)) = (gui_tx.clone(), egui_ctx.clone()) {
+        let local_preview_handle = egui_ctx.clone().map(|ctx| {
             let stop_p = stop.clone();
             thread::spawn(move || {
-                run_local_preview_decoder(stop_p, prev_rx, gtx, ctx);
-            });
-        }
+                run_local_preview_decoder(stop_p, prev_rx, ctx);
+            })
+        });
 
         while !stop.load(Ordering::Relaxed) {
             if !cam_enabled.load(Ordering::Relaxed) {
-                if let Some(mut c) = child_opt.take() {
-                    let _ = c.kill();
+                if let Some((mut guard, stdout)) = child_opt.take() {
+                    drop(stdout);
+                    guard.kill_and_reap();
                 }
                 thread::sleep(Duration::from_millis(80));
                 continue;
@@ -1104,8 +1225,9 @@ fn spawn_camera_capture_thread(
             }
 
             if child_opt.is_none() || current_dev != desired {
-                if let Some(mut c) = child_opt.take() {
-                    let _ = c.kill();
+                if let Some((mut guard, stdout)) = child_opt.take() {
+                    drop(stdout);
+                    guard.kill_and_reap();
                 }
                 current_dev = desired.clone();
                 stream_acc.clear();
@@ -1168,12 +1290,18 @@ fn spawn_camera_capture_thread(
 
                 match cmd.spawn() {
                     Ok(c) => {
+                        let mut guard = ChildGuard::new(c);
+                        let Some(stdout) = guard.take_stdout() else {
+                            guard.kill_and_reap();
+                            thread::sleep(Duration::from_millis(250));
+                            continue;
+                        };
                         crate::voip_log::line(
                             "VCAM",
                             format!("started webcam capture: {current_dev}"),
                         );
                         let _ = want_keyframe.swap(false, Ordering::Relaxed);
-                        child_opt = Some(c);
+                        child_opt = Some((guard, stdout));
                     }
                     Err(e) => {
                         crate::voip_log::line(
@@ -1186,17 +1314,16 @@ fn spawn_camera_capture_thread(
                 }
             }
 
-            let Some(child) = &mut child_opt else {
-                continue;
+            let read_res = match &mut child_opt {
+                Some((_, stdout)) => stdout.read(&mut read_buf),
+                None => continue,
             };
-            let Some(stdout) = &mut child.stdout else {
-                child_opt = None;
-                continue;
-            };
-            match stdout.read(&mut read_buf) {
+            match read_res {
                 Ok(0) | Err(_) => {
-                    let _ = child.kill();
-                    child_opt = None;
+                    if let Some((mut guard, stdout)) = child_opt.take() {
+                        drop(stdout);
+                        guard.kill_and_reap();
+                    }
                     if stream_acc.is_empty()
                         && !current_dev.is_empty()
                         && !failed_devs.contains(&current_dev)
@@ -1235,10 +1362,15 @@ fn spawn_camera_capture_thread(
                 }
             }
         }
-        if let Some(mut c) = child_opt.take() {
-            let _ = c.kill();
+        if let Some((mut guard, stdout)) = child_opt.take() {
+            drop(stdout);
+            guard.kill_and_reap();
         }
-    });
+        drop(prev_tx);
+        if let Some(h) = local_preview_handle {
+            let _ = h.join();
+        }
+    })
 }
 
 fn find_aud_delimiter(buf: &[u8], start_from: usize) -> Option<usize> {
@@ -1447,7 +1579,6 @@ impl SrtpContext {
 fn run_local_preview_decoder(
     stop: Arc<AtomicBool>,
     rx: std::sync::mpsc::Receiver<Vec<u8>>,
-    gui_tx: crate::gui::GuiTx,
     egui_ctx: eframe::egui::Context,
 ) {
     use std::io::{Read, Write};
@@ -1492,19 +1623,18 @@ fn run_local_preview_decoder(
         cmd.creation_flags(0x08000000);
     }
 
-    let Ok(mut child) = cmd.spawn() else {
+    let Ok(child) = cmd.spawn() else {
         return;
     };
-    let Some(mut stdin) = child.stdin.take() else {
-        let _ = child.kill();
+    let mut guard = ChildGuard::new(child);
+    let Some(mut stdin) = guard.take_stdin() else {
         return;
     };
-    let Some(mut stdout) = child.stdout.take() else {
-        let _ = child.kill();
+    let Some(mut stdout) = guard.take_stdout() else {
         return;
     };
     let stop_w = stop.clone();
-    thread::spawn(move || {
+    let writer_handle = thread::spawn(move || {
         while !stop_w.load(Ordering::Relaxed) {
             match rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(au) => {
@@ -1524,16 +1654,15 @@ fn run_local_preview_decoder(
         if stdout.read_exact(&mut frame).is_ok() {
             let (cw, ch, cropped) = trim_black_borders(&frame, PREV_W, PREV_H);
             let img = eframe::egui::ColorImage::from_rgba_unmultiplied([cw, ch], &cropped);
-            let _ = gui_tx.send(crate::gui::GuiEvent::StickerImageReady {
-                key: "call_local_video".to_string(),
-                image: img,
-            });
+            publish_call_video_frame("call_local_video", img);
             egui_ctx.request_repaint();
         } else {
             break;
         }
     }
-    let _ = child.kill();
+    drop(stdout);
+    guard.kill_and_reap();
+    let _ = writer_handle.join();
 }
 
 /// Result counters of every UDP send. They used to be dropped silently (`let _ = try_send_to`) while the
@@ -1617,6 +1746,15 @@ fn extract_rtp_opus_payload(rtp: &[u8]) -> Option<&[u8]> {
     }
 }
 
+struct ExtraVideoStream {
+    ssrc: u32,
+    tex_key: String,
+    fu_a_buf: Vec<u8>,
+    tx: std::sync::mpsc::SyncSender<Vec<u8>>,
+    last_rx: Option<std::time::Instant>,
+    _handle: JoinHandle<()>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_media_loop(
     stop: Arc<AtomicBool>,
@@ -1646,26 +1784,30 @@ fn run_media_loop(
     } else {
         format!("call_remote_video_{slot_idx}")
     };
-    if let (Some(tx), Some(ctx)) = (gui_tx.clone(), egui_ctx.clone()) {
+    let primary_dec_handle = if let Some(ctx) = egui_ctx.clone() {
         let stop_v = stop.clone();
         let synced_v = video_synced.clone();
         decoder_active = true;
-        thread::spawn(move || {
-            run_h264_ffmpeg_decoder(stop_v, h264_rx, tx, ctx, synced_v, tex_key);
-        });
-    }
-    let gui_tx_extra = gui_tx.clone();
+        Some(thread::spawn(move || {
+            run_h264_ffmpeg_decoder(stop_v, h264_rx, ctx, synced_v, tex_key);
+        }))
+    } else {
+        drop(h264_rx);
+        None
+    };
     let egui_ctx_extra = egui_ctx.clone();
-    if slot_idx == 0 {
-        spawn_camera_capture_thread(
+    let cam_handle = if slot_idx == 0 {
+        Some(spawn_camera_capture_thread(
             stop.clone(),
             cam_enabled.clone(),
             want_keyframe.clone(),
-            cam_au_tx,
+            cam_au_tx.clone(),
             gui_tx,
             egui_ctx,
-        );
-    }
+        ))
+    } else {
+        None
+    };
     let mut fu_a_buf: Vec<u8> = Vec::with_capacity(65536);
     let host = cpal::default_host();
     let preferred_mic = selected_mic_device();
@@ -1873,13 +2015,7 @@ fn run_media_loop(
     let mut last_shared_cam_seq: u64 = 0;
     let mut primary_video_ssrc: u32 = 0;
     let mut last_primary_vid_rx: Option<std::time::Instant> = None;
-    let mut extra_vid_streams: Vec<(
-        u32,
-        String,
-        Vec<u8>,
-        std::sync::mpsc::SyncSender<Vec<u8>>,
-        Option<std::time::Instant>,
-    )> = Vec::new();
+    let mut extra_vid_streams: Vec<ExtraVideoStream> = Vec::new();
     let mut room_partners: Vec<u32> = Vec::new();
     let mut tx_layer_byte: u8 = 0x00;
     if partner_uid_u32 != 0 && partner_uid_u32 != from_uid_u32 {
@@ -1889,7 +2025,7 @@ fn run_media_loop(
     while !stop.load(Ordering::Relaxed) {
         // --- Capture: take 320 samples (or emit comfort-noise every 20ms so peer never sees 0kbps) ---
         let mut frame: Vec<f32> = {
-            let mut b = input_buf.lock().unwrap();
+            let mut b = input_buf.lock().unwrap_or_else(|e| e.into_inner());
             if b.len() >= FRAME_SAMPLES {
                 b.drain(0..FRAME_SAMPLES).collect()
             } else {
@@ -2408,31 +2544,30 @@ fn run_media_loop(
                     } else if slot_idx == 0 {
                         let stream_pos = extra_vid_streams
                             .iter()
-                            .position(|(ssrc, _, _, _, _)| *ssrc == pkt_ssrc);
+                            .position(|s| s.ssrc == pkt_ssrc);
                         let idx = if let Some(pos) = stream_pos {
                             Some(pos)
                         } else if extra_vid_streams.len() < 5 {
-                            if let (Some(tx), Some(ctx)) =
-                                (gui_tx_extra.clone(), egui_ctx_extra.clone())
-                            {
+                            if let Some(ctx) = egui_ctx_extra.clone() {
                                 let stream_num = extra_vid_streams.len() + 1;
                                 let tex_key = format!("call_remote_video_{stream_num}");
                                 let tex_key_cl = tex_key.clone();
                                 let (tx_n, rx_n) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
                                 let stop_vn = stop.clone();
                                 let synced_vn = Arc::new(AtomicBool::new(false));
-                                thread::spawn(move || {
+                                let handle = thread::spawn(move || {
                                     run_h264_ffmpeg_decoder(
-                                        stop_vn, rx_n, tx, ctx, synced_vn, tex_key_cl,
+                                        stop_vn, rx_n, ctx, synced_vn, tex_key_cl,
                                     );
                                 });
-                                extra_vid_streams.push((
-                                    pkt_ssrc,
+                                extra_vid_streams.push(ExtraVideoStream {
+                                    ssrc: pkt_ssrc,
                                     tex_key,
-                                    Vec::with_capacity(65536),
-                                    tx_n,
-                                    None,
-                                ));
+                                    fu_a_buf: Vec::with_capacity(65536),
+                                    tx: tx_n,
+                                    last_rx: None,
+                                    _handle: handle,
+                                });
                                 Some(extra_vid_streams.len() - 1)
                             } else {
                                 None
@@ -2442,10 +2577,9 @@ fn run_media_loop(
                         };
                         if let Some(i) = idx {
                             if let Some(payload) = dec_vid_payload.as_deref() {
-                                let (_, _, ref mut fbuf, ref tx_n, ref mut last_rx) =
-                                    extra_vid_streams[i];
-                                *last_rx = Some(std::time::Instant::now());
-                                depacketize_h264(payload, fbuf, tx_n);
+                                let stream = &mut extra_vid_streams[i];
+                                stream.last_rx = Some(std::time::Instant::now());
+                                depacketize_h264(payload, &mut stream.fu_a_buf, &stream.tx);
                             }
                         }
                     }
@@ -2456,24 +2590,24 @@ fn run_media_loop(
         if let Some(t) = last_primary_vid_rx {
             if t.elapsed() >= Duration::from_millis(1800) {
                 last_primary_vid_rx = None;
-                if let Some(ref tx) = gui_tx_extra {
-                    let pri_key = if slot_idx == 0 {
-                        "call_remote_video".to_string()
-                    } else {
-                        format!("call_remote_video_{slot_idx}")
-                    };
-                    let _ = tx.send(crate::gui::GuiEvent::StickerImageFailed { key: pri_key });
+                let pri_key = if slot_idx == 0 {
+                    "call_remote_video".to_string()
+                } else {
+                    format!("call_remote_video_{slot_idx}")
+                };
+                clear_call_video_frame(&pri_key);
+                if let Some(ref ctx) = egui_ctx_extra {
+                    ctx.request_repaint();
                 }
             }
         }
-        for (_, tex_key, _, _, last_rx) in &mut extra_vid_streams {
-            if let Some(t) = *last_rx {
+        for stream in &mut extra_vid_streams {
+            if let Some(t) = stream.last_rx {
                 if t.elapsed() >= Duration::from_millis(1800) {
-                    *last_rx = None;
-                    if let Some(ref tx) = gui_tx_extra {
-                        let _ = tx.send(crate::gui::GuiEvent::StickerImageFailed {
-                            key: tex_key.clone(),
-                        });
+                    stream.last_rx = None;
+                    clear_call_video_frame(&stream.tex_key);
+                    if let Some(ref ctx) = egui_ctx_extra {
+                        ctx.request_repaint();
                     }
                 }
             }
@@ -2559,8 +2693,23 @@ fn run_media_loop(
     }
     crate::voip_log::line("CALL", "media stop");
 
-    drop(input_stream);
-    drop(output_stream);
+    drop(h264_tx);
+    drop(cam_au_tx);
+    let extra_handles: Vec<JoinHandle<()>> = extra_vid_streams
+        .drain(..)
+        .map(|s| s._handle)
+        .collect();
+    if let Some(h) = primary_dec_handle {
+        let _ = h.join();
+    }
+    if let Some(h) = cam_handle {
+        let _ = h.join();
+    }
+    for h in extra_handles {
+        let _ = h.join();
+    }
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(input_stream)));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(output_stream)));
 }
 
 /// Reassemble RFC 6184 H.264 RTP payloads (Single NAL 1..23, STAP-A 24, FU-A 28) into Annex-B (`00 00 00 01`) byte stream.
@@ -2693,7 +2842,6 @@ fn trim_black_borders(rgba: &[u8], w: usize, h: usize) -> (usize, usize, Vec<u8>
 fn run_h264_ffmpeg_decoder(
     stop: Arc<AtomicBool>,
     h264_rx: std::sync::mpsc::Receiver<Vec<u8>>,
-    gui_tx: crate::gui::GuiTx,
     egui_ctx: eframe::egui::Context,
     synced: Arc<AtomicBool>,
     tex_key: String,
@@ -2754,19 +2902,18 @@ fn run_h264_ffmpeg_decoder(
     let decoded_counter = Arc::new(AtomicU64::new(0));
     while !stop.load(Ordering::Relaxed) {
         synced.store(false, Ordering::Relaxed);
-        let Some(mut child) = spawn_ffmpeg_h264_child() else {
+        let Some(child) = spawn_ffmpeg_h264_child() else {
             return;
         };
+        let mut child_guard = ChildGuard::new(child);
         crate::voip_log::line("VDEC", "ffmpeg decoder started");
-        let Some(mut stdin) = child.stdin.take() else {
-            let _ = child.kill();
+        let Some(mut stdin) = child_guard.take_stdin() else {
             return;
         };
-        let Some(mut stdout) = child.stdout.take() else {
-            let _ = child.kill();
+        let Some(mut stdout) = child_guard.take_stdout() else {
             return;
         };
-        if let Some(mut stderr) = child.stderr.take() {
+        let stderr_handle = child_guard.take_stderr().map(|mut stderr| {
             thread::spawn(move || {
                 let mut buf = [0u8; 512];
                 let mut lines = 0u32;
@@ -2782,11 +2929,10 @@ fn run_h264_ffmpeg_decoder(
                         );
                     }
                 }
-            });
-        }
+            })
+        });
 
         let stop_reader = stop.clone();
-        let gui_tx_r = gui_tx.clone();
         let egui_ctx_r = egui_ctx.clone();
         let tex_key_r = tex_key.clone();
         let dec_cnt_r = decoded_counter.clone();
@@ -2801,10 +2947,7 @@ fn run_h264_ffmpeg_decoder(
                     let (cw, ch, cropped) = trim_black_borders(&raw_frame, VID_W, VID_H);
                     let color_img =
                         eframe::egui::ColorImage::from_rgba_unmultiplied([cw, ch], &cropped);
-                    let _ = gui_tx_r.send(crate::gui::GuiEvent::StickerImageReady {
-                        key: tex_key_r.clone(),
-                        image: color_img,
-                    });
+                    publish_call_video_frame(&tex_key_r, color_img);
                     egui_ctx_r.request_repaint();
                 } else {
                     break;
@@ -2890,9 +3033,11 @@ fn run_h264_ffmpeg_decoder(
         }
 
         drop(stdin);
-        let _ = child.kill();
-        let _ = child.wait();
+        child_guard.kill_and_reap();
         let _ = reader_handle.join();
+        if let Some(h) = stderr_handle {
+            let _ = h.join();
+        }
         if !restart_decoder || stop.load(Ordering::Relaxed) {
             break;
         }
@@ -3438,5 +3583,53 @@ mod tests {
             "list_media_devices_nonblocking blocked UI thread for {:?}",
             t0.elapsed()
         );
+    }
+
+    #[test]
+    fn call_video_mailbox_coalesces_to_latest_frame_and_clears() {
+        clear_all_call_video_frames();
+        let first = eframe::egui::ColorImage::new([4, 4], eframe::egui::Color32::RED);
+        let second = eframe::egui::ColorImage::new([8, 6], eframe::egui::Color32::BLUE);
+        publish_call_video_frame("call_remote_video", first);
+        publish_call_video_frame("call_remote_video", second);
+
+        let drained = drain_call_video_frames();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].0, "call_remote_video");
+        assert_eq!(drained[0].1.as_ref().unwrap().size, [8, 6]);
+        assert!(drain_call_video_frames().is_empty());
+
+        clear_call_video_frame("call_remote_video");
+        let cleared = drain_call_video_frames();
+        assert_eq!(cleared.len(), 1);
+        assert!(cleared[0].1.is_none());
+    }
+
+    #[test]
+    fn child_guard_kills_and_reaps_without_zombie() {
+        #[cfg(target_os = "windows")]
+        let child = {
+            use std::os::windows::process::CommandExt;
+            std::process::Command::new("cmd")
+                .args(["/C", "timeout", "/T", "5", "/NOBREAK"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .creation_flags(0x08000000)
+                .spawn()
+        };
+        #[cfg(not(target_os = "windows"))]
+        let child = std::process::Command::new("sleep")
+            .arg("5")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+
+        if let Ok(c) = child {
+            let mut g = ChildGuard::new(c);
+            g.kill_and_reap();
+            assert!(g.0.is_none());
+        }
     }
 }

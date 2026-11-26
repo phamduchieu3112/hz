@@ -352,7 +352,7 @@ impl ResourceLru {
     }
     pub fn insert(&mut self, key: String, bytes: u64) -> Vec<String> {
         let empty = std::collections::HashSet::new();
-        self.insert_with_policy(key, bytes, &empty, false)
+        self.insert_with_policy(key, bytes, &empty, &empty, false)
     }
     /// Insert `key` (`bytes`) and evict oldest entries NOT present in `protected`
     /// until `used <= budget` (or only protected entries remain). Prevents GPU texture thrashing.
@@ -362,13 +362,25 @@ impl ResourceLru {
         bytes: u64,
         protected: &std::collections::HashSet<String>,
     ) -> Vec<String> {
-        self.insert_with_policy(key, bytes, protected, true)
+        let empty = std::collections::HashSet::new();
+        self.insert_with_policy(key, bytes, protected, &empty, true)
+    }
+    /// Insert `key` (`bytes`) protecting entries in either `protected_a` or `protected_b`.
+    pub fn insert_protecting_two(
+        &mut self,
+        key: String,
+        bytes: u64,
+        protected_a: &std::collections::HashSet<String>,
+        protected_b: &std::collections::HashSet<String>,
+    ) -> Vec<String> {
+        self.insert_with_policy(key, bytes, protected_a, protected_b, true)
     }
     fn insert_with_policy(
         &mut self,
         key: String,
         bytes: u64,
-        protected: &std::collections::HashSet<String>,
+        protected_a: &std::collections::HashSet<String>,
+        protected_b: &std::collections::HashSet<String>,
         protect_self: bool,
     ) -> Vec<String> {
         self.remove(&key);
@@ -377,10 +389,11 @@ impl ResourceLru {
         self.order.push_back(key.clone());
         let mut evicted = Vec::new();
         while self.used > self.budget {
-            let victim_idx = self
-                .order
-                .iter()
-                .position(|k| (!protect_self || k != &key) && !protected.contains(k));
+            let victim_idx = self.order.iter().position(|k| {
+                (!protect_self || k != &key)
+                    && !protected_a.contains(k)
+                    && !protected_b.contains(k)
+            });
             let Some(idx) = victim_idx else {
                 break;
             };
@@ -504,5 +517,28 @@ mod admission_and_drop_tests {
         let evicted = lru.insert("c".into(), 40);
         assert_eq!(evicted, vec!["b".to_string()]);
         assert_eq!(lru.used(), 80);
+    }
+
+    #[test]
+    fn insert_protecting_two_prevents_same_frame_batch_self_eviction() {
+        let mut lru = ResourceLru::new(100);
+        let empty = std::collections::HashSet::new();
+        assert!(lru.insert_protecting("stale_old".into(), 50, &empty).is_empty());
+
+        let mut last_frame = std::collections::HashSet::new();
+        last_frame.insert("painted_prev".to_string());
+        assert!(lru
+            .insert_protecting_two("painted_prev".into(), 40, &last_frame, &empty)
+            .is_empty());
+
+        let mut pending_paint = std::collections::HashSet::new();
+        pending_paint.insert("batch_1".to_string());
+        let ev1 = lru.insert_protecting_two("batch_1".into(), 40, &last_frame, &pending_paint);
+        assert_eq!(ev1, vec!["stale_old".to_string()]);
+
+        pending_paint.insert("batch_2".to_string());
+        let ev2 = lru.insert_protecting_two("batch_2".into(), 40, &last_frame, &pending_paint);
+        assert!(ev2.is_empty(), "same-frame batch must never self-evict: {ev2:?}");
+        assert_eq!(lru.used(), 120);
     }
 }

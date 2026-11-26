@@ -659,6 +659,10 @@ pub enum WorkerCmd {
     SwitchAccount {
         target_uin: String,
     },
+    Shutdown {
+        uin: String,
+        ack: std::sync::mpsc::SyncSender<()>,
+    },
 }
 
 pub(super) static WORKER_TX: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<WorkerCmd>> =
@@ -1249,15 +1253,14 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                     });
                 }
                 {
+                    let _ = crate::media::is_ffmpeg_available_nonblocking();
+                    let _ = crate::media::list_media_devices_nonblocking(false);
                     let s_kw = session.clone();
                     let gui_tx_kw = gui_tx.clone();
                     let ctx_kw = egui_ctx.clone();
                     tokio::spawn(async move {
                         let s = s_kw.lock().await.clone();
                         if s.login.is_some() {
-                            if let Some(tx) = WORKER_TX.get() {
-                                let _ = tx.send(WorkerCmd::RefreshThreads);
-                            }
                             if let Ok(kws) = crate::chat::fetch_sticker_suggest_keywords(&s).await {
                                 if !kws.is_empty() {
                                     let _ = gui_tx_kw
@@ -3751,7 +3754,6 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                         WorkerCmd::FetchStickerImage { key, url } => {
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
-                            let ctx_clone = egui_ctx.clone();
                             let decode_sem = media_decode_sem.clone();
                             if key.starts_with("stk_99901_") {
                                 if let Some(sid) = key
@@ -3774,7 +3776,6 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                 key,
                                                 image: color_img,
                                             });
-                                            egui_ctx.request_repaint();
                                         }
                                         continue;
                                     }
@@ -3821,7 +3822,6 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                     };
                                 let Some(bytes) = bytes_opt else {
                                     let _ = gui_tx_clone.send(GuiEvent::StickerImageFailed { key });
-                                    ctx_clone.request_repaint();
                                     return;
                                 };
 
@@ -3834,7 +3834,6 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                         // SVG không decode được bằng image crate: fail vĩnh viễn,
                                         // không xoá cache, bubble hiển thị link fallback (#5508).
                                         let _ = gui_tx_clone.send(GuiEvent::StickerImageFailed { key });
-                                        ctx_clone.request_repaint();
                                         return;
                                     }
                                     let decoded = decode_image_with_fallback(&bytes, &url);
@@ -3844,7 +3843,6 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                             let _ = std::fs::remove_file(&cache_path);
                                         }
                                         let _ = gui_tx_clone.send(GuiEvent::StickerImageFailed { key });
-                                        ctx_clone.request_repaint();
                                         return;
                                     };
                                     if from_network {
@@ -3906,7 +3904,6 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                             key,
                                             image: color_img,
                                         });
-                                        ctx_clone.request_repaint();
                                     }
                                 })
                                 .await;
@@ -5065,14 +5062,12 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                         WorkerCmd::FetchVideoThumbnail { key, url } => {
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
-                            let ctx_clone = egui_ctx.clone();
                             tokio::spawn(async move {
                                 // No ffmpeg -> no thumbnail, no crash: the bubble
                                 // keeps its fallback card below.
                                 if !crate::media::is_ffmpeg_available() {
                                     let _ = gui_tx_clone
                                         .send(GuiEvent::StickerImageFailed { key });
-                                    ctx_clone.request_repaint();
                                     return;
                                 }
                                 let bytes = {
@@ -5087,7 +5082,6 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 let Some(bytes) = bytes else {
                                     let _ = gui_tx_clone
                                         .send(GuiEvent::StickerImageFailed { key });
-                                    ctx_clone.request_repaint();
                                     return;
                                 };
                                 let frame = tokio::task::spawn_blocking(move || {
@@ -5099,7 +5093,6 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 let Some(rgba) = frame else {
                                     let _ = gui_tx_clone
                                         .send(GuiEvent::StickerImageFailed { key });
-                                    ctx_clone.request_repaint();
                                     return;
                                 };
                                 let size = [rgba.width() as usize, rgba.height() as usize];
@@ -5112,7 +5105,6 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                     key,
                                     image: color_img,
                                 });
-                                ctx_clone.request_repaint();
                             });
                         }
                         WorkerCmd::SendTyping {
@@ -5135,6 +5127,16 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 let s = session_clone.lock().await.clone();
                                 let _ = crate::chat::send_seen_v2(&s, &thread_id, is_group, &last_msg_id).await;
                             });
+                        }
+                        WorkerCmd::Shutdown { uin, ack } => {
+                            call_bridge.end_call();
+                            let _ = tokio::task::spawn_blocking(move || {
+                                let db = crate::store::db_path_for_account(&uin);
+                                let _ = crate::store::MessageStore::checkpoint_wal(&db);
+                            })
+                            .await;
+                            let _ = ack.try_send(());
+                            break;
                         }
                     }
                 }
@@ -5657,8 +5659,10 @@ pub(crate) fn target_decode_max_dim(key: &str) -> u32 {
         128
     } else if key.starts_with("hd_") {
         2048
-    } else {
+    } else if key.starts_with("cov_") || key.starts_with("fmed_") {
         720
+    } else {
+        480
     }
 }
 

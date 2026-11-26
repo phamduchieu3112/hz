@@ -581,8 +581,10 @@ impl ZaloGuiApp {
                             .clicked()
                         {
                             self.allow_quit = true;
+                            if let Some(tx) = WORKER_TX.get() {
+                                let _ = tx.send(WorkerCmd::EndCall);
+                            }
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                            std::process::exit(0);
                         }
                     });
             });
@@ -654,6 +656,10 @@ impl ZaloGuiApp {
             let elapsed_ms = popup.created_at.elapsed().as_millis() as u64;
             if elapsed_ms >= POPUP_DURATION_MS || !self.settings.enable_notifications {
                 close_popup = true;
+            } else if self.rendered_frames < 3 {
+                // Wait until the main HWND + WGL context have presented before creating any
+                // secondary immediate OpenGL viewport during startup.
+                ctx.request_repaint();
             } else {
                 const POPUP_TITLE: &str = "Hz (Hiếu's Zalo) — Tin nhắn mới";
                 ctx.request_repaint_after(Duration::from_millis(40));
@@ -681,7 +687,13 @@ impl ZaloGuiApp {
                     .avatar_url
                     .as_ref()
                     .map(|u| format!("thumb_{}", crate::crypto::md5_hex(u)))
-                    .and_then(|k| self.sticker_textures.get(&k).cloned());
+                    .and_then(|k| {
+                        let tex = self.sticker_textures.get(&k).cloned();
+                        if tex.is_some() {
+                            crate::gui::mark_texture_used(&k);
+                        }
+                        tex
+                    });
                 let logo_tex = self.app_logo_texture.clone();
                 let mut draft_local = popup.reply_draft.clone();
                 let mut paused = !draft_local.trim().is_empty();
@@ -5703,7 +5715,7 @@ impl ZaloGuiApp {
         }
         // Extract participants for Zavi SFU group call multi-tile view (tile 0 = local user `(Bạn)`, followed by remote members)
         let mut group_remotes: Vec<(String, Option<String>)> = Vec::new();
-        if call.is_group || self.sticker_textures.contains_key("call_remote_video_1") {
+        if call.is_group || self.call_textures.contains_key("call_remote_video_1") {
             let self_disp = if self.user_name.trim().is_empty() {
                 "Tôi".to_string()
             } else {
@@ -6521,7 +6533,7 @@ impl ZaloGuiApp {
                             });
                         } else {
                             let is_multi_dock = call.is_group
-                                || self.sticker_textures.contains_key("call_remote_video_1");
+                                || self.call_textures.contains_key("call_remote_video_1");
                             let dock_w = if call.is_group {
                                 320.0_f32
                             } else if is_multi_dock {
@@ -6662,11 +6674,14 @@ impl ZaloGuiApp {
                                         .clicked()
                                     {
                                         if !call.cam_enabled {
-                                            if !crate::media::is_ffmpeg_available() {
+                                            let ff_opt = crate::media::is_ffmpeg_available_nonblocking();
+                                            let (_, cams, scanning) =
+                                                crate::media::list_media_devices_nonblocking(false);
+                                            if ff_opt == Some(false) {
                                                 self.show_toast(
                                                     "⚠️ Cần cài đặt ffmpeg trong PATH để bật Camera (winget install Gyan.FFmpeg)",
                                                 );
-                                            } else if crate::media::list_media_devices(false).1.is_empty() {
+                                            } else if ff_opt == Some(true) && !scanning && cams.is_empty() {
                                                 self.show_toast(
                                                     "⚠️ Không tìm thấy thiết bị Camera nào trên máy",
                                                 );
@@ -6676,7 +6691,8 @@ impl ZaloGuiApp {
                                             }
                                         } else {
                                             call.cam_enabled = false;
-                                            self.sticker_textures.remove("call_local_video");
+                                            self.call_textures.remove("call_local_video");
+                                            crate::media::clear_call_video_frame("call_local_video");
                                         }
                                         if let Some(tx) = WORKER_TX.get() {
                                             let _ = tx.send(WorkerCmd::SetCallMediaState {
@@ -7039,7 +7055,7 @@ impl ZaloGuiApp {
                             );
 
                             let is_multi_stage =
-                                call.is_group || self.sticker_textures.contains_key("call_remote_video_1");
+                                call.is_group || self.call_textures.contains_key("call_remote_video_1");
                             if is_multi_stage {
                                 let inner = stage_rect.shrink(12.0);
                                 let per_page = compute_call_per_page(inner.width());
@@ -7063,7 +7079,7 @@ impl ZaloGuiApp {
                                         format!("call_remote_video_{}", global_idx - 1)
                                     };
                                     let a = self
-                                        .sticker_textures
+                                        .call_textures
                                         .get(&tk)
                                         .map(|t| {
                                             let s = t.size_vec2();
@@ -7157,9 +7173,9 @@ impl ZaloGuiApp {
                                     };
                                     let (ref p_name, ref p_ava) = page_remotes[idx];
                                     let show_tex = (!is_self_tile || call.cam_enabled)
-                                        && self.sticker_textures.contains_key(&tex_key);
+                                        && self.call_textures.contains_key(&tex_key);
                                     let has_vid = if show_tex {
-                                        if let Some(vtex) = self.sticker_textures.get(&tex_key) {
+                                        if let Some(vtex) = self.call_textures.get(&tex_key) {
                                             let t_inner = tile_rect.shrink(6.0);
                                             let tex_size = vtex.size_vec2();
                                             let tex_aspect = if tex_size.y > 0.0 {
@@ -7282,7 +7298,7 @@ impl ZaloGuiApp {
                                     );
                                 }
                             } else if let Some(vtex) =
-                                self.sticker_textures.get("call_remote_video")
+                                self.call_textures.get("call_remote_video")
                             {
                                 let inner = stage_rect.shrink(10.0);
                                 let tex_size = vtex.size_vec2();
@@ -7371,7 +7387,7 @@ impl ZaloGuiApp {
                                     pal.bg_elevated,
                                 );
                                 if call.cam_enabled {
-                                    if let Some(ltex) = self.sticker_textures.get("call_local_video") {
+                                    if let Some(ltex) = self.call_textures.get("call_local_video") {
                                         let inner_pip = pip_rect.shrink(2.0);
                                         let lsize = ltex.size_vec2();
                                         let laspect = if lsize.y > 0.0 {
@@ -7515,12 +7531,7 @@ impl ZaloGuiApp {
         });
 
         if retry_clicked {
-            self.sticker_textures.remove("call_remote_video");
-            self.sticker_textures.remove("call_remote_video_1");
-            self.sticker_textures.remove("call_remote_video_2");
-            self.sticker_textures.remove("call_remote_video_3");
-            self.sticker_textures.remove("call_remote_video_4");
-            self.sticker_textures.remove("call_remote_video_5");
+            self.clear_call_textures(true);
             call.error_code = None;
             call.error_reason = None;
             call.started_at = std::time::Instant::now();
@@ -7541,13 +7552,7 @@ impl ZaloGuiApp {
             self.active_call = Some(call);
         } else if hangup_clicked {
             self.active_call = None;
-            self.sticker_textures.remove("call_remote_video");
-            self.sticker_textures.remove("call_remote_video_1");
-            self.sticker_textures.remove("call_remote_video_2");
-            self.sticker_textures.remove("call_remote_video_3");
-            self.sticker_textures.remove("call_remote_video_4");
-            self.sticker_textures.remove("call_remote_video_5");
-            self.sticker_textures.remove("call_local_video");
+            self.clear_call_textures(false);
             if let Some(tx) = WORKER_TX.get() {
                 let _ = tx.send(WorkerCmd::EndCall);
             }
@@ -8334,7 +8339,14 @@ impl ZaloGuiApp {
                 .min(gallery_len.saturating_sub(half * 2 + 1));
             let end = (start + half * 2 + 1).min(gallery_len);
             (start..end)
-                .map(|i| (i, self.sticker_textures.get(&viewer.gallery[i].tex_key).cloned()))
+                .map(|i| {
+                    let key = &viewer.gallery[i].tex_key;
+                    let tex = self.sticker_textures.get(key).cloned();
+                    if tex.is_some() {
+                        crate::gui::mark_texture_used(key);
+                    }
+                    (i, tex)
+                })
                 .collect()
         } else {
             Vec::new()
@@ -8977,7 +8989,13 @@ impl ZaloGuiApp {
         let active_tex = viewer
             .thumb_key
             .as_ref()
-            .and_then(|k| self.sticker_textures.get(k))
+            .and_then(|k| {
+                let tex = self.sticker_textures.get(k);
+                if tex.is_some() {
+                    crate::gui::mark_texture_used(k);
+                }
+                tex
+            })
             .cloned();
 
         let max_stage_w = (stage_area_rect.width() - 48.0).max(160.0);
@@ -9478,6 +9496,7 @@ impl ZaloGuiApp {
                             };
                             if let Some(tkey) = thumb_key.as_deref() {
                                 if let Some(tex) = self.sticker_textures.get(tkey) {
+                                    crate::gui::mark_texture_used(tkey);
                                     ui.add(
                                         egui::Image::new(tex)
                                             .fit_to_exact_size(Vec2::new(48.0, 48.0))
@@ -10541,17 +10560,9 @@ impl ZaloGuiApp {
                     ui.set_width(col_w - 36.0);
                     if !prof.cover_url.is_empty() && !prof.cover_url.ends_with("/default") {
                         let ckey = format!("cov_{}", crate::crypto::md5_hex(&prof.cover_url));
-                        if !self.sticker_textures.contains_key(&ckey)
-                            && self.loading_stickers.insert(ckey.clone())
-                        {
-                            if let Some(tx) = WORKER_TX.get() {
-                                let _ = tx.send(WorkerCmd::FetchStickerImage {
-                                    key: ckey.clone(),
-                                    url: prof.cover_url.clone(),
-                                });
-                            }
-                        }
+                        self.request_sticker_image(ckey.clone(), prof.cover_url.clone());
                         if let Some(tex) = self.sticker_textures.get(&ckey) {
+                            crate::gui::mark_texture_used(&ckey);
                             let w = ui.available_width();
                             let resp = ui.add(
                                 egui::Image::new((tex.id(), Vec2::new(w, 180.0)))
@@ -10818,16 +10829,7 @@ impl ZaloGuiApp {
                         if media_cnt == 1 {
                             let m = &item.media_list[0];
                             let mkey = format!("fmed_{}", crate::crypto::md5_hex(&m.thumbnail));
-                            if !self.sticker_textures.contains_key(&mkey)
-                                && self.loading_stickers.insert(mkey.clone())
-                            {
-                                if let Some(tx) = WORKER_TX.get() {
-                                    let _ = tx.send(WorkerCmd::FetchStickerImage {
-                                        key: mkey.clone(),
-                                        url: m.thumbnail.clone(),
-                                    });
-                                }
-                            }
+                            self.request_sticker_image(mkey.clone(), m.thumbnail.clone());
                             let img_h = if m.width > 0 && m.height > 0 && avail_w.is_finite() {
                                 (avail_w * (m.height as f32 / m.width as f32)).clamp(200.0, 420.0)
                             } else {
@@ -10836,6 +10838,7 @@ impl ZaloGuiApp {
                             let (r, resp) =
                                 ui.allocate_exact_size(Vec2::new(avail_w, img_h), Sense::click());
                             if let Some(tex) = self.sticker_textures.get(&mkey) {
+                                crate::gui::mark_texture_used(&mkey);
                                 ui.painter().image(
                                     tex.id(),
                                     r,
@@ -10861,21 +10864,13 @@ impl ZaloGuiApp {
                                 for m in item.media_list.iter().take(6) {
                                     let mkey =
                                         format!("fmed_{}", crate::crypto::md5_hex(&m.thumbnail));
-                                    if !self.sticker_textures.contains_key(&mkey)
-                                        && self.loading_stickers.insert(mkey.clone())
-                                    {
-                                        if let Some(tx) = WORKER_TX.get() {
-                                            let _ = tx.send(WorkerCmd::FetchStickerImage {
-                                                key: mkey.clone(),
-                                                url: m.thumbnail.clone(),
-                                            });
-                                        }
-                                    }
+                                    self.request_sticker_image(mkey.clone(), m.thumbnail.clone());
                                     let (r, resp) = ui.allocate_exact_size(
                                         Vec2::new(cell_w, cell_w),
                                         Sense::click(),
                                     );
                                     if let Some(tex) = self.sticker_textures.get(&mkey) {
+                                        crate::gui::mark_texture_used(&mkey);
                                         ui.painter().image(
                                             tex.id(),
                                             r,
@@ -11068,18 +11063,10 @@ impl ZaloGuiApp {
                 ui.horizontal_wrapped(|ui| {
                     for item in &avatars_snap {
                         let tkey = format!("fava_{}", crate::crypto::md5_hex(&item.thumbnail));
-                        if !self.sticker_textures.contains_key(&tkey)
-                            && self.loading_stickers.insert(tkey.clone())
-                        {
-                            if let Some(tx) = WORKER_TX.get() {
-                                let _ = tx.send(WorkerCmd::FetchStickerImage {
-                                    key: tkey.clone(),
-                                    url: item.thumbnail.clone(),
-                                });
-                            }
-                        }
+                        self.request_sticker_image(tkey.clone(), item.thumbnail.clone());
                         let (r, resp) = ui.allocate_exact_size(Vec2::splat(130.0), Sense::click());
                         if let Some(tex) = self.sticker_textures.get(&tkey) {
+                            crate::gui::mark_texture_used(&tkey);
                             ui.painter().image(
                                 tex.id(),
                                 r,

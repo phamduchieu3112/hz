@@ -224,6 +224,16 @@ impl MessageStore {
         let _ = conn.busy_timeout(std::time::Duration::from_millis(5000));
     }
 
+    /// Checkpoint and truncate the SQLite WAL file cleanly before process exit.
+    pub fn checkpoint_wal(path: &str) -> Result<()> {
+        if path == ":memory:" || !std::path::Path::new(path).exists() {
+            return Ok(());
+        }
+        let store = Self::open_no_migrate(path)?;
+        let _ = store.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+        Ok(())
+    }
+
      /// Open SQLite database at `path` and initialize table schemas and indices if absent.
      pub fn open(path: &str) -> Result<Self> {
         let conn = if path == ":memory:" {
@@ -4495,6 +4505,43 @@ mod tests {
         );
 
         drop(st);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checkpoint_wal_truncates_cleanly_and_preserves_data() {
+        let dir = std::env::temp_dir().join(format!("hz_wal_ckpt_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("test.db");
+        let path = db_path.to_str().unwrap();
+
+        {
+            let mut st = MessageStore::open(path).unwrap();
+            st.upsert_thread(&StoredThread {
+                thread_id: "t_wal".into(),
+                name: "WAL Check".into(),
+                is_group: false,
+                last_ts: 4242,
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        MessageStore::checkpoint_wal(path).unwrap();
+
+        let reopened = MessageStore::open(path).unwrap();
+        let (tid, name): (String, String) = reopened
+            .conn
+            .query_row(
+                "SELECT thread_id, name FROM threads WHERE thread_id = ?1",
+                params!["t_wal"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(tid, "t_wal");
+        assert_eq!(name, "WAL Check");
+
+        drop(reopened);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

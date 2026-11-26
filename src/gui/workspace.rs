@@ -4531,18 +4531,10 @@ impl ZaloGuiApp {
                                                 ui.horizontal(|ui| {
                                                     ui.spacing_mut().item_spacing.x = gap;
                                                     for (tkey, thumb_u, full_u, ptitle) in chunk {
-                                                        if !self.sticker_textures.contains_key(tkey)
-                                                            && self.loading_stickers.insert(tkey.clone())
-                                                        {
-                                                            if let Some(tx) = WORKER_TX.get() {
-                                                                let _ = tx.send(
-                                                                    WorkerCmd::FetchStickerImage {
-                                                                        key: tkey.clone(),
-                                                                        url: thumb_u.clone(),
-                                                                    },
-                                                                );
-                                                            }
-                                                        }
+                                                        self.request_sticker_image(
+                                                            tkey.clone(),
+                                                            thumb_u.clone(),
+                                                        );
                                                         let (cell_r, cell_resp) = ui
                                                             .allocate_exact_size(
                                                                 Vec2::splat(cell_sz),
@@ -5908,14 +5900,15 @@ impl ZaloGuiApp {
                                         })
                                         .clicked()
                                     {
-                                        let ff_ok = crate::media::is_ffmpeg_available();
-                                        let (_, cams) = crate::media::list_media_devices(false);
-                                        let can_cam = ff_ok && !cams.is_empty();
-                                        if !ff_ok {
+                                        let ff_opt = crate::media::is_ffmpeg_available_nonblocking();
+                                        let (_, cams, scanning) =
+                                            crate::media::list_media_devices_nonblocking(false);
+                                        let can_cam = ff_opt != Some(false) && (scanning || !cams.is_empty());
+                                        if ff_opt == Some(false) {
                                             self.show_toast(
                                                 "⚠️ Không tìm thấy ffmpeg trong PATH để bật Camera (cài bằng: winget install Gyan.FFmpeg)",
                                             );
-                                        } else if cams.is_empty() {
+                                        } else if !scanning && cams.is_empty() {
                                             self.show_toast(
                                                 "⚠️ Không phát hiện thiết bị Camera trên máy — đang gọi không hình",
                                             );

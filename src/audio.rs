@@ -273,6 +273,9 @@ impl Drop for VoiceRecorder {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         clear_recorder_meter(&self.last_peak);
+        if let Some(stream) = self._stream.take() {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(stream)));
+        }
     }
 }
 

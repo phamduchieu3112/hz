@@ -7,7 +7,7 @@
 //! - Filterable conversation sidebar (`Tất cả`, `Cá nhân`, `Nhóm`), avatar badges, and grouped chat bubbles
 //! - Built-in Zalo Sticker rendering & picker (`[Nhãn dán]`)
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Duration;
 
@@ -1428,7 +1428,12 @@ impl AppSettings {
 
     fn save(&self) {
         if let Ok(json) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write("app_settings.json", json);
+            if let Err(err) = crate::data_dir::write_private_atomic(
+                std::path::Path::new("app_settings.json"),
+                json.as_bytes(),
+            ) {
+                crate::logger::log_error("gui::AppSettings::save", &err.to_string());
+            }
         }
     }
 }
@@ -1602,8 +1607,11 @@ pub struct ZaloGuiApp {
     sticker_picker_open: bool,
     sticker_tab: StickerTab,
     sticker_textures: HashMap<String, TextureHandle>,
+    call_textures: HashMap<String, TextureHandle>,
     texture_lru: crate::media_resources::ResourceLru,
     last_frame_textures: HashSet<String>,
+    pending_paint_textures: HashSet<String>,
+    deferred_sticker_ready: VecDeque<(String, egui::ColorImage)>,
     loading_stickers: HashSet<String>,
     /// Tracks sticker/avatar/thumb URLs that failed to download: `(attempts, last_failed_at)`.
     failed_stickers: HashMap<String, (u8, std::time::Instant)>,
@@ -1709,6 +1717,7 @@ pub struct ZaloGuiApp {
     doc_viewer: Option<(String, String, String)>,
     user_online_map: HashMap<String, (bool, String)>,
     allow_quit: bool,
+    rendered_frames: u64,
     settings_modal_open: bool,
     settings_tab: SettingsTab,
     notification_authorization: crate::native_notifications::AuthorizationState,
@@ -1997,8 +2006,13 @@ impl ZaloGuiApp {
             sticker_picker_open: false,
             sticker_tab: StickerTab::Popular,
             sticker_textures: HashMap::new(),
-            texture_lru: crate::media_resources::ResourceLru::new(64 * 1024 * 1024),
+            call_textures: HashMap::new(),
+            texture_lru: crate::media_resources::ResourceLru::new(
+                crate::media_resources::TEXTURE_BUDGET,
+            ),
             last_frame_textures: HashSet::new(),
+            pending_paint_textures: HashSet::new(),
+            deferred_sticker_ready: VecDeque::new(),
             loading_stickers: HashSet::new(),
             failed_stickers: HashMap::new(),
             emoji_textures: load_default_emoji_textures(&cc.egui_ctx),
@@ -2080,6 +2094,7 @@ impl ZaloGuiApp {
             doc_viewer: None,
             user_online_map: HashMap::new(),
             allow_quit: false,
+            rendered_frames: 0,
             settings_modal_open: false,
             settings_tab: SettingsTab::General,
             notification_authorization: Default::default(),
@@ -2221,6 +2236,16 @@ pub(crate) fn can_attempt_sticker_fetch(
                 && now.saturating_duration_since(last_fail) >= STICKER_RETRY_COOLDOWN
         }
     }
+}
+
+/// Returns `true` when `key` has exhausted all sticker/image fetch retries.
+pub(crate) fn is_permanently_failed_sticker_fetch(
+    failures: &HashMap<String, (u8, std::time::Instant)>,
+    key: &str,
+) -> bool {
+    failures
+        .get(key)
+        .is_some_and(|&(attempts, _)| attempts >= MAX_STICKER_FETCH_ATTEMPTS)
 }
 
 /// Records a sticker/image fetch failure with timestamp and capped attempt count.
@@ -2721,7 +2746,103 @@ impl ZaloGuiApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
     }
 
+    fn clear_call_textures(&mut self, remote_only: bool) {
+        if remote_only {
+            self.call_textures.retain(|k, _| k == "call_local_video");
+        } else {
+            self.call_textures.clear();
+            crate::media::clear_all_call_video_frames();
+        }
+    }
+
+    fn apply_call_video_frames(&mut self, ctx: &egui::Context) {
+        const MAX_CALL_VIDEO_TEXTURE_BYTES: u64 = 8 * 1024 * 1024;
+        let frames = crate::media::drain_call_video_frames();
+        if self.active_call.is_none() {
+            if !self.call_textures.is_empty() {
+                self.call_textures.clear();
+            }
+            return;
+        }
+        for (key, maybe_img) in frames {
+            let Some(image) = maybe_img else {
+                self.call_textures.remove(&key);
+                continue;
+            };
+            if let Some(existing) = self.call_textures.get_mut(&key) {
+                existing.set(image, TextureOptions::LINEAR);
+                continue;
+            }
+            let new_bytes = (image.size[0] as u64)
+                .saturating_mul(image.size[1] as u64)
+                .saturating_mul(4);
+            let mut cur_bytes: u64 = self
+                .call_textures
+                .values()
+                .map(|t| {
+                    let [w, h] = t.size();
+                    (w as u64).saturating_mul(h as u64).saturating_mul(4)
+                })
+                .sum();
+            while cur_bytes.saturating_add(new_bytes) > MAX_CALL_VIDEO_TEXTURE_BYTES {
+                let Some(evict_key) = self
+                    .call_textures
+                    .keys()
+                    .find(|k| k.as_str() != "call_local_video" && k.as_str() != "call_remote_video")
+                    .cloned()
+                else {
+                    break;
+                };
+                if let Some(evicted) = self.call_textures.remove(&evict_key) {
+                    let [w, h] = evicted.size();
+                    cur_bytes = cur_bytes
+                        .saturating_sub((w as u64).saturating_mul(h as u64).saturating_mul(4));
+                }
+            }
+            let tex = ctx.load_texture(&key, image, TextureOptions::LINEAR);
+            self.call_textures.insert(key, tex);
+        }
+    }
+
+    fn upload_sticker_texture(
+        &mut self,
+        ctx: &egui::Context,
+        key: String,
+        image: egui::ColorImage,
+    ) {
+        // Avatars and thumbnails are drawn far below their pixel size; without
+        // mipmaps the downscale aliases into a grainy image.
+        let options = TextureOptions {
+            mipmap_mode: Some(egui::TextureFilter::Linear),
+            ..TextureOptions::LINEAR
+        };
+        let bytes = (image.size[0] as u64)
+            .saturating_mul(image.size[1] as u64)
+            .saturating_mul(4);
+        self.pending_paint_textures.insert(key.clone());
+        let tex = ctx.load_texture(&key, image, options);
+        self.sticker_textures.insert(key.clone(), tex);
+        for evicted_key in self.texture_lru.insert_protecting_two(
+            key,
+            bytes,
+            &self.last_frame_textures,
+            &self.pending_paint_textures,
+        ) {
+            self.sticker_textures.remove(&evicted_key);
+        }
+    }
+
     fn check_events(&mut self, ctx: &egui::Context) {
+        const MAX_TEXTURE_UPLOADS_PER_FRAME: usize = 6;
+        self.apply_call_video_frames(ctx);
+        let mut uploads_this_frame = 0usize;
+        while uploads_this_frame < MAX_TEXTURE_UPLOADS_PER_FRAME {
+            let Some((key, image)) = self.deferred_sticker_ready.pop_front() else {
+                break;
+            };
+            self.upload_sticker_texture(ctx, key, image);
+            uploads_this_frame += 1;
+        }
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
                 GuiEvent::NotificationAuthorization { request_id, result } => {
@@ -3989,33 +4110,36 @@ impl ZaloGuiApp {
                 GuiEvent::StickerImageReady { key, image } => {
                     self.loading_stickers.remove(&key);
                     self.failed_stickers.remove(&key);
-                    // Avatars and thumbnails are drawn far below their pixel size; without
-                    // mipmaps the downscale aliases into a grainy image. Live call frames are
-                    // replaced every frame, so they skip the mipmap generation cost.
-                    let options = if key.starts_with("call_") {
-                        TextureOptions::LINEAR
-                    } else {
-                        TextureOptions {
-                            mipmap_mode: Some(egui::TextureFilter::Linear),
-                            ..TextureOptions::LINEAR
+                    if key.starts_with("call_") {
+                        if self.active_call.is_some() {
+                            if let Some(existing) = self.call_textures.get_mut(&key) {
+                                existing.set(image, TextureOptions::LINEAR);
+                            } else {
+                                let tex = ctx.load_texture(&key, image, TextureOptions::LINEAR);
+                                self.call_textures.insert(key, tex);
+                            }
                         }
-                    };
-                    let bytes = (image.size[0] as u64)
-                        .saturating_mul(image.size[1] as u64)
-                        .saturating_mul(4);
-                    let tex = ctx.load_texture(&key, image, options);
-                    self.sticker_textures.insert(key.clone(), tex);
-                    for evicted_key in
-                        self.texture_lru
-                            .insert_protecting(key, bytes, &self.last_frame_textures)
-                    {
-                        self.sticker_textures.remove(&evicted_key);
+                        continue;
+                    }
+                    if uploads_this_frame < MAX_TEXTURE_UPLOADS_PER_FRAME {
+                        self.upload_sticker_texture(ctx, key, image);
+                        uploads_this_frame += 1;
+                    } else {
+                        if let Some(slot) = self
+                            .deferred_sticker_ready
+                            .iter_mut()
+                            .find(|(k, _)| *k == key)
+                        {
+                            slot.1 = image;
+                        } else {
+                            self.deferred_sticker_ready.push_back((key, image));
+                        }
                     }
                 }
                 GuiEvent::StickerImageFailed { key } => {
                     self.loading_stickers.remove(&key);
                     if key.starts_with("call_remote_video") {
-                        self.sticker_textures.remove(&key);
+                        self.call_textures.remove(&key);
                         ctx.request_repaint();
                     } else {
                         record_sticker_fetch_failure(
@@ -4232,13 +4356,7 @@ impl ZaloGuiApp {
                             .as_ref()
                             .and_then(|c| c.error_reason.as_ref())
                             .is_some();
-                        self.sticker_textures.remove("call_remote_video");
-                        self.sticker_textures.remove("call_remote_video_1");
-                        self.sticker_textures.remove("call_remote_video_2");
-                        self.sticker_textures.remove("call_remote_video_3");
-                        self.sticker_textures.remove("call_remote_video_4");
-                        self.sticker_textures.remove("call_remote_video_5");
-                        self.sticker_textures.remove("call_local_video");
+                        self.clear_call_textures(false);
                         if !has_error {
                             self.active_call = None;
                         }
@@ -4931,6 +5049,9 @@ impl ZaloGuiApp {
                 }
             }
         }
+        if !self.deferred_sticker_ready.is_empty() {
+            ctx.request_repaint();
+        }
     }
 }
 
@@ -5016,24 +5137,48 @@ impl eframe::App for ZaloGuiApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         if !self.allow_quit {
-            use std::io::Write;
             let ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("crash.log")
-            {
-                let _ = writeln!(
-                    f,
-                    "[{ts}] UNEXPECTED_EXIT: eframe on_exit called while allow_quit=false"
-                );
-            }
+            let _ = crate::logger::append_crash_log(&format!(
+                "[{ts}] UNEXPECTED_EXIT: eframe on_exit called while allow_quit=false\n"
+            ));
         }
-        let _ = self.settings.save();
-        std::process::exit(0);
+        self.flush_group_note_pending();
+        self.settings.save();
+        self.clear_call_textures(false);
+        #[cfg(target_os = "linux")]
+        {
+            self.tray.take();
+        }
+        let uin = self.user_uin.clone();
+        if let Some(tx) = WORKER_TX.get() {
+            let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
+            if tx
+                .send(WorkerCmd::Shutdown {
+                    uin: uin.clone(),
+                    ack: ack_tx,
+                })
+                .is_ok()
+            {
+                let _ = ack_rx.recv_timeout(Duration::from_millis(1200));
+            } else {
+                let db = crate::store::db_path_for_account(&uin);
+                let _ = crate::store::MessageStore::checkpoint_wal(&db);
+            }
+        } else {
+            let db = crate::store::db_path_for_account(&uin);
+            let _ = crate::store::MessageStore::checkpoint_wal(&db);
+        }
+        // Let eframe::run_native unwind WGL/Win32 cleanly, but ensure a wedged driver
+        // teardown cannot leave a zombie background process.
+        let _ = std::thread::Builder::new()
+            .name("hz-exit-watchdog".into())
+            .spawn(|| {
+                std::thread::sleep(Duration::from_secs(2));
+                std::process::exit(0);
+            });
     }
 }
 
@@ -5100,12 +5245,16 @@ impl ZaloGuiApp {
 
         let scr_check = ctx.screen_rect();
         if scr_check.width() < 64.0 || scr_check.height() < 64.0 {
+            let pal = self.cached_palette.clone();
             if self.incoming_popup.is_some() && self.settings.enable_notifications {
-                let pal = self.cached_palette.clone();
                 self.render_toast_overlay(ctx, &pal);
+            }
+            if self.active_call.is_some() {
+                self.render_call_overlay(ctx, &pal);
             }
             return;
         }
+        self.rendered_frames = self.rendered_frames.saturating_add(1);
 
         self.ime_just_committed = false;
         let scroll_scale = self.settings.normalized_scroll_speed();
@@ -5317,6 +5466,7 @@ impl ZaloGuiApp {
             self.texture_lru.touch(k);
         }
         self.last_frame_textures = touched;
+        self.pending_paint_textures.clear();
     }
 }
 

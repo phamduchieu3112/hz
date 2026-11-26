@@ -1898,7 +1898,10 @@ pub fn save_threads_cache_for(uin: &str, threads: &[Thread]) {
             let _ = crate::data_dir::write_private_atomic(&path, text.as_bytes());
             let _ = std::fs::remove_file("threads_cache.json");
         } else {
-            let _ = std::fs::write("threads_cache.json", &text);
+            let _ = crate::data_dir::write_private_atomic(
+                std::path::Path::new("threads_cache.json"),
+                text.as_bytes(),
+            );
         }
     }
 }

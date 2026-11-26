@@ -1143,7 +1143,34 @@ impl Drop for GroupMemberLeg {
         if let Some(tx) = self.keepalive_abort.take() {
             let _ = tx.send(true);
         }
+        drop_media_async(self.media.take());
     }
+}
+
+fn drop_media_async(media: Option<crate::media::MediaHandle>) {
+    if let Some(m) = media {
+        m.request_stop();
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn_blocking(move || drop(m));
+        } else {
+            let _ = std::thread::Builder::new()
+                .name("hz-media-drop".into())
+                .spawn(move || drop(m));
+        }
+    }
+}
+
+fn drop_call_leg_async(mut leg: GroupMemberLeg) {
+    drop_media_async(leg.media.take());
+    drop(leg);
+}
+
+fn drop_call_state_async(mut st: PureRustCallState) {
+    drop_media_async(st.media.take());
+    for leg in st.extra_legs.drain(..) {
+        drop_call_leg_async(leg);
+    }
+    drop(st);
 }
 
 struct PureRustCallState {
@@ -1214,6 +1241,10 @@ impl Drop for PureRustCallState {
     fn drop(&mut self) {
         if let Some(tx) = self.keepalive_abort.take() {
             let _ = tx.send(true);
+        }
+        drop_media_async(self.media.take());
+        for leg in self.extra_legs.drain(..) {
+            drop_call_leg_async(leg);
         }
     }
 }
@@ -3223,7 +3254,7 @@ impl CallBridge {
                                             if cam_start_off {
                                                 m.set_cam_enabled(false);
                                             }
-                                            st.media = Some(m);
+                                            drop_media_async(st.media.replace(m));
                                         }
                                         Err(e) => {
                                             eprintln!("media start failed: {e}");
@@ -3241,7 +3272,11 @@ impl CallBridge {
                                 } else {
                                     let partner_id = st.thread_id.clone();
                                     let was_video = st.is_video;
-                                    *guard = None;
+                                    let old_st = guard.take();
+                                    drop(guard);
+                                    if let Some(st) = old_st {
+                                        drop_call_state_async(st);
+                                    }
                                     let _ = gui_tx_clone
                                         .send(GuiEvent::CallStateChanged("free".into()));
                                     let _ = gui_tx_clone.send(GuiEvent::MessageSent {
@@ -3254,6 +3289,8 @@ impl CallBridge {
                                         },
                                         msg_id: format!("call_{}", crate::login::unix_now()),
                                     });
+                                    ctx_clone.request_repaint();
+                                    return;
                                 }
                                 drop(guard);
                                 ctx_clone.request_repaint();
@@ -3357,7 +3394,7 @@ impl CallBridge {
                         if let Some(ref mut st) = *guard {
                             st.is_video = st.is_video || is_on_cam;
                             if st.media.is_none() && is_on_cam {
-                                st.media = crate::media::MediaHandle::start_with_sockets(
+                                let new_media = crate::media::MediaHandle::start_with_sockets(
                                     String::new(),
                                     String::new(),
                                     st.from_uid_u32,
@@ -3372,6 +3409,9 @@ impl CallBridge {
                                     Some(egui_ctx.clone()),
                                 )
                                 .ok();
+                                if let Some(m) = new_media {
+                                    drop_media_async(st.media.replace(m));
+                                }
                             }
                             if let Some(media) = &st.media {
                                 media.set_mic_muted(!is_on_mic);
@@ -3553,8 +3593,13 @@ impl CallBridge {
                             let extra_hangup: Vec<(String, i64, bool)> = st
                                 .extra_legs
                                 .drain(..)
-                                .map(|l| (l.partner_id.clone(), l.call_id, l.is_connected))
+                                .map(|mut l| {
+                                    let info = (l.partner_id.clone(), l.call_id, l.is_connected);
+                                    drop_media_async(l.media.take());
+                                    info
+                                })
                                 .collect();
+                            drop_call_state_async(st);
 
                             if !thread_id.is_empty() {
                                 let is_vid_call = matches!(
@@ -3900,7 +3945,11 @@ impl CallBridge {
                                     // Dismiss ringing on this desktop client and clean up active call resources.
                                     let is_group = st_check.is_group;
                                     eprintln!("[call] dismiss: mobile handled call {}, eff_status={}", ev_call_id, eff_status);
-                                    let _taken = guard.take();
+                                    let taken = guard.take();
+                                    drop(guard);
+                                    if let Some(st) = taken {
+                                        drop_call_state_async(st);
+                                    }
                                     dismissed_by_peer.insert(ev_call_id);
                                     let _ = gui_tx.send(GuiEvent::CallStateChanged("free".into()));
                                     let msg = if eff_status == 0 {
@@ -3955,7 +4004,7 @@ impl CallBridge {
                                                     );
                                                     let _ = rsock.try_send_to(&pkt_p, target);
                                                 }
-                                                leg.media =
+                                                let new_leg_media =
                                                     crate::media::MediaHandle::start_with_sockets(
                                                         leg.rtp_ip.clone(),
                                                         leg.rtcp_ip.clone(),
@@ -3971,6 +4020,8 @@ impl CallBridge {
                                                         Some(egui_ctx.clone()),
                                                     )
                                                     .ok();
+                                                drop_media_async(leg.media.take());
+                                                leg.media = new_leg_media;
                                                 let l_cid = leg.call_id;
                                                 let l_pid = leg.partner_id.clone();
                                                 let s_cl = s_snap.clone();
@@ -4071,7 +4122,7 @@ impl CallBridge {
                                             && st.media.is_some()
                                             && st.relay_token != 0)
                                         {
-                                            st.media = None;
+                                            drop_media_async(st.media.take());
                                             if st.is_group {
                                                 crate::media::set_group_srtp_key(
                                                     Some(st.sess_id.clone()),
@@ -4095,7 +4146,7 @@ impl CallBridge {
                                                 Some(egui_ctx.clone()),
                                             ) {
                                                 Ok(m) => {
-                                                    st.media = Some(m);
+                                                    drop_media_async(st.media.replace(m));
                                                 }
                                                 Err(e) => {
                                                     eprintln!("media start failed: {e}");
@@ -4206,6 +4257,7 @@ impl CallBridge {
                                         }
                                     }
                                     let taken = guard.take();
+                                    drop(guard);
                                     let reason = match status {
                                         1 | 2 | 3 | 4 => {
                                             "Người nhận đang bận hoặc đã từ chối cuộc gọi"
@@ -4228,6 +4280,7 @@ impl CallBridge {
                                             },
                                             msg_id: format!("call_{}", crate::login::unix_now()),
                                         });
+                                        drop_call_state_async(st);
                                     }
                                 }
                                 egui_ctx.request_repaint();
@@ -4301,15 +4354,19 @@ impl CallBridge {
                                     continue;
                                 }
                                 if let Some(idx) = extra_leg_idx {
-                                    if let Some(st) = guard.as_mut() {
-                                        st.extra_legs.remove(idx);
+                                    let removed_leg = guard.as_mut().map(|st| st.extra_legs.remove(idx));
+                                    drop(guard);
+                                    if let Some(leg) = removed_leg {
+                                        drop_call_leg_async(leg);
                                     }
                                     continue;
                                 }
                                 if let Some(st) = guard.as_mut() {
                                     if !st.extra_legs.is_empty() {
                                         st.swap_with_extra_leg(0);
-                                        st.extra_legs.remove(0);
+                                        let old_leg = st.extra_legs.remove(0);
+                                        drop(guard);
+                                        drop_call_leg_async(old_leg);
                                         continue;
                                     }
                                     if st.is_group && act == "group_end_call" {
@@ -4351,6 +4408,7 @@ impl CallBridge {
                                     }
                                 }
                                 if let Some(st) = guard.take() {
+                                    drop(guard);
                                     let duration_sec = if st.is_connected {
                                         st.started_at.elapsed().as_secs()
                                     } else {
@@ -4378,6 +4436,7 @@ impl CallBridge {
                                         text: label,
                                         msg_id: format!("call_{}", crate::login::unix_now()),
                                     });
+                                    drop_call_state_async(st);
                                 }
                                 let _ = gui_tx.send(GuiEvent::CallStateChanged("free".into()));
                                 let _ = gui_tx.send(GuiEvent::StatusUpdate(

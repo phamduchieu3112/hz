@@ -26,8 +26,96 @@ fn run_async<F: std::future::Future<Output = Result<()>>>(fut: F) -> Result<()> 
     rt.block_on(fut)
 }
 
+#[cfg(target_os = "windows")]
+fn is_cli_or_headless_args(args: &[String]) -> bool {
+    args.iter().any(|a| {
+        matches!(
+            a.as_str(),
+            "--version"
+                | "-V"
+                | "--check-update"
+                | "--print-data-dir"
+                | "--tui"
+                | "--qr"
+                | "--logout"
+                | "--mcp"
+                | "--agent"
+                | "--tg-bridge"
+                | "--api-only"
+                | "--dev"
+                | "-v"
+                | "--verbose"
+        ) || a.starts_with("--phone")
+            || a.starts_with("--auth")
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn show_windows_fatal_dialog(title: &str, body: &str) {
+    #[link(name = "user32")]
+    extern "system" {
+        fn MessageBoxW(
+            hwnd: usize,
+            text: *const u16,
+            caption: *const u16,
+            u_type: u32,
+        ) -> i32;
+    }
+    const MB_OK_ICONERROR: u32 = 0x0000_0010;
+    let to_wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
+    let text_w = to_wide(body);
+    let title_w = to_wide(title);
+    // SAFETY: both pointers are null-terminated UTF-16 buffers valid for the duration of the call.
+    unsafe {
+        let _ = MessageBoxW(0, text_w.as_ptr(), title_w.as_ptr(), MB_OK_ICONERROR);
+    }
+}
+
+fn install_early_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        if logger::is_panic_log_suppressed() {
+            return;
+        }
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let bt = std::backtrace::Backtrace::force_capture();
+        let msg = format!("[{ts}] PANIC: {info}\n{bt}\n");
+        eprint!("{msg}");
+        let _ = logger::append_crash_log(&msg);
+    }));
+}
+
 fn main() -> Result<()> {
+    install_early_panic_hook();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Err(err) = run_main(&args) {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let log_line = format!("[{ts}] FATAL_ERR: {err:#}\n");
+        let log_path = logger::append_crash_log(&log_line);
+        #[cfg(target_os = "windows")]
+        if !is_cli_or_headless_args(&args) {
+            let log_hint = log_path
+                .as_ref()
+                .map(|p| format!("\n\nNhật ký lỗi: {}", p.display()))
+                .unwrap_or_default();
+            show_windows_fatal_dialog(
+                "Hz (Hiếu's Zalo) — Lỗi khởi động",
+                &format!("Không thể khởi chạy Hz:\n{err:#}{log_hint}"),
+            );
+        }
+        #[cfg(not(target_os = "windows"))]
+        let _ = log_path;
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn run_main(args: &[String]) -> Result<()> {
     if args.iter().any(|a| a == "--version" || a == "-V") {
         println!("Hz (Hiếu's Zalo) v{}", env!("CARGO_PKG_VERSION"));
         return Ok(());
@@ -78,28 +166,11 @@ fn main() -> Result<()> {
             }
         });
     }
-    let data_path = data_dir::initialize(&args)?;
+    let data_path = data_dir::initialize(args)?;
     if args.iter().any(|a| a == "--print-data-dir") {
         println!("{}", data_path.display());
         return Ok(());
     }
-    std::panic::set_hook(Box::new(|info| {
-        use std::io::Write;
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let bt = std::backtrace::Backtrace::force_capture();
-        let msg = format!("[{ts}] PANIC: {info}\n{bt}\n");
-        eprint!("{msg}");
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("crash.log")
-        {
-            let _ = f.write_all(msg.as_bytes());
-        }
-    }));
     let dev_mode = args
         .iter()
         .any(|a| a == "--dev" || a == "-v" || a == "--verbose");
@@ -277,7 +348,7 @@ fn main() -> Result<()> {
             anyhow::bail!("--tg-bridge yêu cầu --tg-map \"<tg_chat>[/topic]:<zalo_tid>[,...]\"");
         }
         let db = store::db_path_for_account(s.login.as_ref().map(|l| l.uin.as_str()).unwrap_or(""));
-        let data_dir = data_dir::initialize(&args)?;
+        let data_dir = data_dir::initialize(args)?;
         return run_async(tg_bridge::run_bridge_loop_full(
             s,
             db,
@@ -380,21 +451,11 @@ fn main() -> Result<()> {
         )
         .map_err(|e| anyhow::anyhow!("Không thể khởi chạy GUI: {e}"));
         if let Err(ref e) = res {
-            use std::io::Write;
             let ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("crash.log")
-            {
-                let _ = writeln!(f, "[{ts}] EFRAME_EXIT_ERR: {e}");
-            }
-        }
-        if res.is_ok() {
-            std::process::exit(0);
+            let _ = logger::append_crash_log(&format!("[{ts}] EFRAME_EXIT_ERR: {e}\n"));
         }
         return res;
     }

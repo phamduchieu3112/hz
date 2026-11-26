@@ -42,6 +42,98 @@ pub(super) fn is_sticker_message(msg: &ChatMessage) -> Option<(u64, u64)> {
     None
 }
 
+fn is_cursor_near_viewport(ui: &egui::Ui, est_height: f32) -> bool {
+    let est_rect = Rect::from_min_size(
+        ui.cursor().min,
+        Vec2::new(ui.available_width().max(1.0), est_height.max(40.0)),
+    );
+    ui.clip_rect().expand(400.0).intersects(est_rect)
+}
+
+trait JsonFieldLookup {
+    fn get_field(&self, key: &str) -> Option<&serde_json::Value>;
+}
+
+impl JsonFieldLookup for serde_json::Map<String, serde_json::Value> {
+    fn get_field(&self, key: &str) -> Option<&serde_json::Value> {
+        self.get(key)
+    }
+}
+
+impl JsonFieldLookup for std::collections::BTreeMap<String, serde_json::Value> {
+    fn get_field(&self, key: &str) -> Option<&serde_json::Value> {
+        self.get(key)
+    }
+}
+
+fn parse_positive_u32_field(obj: &impl JsonFieldLookup, keys: &[&str]) -> Option<u32> {
+    for k in keys {
+        if let Some(v) = obj.get_field(k) {
+            let n = v
+                .as_u64()
+                .or_else(|| v.as_i64().filter(|&x| x > 0).map(|x| x as u64))
+                .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()));
+            if let Some(val) = n.filter(|&x| x > 0 && x <= 32_768) {
+                return Some(val as u32);
+            }
+        }
+    }
+    None
+}
+
+fn extract_dims_from_map(obj: &impl JsonFieldLookup) -> Option<(u32, u32)> {
+    if let (Some(w), Some(h)) = (
+        parse_positive_u32_field(obj, &["width", "oriWidth", "w"]),
+        parse_positive_u32_field(obj, &["height", "oriHeight", "h"]),
+    ) {
+        return Some((w, h));
+    }
+    for nested_key in ["params", "attach"] {
+        if let Some(nested) = obj.get_field(nested_key) {
+            if let Some(nested_obj) = nested.as_object() {
+                if let Some(dims) = extract_dims_from_map(nested_obj) {
+                    return Some(dims);
+                }
+            }
+            if let Some(s) = nested.as_str() {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s.trim()) {
+                    if let Some(nested_obj) = parsed.as_object() {
+                        if let Some(dims) = extract_dims_from_map(nested_obj) {
+                            return Some(dims);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+pub(crate) fn extract_wire_photo_dims(msg: &ChatMessage) -> Option<(u32, u32)> {
+    if let Some(src) = msg.history_source.as_ref().and_then(|v| v.as_object()) {
+        if let Some(dims) = extract_dims_from_map(src) {
+            return Some(dims);
+        }
+    }
+    if !msg.wire_ref.fields.is_empty() {
+        if let Some(dims) = extract_dims_from_map(&msg.wire_ref.fields) {
+            return Some(dims);
+        }
+    }
+    None
+}
+
+pub(crate) fn compute_photo_display_size(tw: usize, th: usize, max_text_width: f32) -> (f32, f32) {
+    let tw_f = tw.max(1) as f32;
+    let th_f = th.max(1) as f32;
+    let max_w = max_text_width.clamp(110.0, 360.0);
+    let max_h = 340.0_f32;
+    let scale = (max_w / tw_f).min(max_h / th_f).min(1.0);
+    let disp_w = (tw_f * scale).round().clamp(max_w.min(140.0), max_w);
+    let disp_h = (th_f * scale).round().clamp(90.0_f32.min(max_h), max_h);
+    (disp_w, disp_h)
+}
+
 pub(super) fn render_sticker_widget(
     ui: &mut egui::Ui,
     msg: &ChatMessage,
@@ -60,11 +152,27 @@ pub(super) fn render_sticker_widget(
         format!("https://api.zaloapp.com/api/emoticon/sticker/webpc?eid={sid}&size=130")
     };
 
-    crate::gui::queue_sticker_fetch(sticker_textures, loading_stickers, failed_stickers, key.clone(), url);
+    if is_cursor_near_viewport(ui, 116.0) {
+        crate::gui::queue_sticker_fetch(
+            sticker_textures,
+            loading_stickers,
+            failed_stickers,
+            key.clone(),
+            url,
+        );
+    }
 
     if let Some(tex) = sticker_textures.get(&key) {
         crate::gui::mark_texture_used(&key);
         ui.image((tex.id(), Vec2::new(116.0, 116.0)));
+        true
+    } else if !crate::gui::is_permanently_failed_sticker_fetch(failed_stickers, &key) {
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(116.0, 116.0), Sense::hover());
+        ui.painter().rect_filled(
+            rect,
+            Rounding::same(10.0),
+            ui.visuals().text_color().linear_multiply(0.05),
+        );
         true
     } else {
         false
@@ -1976,19 +2084,25 @@ pub(super) fn render_message_body(
             max_text_width,
             sticker_textures,
             loading_stickers,
+            failed_stickers,
             emoji_textures,
         );
     }
     if is_zalo_photo {
         if let Some(thumb_url) = photo_primary_url(msg) {
             let key = format!("thumb_{}", crate::crypto::md5_hex(thumb_url));
-            crate::gui::queue_sticker_fetch(
-                sticker_textures,
-                loading_stickers,
-                failed_stickers,
-                key.clone(),
-                thumb_url.to_string(),
-            );
+            let (placeholder_w, placeholder_h) = extract_wire_photo_dims(msg)
+                .map(|(w, h)| compute_photo_display_size(w as usize, h as usize, max_text_width))
+                .unwrap_or((max_text_width.min(280.0).max(110.0), 180.0));
+            if is_cursor_near_viewport(ui, placeholder_h) {
+                crate::gui::queue_sticker_fetch(
+                    sticker_textures,
+                    loading_stickers,
+                    failed_stickers,
+                    key.clone(),
+                    thumb_url.to_string(),
+                );
+            }
             let open_target = photo_open_target(msg, thumb_url);
             let title_label = msg
                 .link_title
@@ -2052,13 +2166,7 @@ pub(super) fn render_message_body(
                         let _ = open_external_url(&open_target);
                     }
                 } else {
-                    let tw_f = tw.max(1) as f32;
-                    let th_f = th.max(1) as f32;
-                    let max_w = max_text_width.min(360.0).max(110.0);
-                    let max_h = 340.0_f32;
-                    let scale = (max_w / tw_f).min(max_h / th_f).min(1.0);
-                    let disp_w = (tw_f * scale).clamp(max_w.min(140.0), max_w);
-                    let disp_h = (th_f * scale).clamp(90.0_f32.min(max_h), max_h);
+                    let (disp_w, disp_h) = compute_photo_display_size(tw, th, max_text_width);
                     let img = egui::Image::new(tex)
                         .fit_to_exact_size(Vec2::new(disp_w, disp_h))
                         .maintain_aspect_ratio(false)
@@ -2120,9 +2228,9 @@ pub(super) fn render_message_body(
                     }
                 }
             } else {
-                // Loading / Placeholder frame with visual image icon and loading feedback
-                let disp_w = max_text_width.min(280.0).max(110.0);
-                let disp_h = 150.0_f32;
+                // Loading / Placeholder frame reserving deterministic dimensions to prevent scroll jump.
+                let disp_w = placeholder_w;
+                let disp_h = placeholder_h;
                 let (rect, resp) =
                     ui.allocate_exact_size(Vec2::new(disp_w, disp_h), Sense::click());
                 let is_hover = resp.hovered();
@@ -2316,6 +2424,7 @@ pub(super) fn render_message_body(
     let link_col = pal.link_text;
 
     // Auto-enrich link metadata if title or thumbnail is missing/expired
+    let near_viewport = is_cursor_near_viewport(ui, 180.0);
     let needs_meta_enrich = msg.link_title.is_none()
         || msg.link_thumb.is_none()
         || msg
@@ -2327,7 +2436,7 @@ pub(super) fn render_message_body(
                         .contains_key(&format!("thumb_{}", crate::crypto::md5_hex(th)))
             })
             .unwrap_or(false);
-    if needs_meta_enrich {
+    if near_viewport && needs_meta_enrich {
         let meta_key = format!("linkmeta_{}", crate::crypto::md5_hex(&url));
         if loading_stickers.insert(meta_key) {
             if let Some(tx) = WORKER_TX.get() {
@@ -2343,10 +2452,11 @@ pub(super) fn render_message_body(
         ui.add_space(4.0);
     }
 
-    // 2. Optional compact thumbnail directly inside the bubble (no nested card box)
+    // 2. Compact thumbnail with deterministic pre-decode slot so link cards never jump on decode
     if let Some(thumb_url) = msg.link_thumb.as_deref().filter(|u| !u.is_empty()) {
         let key = format!("thumb_{}", crate::crypto::md5_hex(thumb_url));
-        if thumb_url.starts_with("http://") || thumb_url.starts_with("https://") {
+        if near_viewport && (thumb_url.starts_with("http://") || thumb_url.starts_with("https://"))
+        {
             crate::gui::queue_sticker_fetch(
                 sticker_textures,
                 loading_stickers,
@@ -2355,22 +2465,42 @@ pub(super) fn render_message_body(
                 thumb_url.to_string(),
             );
         }
+        let thumb_w = max_text_width.min(260.0);
+        let thumb_h = (thumb_w * (132.0 / 260.0)).clamp(72.0, 132.0);
         if let Some(tex) = sticker_textures.get(&key) {
             crate::gui::mark_texture_used(&key);
             let [tw, th] = tex.size();
-            let aspect = if tw > 0 && th > 0 {
-                (th as f32 / tw as f32).clamp(0.45, 0.85)
-            } else {
-                0.56
-            };
-            let thumb_w = max_text_width.min(260.0);
-            let img_h = (thumb_w * aspect).min(132.0);
+            let uv = cover_uv_for_box(tw as f32, th as f32, thumb_w, thumb_h);
             let img = egui::Image::new(tex)
-                .fit_to_exact_size(Vec2::new(thumb_w, img_h))
+                .uv(uv)
+                .fit_to_exact_size(Vec2::new(thumb_w, thumb_h))
+                .maintain_aspect_ratio(false)
                 .rounding(Rounding::same(6.0))
                 .sense(Sense::click());
             if ui
                 .add(img)
+                .on_hover_cursor(CursorIcon::PointingHand)
+                .on_hover_text(&url)
+                .clicked()
+            {
+                let _ = open_external_url(&url);
+            }
+            ui.add_space(5.0);
+        } else if !crate::gui::is_permanently_failed_sticker_fetch(failed_stickers, &key) {
+            let (rect, resp) =
+                ui.allocate_exact_size(Vec2::new(thumb_w, thumb_h), Sense::click());
+            ui.painter().rect_filled(
+                rect,
+                Rounding::same(6.0),
+                text_col.linear_multiply(0.05),
+            );
+            draw_icon_image(
+                ui.painter(),
+                rect.center(),
+                22.0,
+                text_col.linear_multiply(0.38),
+            );
+            if resp
                 .on_hover_cursor(CursorIcon::PointingHand)
                 .on_hover_text(&url)
                 .clicked()
@@ -2658,13 +2788,15 @@ fn render_oa_rich_card(
 
     if let Some(b_url) = banner_url {
         let key = format!("thumb_{}", crate::crypto::md5_hex(b_url));
-        crate::gui::queue_sticker_fetch(
-            sticker_textures,
-            loading_stickers,
-            failed_stickers,
-            key.clone(),
-            b_url.to_string(),
-        );
+        if is_cursor_near_viewport(ui, 160.0) {
+            crate::gui::queue_sticker_fetch(
+                sticker_textures,
+                loading_stickers,
+                failed_stickers,
+                key.clone(),
+                b_url.to_string(),
+            );
+        }
         if let Some(tex) = sticker_textures.get(&key) {
             crate::gui::mark_texture_used(&key);
             let [tw, th] = tex.size();
@@ -2895,13 +3027,15 @@ fn render_oa_rich_card(
             if show_thumb_slot {
                 if let Some(t_url) = item_thumb {
                     let tkey = format!("thumb_{}", crate::crypto::md5_hex(t_url));
-                    crate::gui::queue_sticker_fetch(
-                        sticker_textures,
-                        loading_stickers,
-                        failed_stickers,
-                        tkey.clone(),
-                        t_url.to_string(),
-                    );
+                    if is_cursor_near_viewport(ui, thumb_dim) {
+                        crate::gui::queue_sticker_fetch(
+                            sticker_textures,
+                            loading_stickers,
+                            failed_stickers,
+                            tkey.clone(),
+                            t_url.to_string(),
+                        );
+                    }
                     if let Some(tex) = sticker_textures.get(&tkey) {
                         crate::gui::mark_texture_used(&tkey);
                         let [tw, th] = tex.size();
@@ -3272,13 +3406,15 @@ fn render_image_file_card(
 
     if let Some(url) = preview_url {
         let key = format!("thumb_{}", crate::crypto::md5_hex(url));
-        crate::gui::queue_sticker_fetch(
-            sticker_textures,
-            loading_stickers,
-            failed_stickers,
-            key.clone(),
-            url.to_string(),
-        );
+        if is_cursor_near_viewport(ui, 180.0) {
+            crate::gui::queue_sticker_fetch(
+                sticker_textures,
+                loading_stickers,
+                failed_stickers,
+                key.clone(),
+                url.to_string(),
+            );
+        }
         if let Some(tex) = sticker_textures.get(&key) {
             crate::gui::mark_texture_used(&key);
             let [tw, th] = tex.size();
@@ -3407,6 +3543,33 @@ fn render_image_file_card(
                 });
                 return action;
             }
+        } else if !crate::gui::is_permanently_failed_sticker_fetch(failed_stickers, &key) {
+            let ph_w = max_text_width.min(240.0).max(110.0);
+            let ph_h = 150.0_f32;
+            let (rect, _) = ui.allocate_exact_size(Vec2::new(ph_w, ph_h), Sense::hover());
+            ui.painter().rect_filled(
+                rect,
+                Rounding::same(8.0),
+                text_col.linear_multiply(0.05),
+            );
+            draw_icon_image(
+                ui.painter(),
+                rect.center(),
+                24.0,
+                text_col.linear_multiply(0.4),
+            );
+            ui.add_space(6.0);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(truncate_chars(file_name, 42))
+                        .size(12.5)
+                        .color(text_col)
+                        .strong(),
+                )
+                .truncate(),
+            )
+            .on_hover_text(file_name);
+            return None;
         }
     }
 
@@ -3576,15 +3739,18 @@ fn render_video_card(
                 .as_deref()
                 .filter(|u| !u.is_empty() && crate::chat::is_zalo_photo_cdn_url(u))
         });
+    let near_viewport = is_cursor_near_viewport(ui, 180.0);
     if let Some(thumb_url) = thumb_url {
         let key = format!("thumb_{}", crate::crypto::md5_hex(thumb_url));
-        crate::gui::queue_sticker_fetch(
-            sticker_textures,
-            loading_stickers,
-            failed_stickers,
-            key.clone(),
-            thumb_url.to_string(),
-        );
+        if near_viewport {
+            crate::gui::queue_sticker_fetch(
+                sticker_textures,
+                loading_stickers,
+                failed_stickers,
+                key.clone(),
+                thumb_url.to_string(),
+            );
+        }
         if let Some(tex) = sticker_textures.get(&key) {
             crate::gui::mark_texture_used(&key);
             if let Some(action) = render_video_thumb_block(
@@ -3599,11 +3765,22 @@ fn render_video_card(
                 return Some(action);
             }
             return None;
+        } else if !crate::gui::is_permanently_failed_sticker_fetch(failed_stickers, &key) {
+            return render_video_loading_placeholder(ui, &title_str, text_col, max_text_width);
         }
     }
     if let Some(url) = msg.link_url.as_deref().filter(|u| !u.is_empty()) {
         let key = video_thumb_key(url);
-        if !sticker_textures.contains_key(&key) && loading_stickers.insert(key.clone()) {
+        if near_viewport
+            && !sticker_textures.contains_key(&key)
+            && !loading_stickers.contains(&key)
+            && crate::gui::can_attempt_sticker_fetch(
+                failed_stickers,
+                &key,
+                std::time::Instant::now(),
+            )
+        {
+            loading_stickers.insert(key.clone());
             if let Some(tx) = WORKER_TX.get() {
                 let _ = tx.send(WorkerCmd::FetchVideoThumbnail {
                     key: key.clone(),
@@ -3625,9 +3802,42 @@ fn render_video_card(
                 return Some(action);
             }
             return None;
+        } else if !crate::gui::is_permanently_failed_sticker_fetch(failed_stickers, &key) {
+            return render_video_loading_placeholder(ui, &title_str, text_col, max_text_width);
         }
     }
     render_video_fallback_card(ui, msg, &title_str, file_name, text_col, pal)
+}
+
+fn render_video_loading_placeholder(
+    ui: &mut egui::Ui,
+    title_str: &str,
+    text_col: Color32,
+    max_text_width: f32,
+) -> Option<BubbleAction> {
+    let thumb_w = max_text_width.min(240.0).max(120.0);
+    let img_h = 150.0_f32;
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(thumb_w, img_h), Sense::hover());
+    ui.painter().rect_filled(
+        rect,
+        Rounding::same(8.0),
+        text_col.linear_multiply(0.06),
+    );
+    ui.painter()
+        .circle_filled(rect.center(), 20.0, Color32::from_black_alpha(110));
+    draw_icon_play(
+        ui.painter(),
+        rect.center() + Vec2::new(2.0, 0.0),
+        18.0,
+        Color32::WHITE,
+    );
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new(truncate_chars(title_str, 60))
+            .size(12.5)
+            .color(text_col),
+    );
+    None
 }
 
 fn render_video_fallback_card(
@@ -4187,21 +4397,27 @@ fn album_columns(count: usize) -> usize {
     }
 }
 
-/// UV sub-rectangle that center-crops a `tw`×`th` texture to a square tile ("cover").
-fn cover_uv(tw: f32, th: f32) -> Rect {
-    if tw <= 0.0 || th <= 0.0 {
+/// UV sub-rectangle that center-crops a `tw`×`th` texture to fit a `box_w`×`box_h` slot ("cover").
+fn cover_uv_for_box(tw: f32, th: f32, box_w: f32, box_h: f32) -> Rect {
+    if tw <= 0.0 || th <= 0.0 || box_w <= 0.0 || box_h <= 0.0 {
         return Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
     }
-    let aspect = tw / th;
-    if aspect > 1.0 {
-        let span = 1.0 / aspect;
-        let start = (1.0 - span) / 2.0;
+    let tex_aspect = tw / th;
+    let box_aspect = box_w / box_h;
+    if tex_aspect > box_aspect {
+        let span = (box_aspect / tex_aspect).clamp(0.0, 1.0);
+        let start = (1.0 - span) * 0.5;
         Rect::from_min_max(Pos2::new(start, 0.0), Pos2::new(start + span, 1.0))
     } else {
-        let span = aspect;
-        let start = (1.0 - span) / 2.0;
+        let span = (tex_aspect / box_aspect).clamp(0.0, 1.0);
+        let start = (1.0 - span) * 0.5;
         Rect::from_min_max(Pos2::new(0.0, start), Pos2::new(1.0, start + span))
     }
+}
+
+/// UV sub-rectangle that center-crops a `tw`×`th` texture to a square tile ("cover").
+fn cover_uv(tw: f32, th: f32) -> Rect {
+    cover_uv_for_box(tw, th, 1.0, 1.0)
 }
 
 /// Draw an album as a grid of square, center-cropped thumbnails; clicking a tile opens it.
@@ -4215,6 +4431,7 @@ fn render_photo_album_grid(
     max_text_width: f32,
     sticker_textures: &HashMap<String, TextureHandle>,
     loading_stickers: &mut HashSet<String>,
+    failed_stickers: &HashMap<String, (u8, std::time::Instant)>,
     emoji_textures: &HashMap<String, TextureHandle>,
 ) -> Option<BubbleAction> {
     let mut action = None;
@@ -4227,19 +4444,21 @@ fn render_photo_album_grid(
 
     ui.spacing_mut().item_spacing = Vec2::splat(gap);
     for row in members.chunks(cols) {
+        let row_near_viewport = is_cursor_near_viewport(ui, tile);
         ui.horizontal(|ui| {
             for &(member_idx, m) in row {
                 let Some(thumb_url) = photo_primary_url(m) else {
                     continue;
                 };
                 let key = format!("thumb_{}", crate::crypto::md5_hex(thumb_url));
-                if !sticker_textures.contains_key(&key) && loading_stickers.insert(key.clone()) {
-                    if let Some(tx) = WORKER_TX.get() {
-                        let _ = tx.send(WorkerCmd::FetchStickerImage {
-                            key: key.clone(),
-                            url: thumb_url.to_string(),
-                        });
-                    }
+                if row_near_viewport {
+                    crate::gui::queue_sticker_fetch(
+                        sticker_textures,
+                        loading_stickers,
+                        failed_stickers,
+                        key.clone(),
+                        thumb_url.to_string(),
+                    );
                 }
                 let open_target = m
                     .link_url
@@ -4554,13 +4773,10 @@ pub(super) fn render_chat_bubble(
             if tw <= 2 || th <= 2 {
                 max_text_width.min(260.0).max(110.0)
             } else {
-                let tw_f = tw as f32;
-                let th_f = th as f32;
-                let max_w = max_text_width.min(360.0).max(110.0);
-                let max_h = 340.0_f32;
-                let scale = (max_w / tw_f).min(max_h / th_f).min(1.0);
-                (tw_f * scale).clamp(max_w.min(140.0), max_w).ceil()
+                compute_photo_display_size(tw, th, max_text_width).0
             }
+        } else if let Some((w, h)) = extract_wire_photo_dims(msg) {
+            compute_photo_display_size(w as usize, h as usize, max_text_width).0
         } else {
             max_text_width.min(280.0).max(110.0)
         };
@@ -4602,18 +4818,24 @@ pub(super) fn render_chat_bubble(
                                 || crate::chat::is_zalo_photo_cdn_url(u))
                     })
                 });
-            let key = thumb_url
-                .map(|u| format!("thumb_{}", crate::crypto::md5_hex(u)))
-                .or_else(|| {
-                    msg.link_url
-                        .as_deref()
-                        .filter(|u| !u.is_empty())
-                        .map(video_thumb_key)
-                });
-            key.and_then(|k| sticker_textures.get(&k)).map(|tex| {
+            let (key, has_visual_source) = if let Some(u) = thumb_url {
+                (format!("thumb_{}", crate::crypto::md5_hex(u)), true)
+            } else if let Some(u) = msg.link_url.as_deref().filter(|u| !u.is_empty()) {
+                (video_thumb_key(u), att_kind == Some(AttachmentKind::Video))
+            } else {
+                (String::new(), false)
+            };
+            if let Some(tex) = (!key.is_empty()).then(|| sticker_textures.get(&key)).flatten() {
+                crate::gui::mark_texture_used(&key);
                 let [tw, th] = tex.size();
-                compute_video_thumb_size(tw, th, max_text_width)
-            })
+                Some(compute_video_thumb_size(tw, th, max_text_width))
+            } else if has_visual_source
+                && !crate::gui::is_permanently_failed_sticker_fetch(failed_stickers, &key)
+            {
+                Some((max_text_width.min(240.0).max(120.0), 150.0))
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -4625,13 +4847,16 @@ pub(super) fn render_chat_bubble(
             };
             vw.max(min_att_w).min(max_text_width)
         } else {
-            let has_loaded_thumb = msg
+            let has_thumb_slot = msg
                 .link_thumb
                 .as_deref()
                 .filter(|u| !u.is_empty())
-                .map(|u| sticker_textures.contains_key(&format!("thumb_{}", crate::crypto::md5_hex(u))))
-                .unwrap_or(false);
-            if has_loaded_thumb {
+                .is_some_and(|u| {
+                    let k = format!("thumb_{}", crate::crypto::md5_hex(u));
+                    sticker_textures.contains_key(&k)
+                        || !crate::gui::is_permanently_failed_sticker_fetch(failed_stickers, &k)
+                });
+            if has_thumb_slot {
                 max_text_width.min(260.0)
             } else {
                 let (cap, url, dom) = extract_message_link_view(msg).unwrap_or_default();
@@ -6778,6 +7003,7 @@ mod album_grid_tests {
                             &HashMap::new(),
                             &mut HashSet::new(),
                             &HashMap::new(),
+                            &HashMap::new(),
                         );
                         // Three 98 pt tiles with 3 pt gaps; aim at the middle of the second.
                         second_tile = Some(origin + Vec2::new(98.0 + 3.0 + 49.0, 49.0));
@@ -7568,5 +7794,21 @@ mod md_block_tests {
                 assert!(matched, "unoccluded double-click should trigger reply without deadlocking");
             }
         }
+    }
+
+    #[test]
+    fn extract_wire_photo_dims_and_display_size_match_pre_and_post_decode() {
+        let msg = ChatMessage {
+            history_source: Some(serde_json::json!({
+                "params": "{\"width\":1200,\"height\":800}"
+            })),
+            ..Default::default()
+        };
+        let (w, h) = extract_wire_photo_dims(&msg).expect("wire photo dims");
+        assert_eq!((w, h), (1200, 800));
+        let pre = compute_photo_display_size(w as usize, h as usize, 420.0);
+        // Decoded thumbnail downscaled to 480x320 has identical aspect ratio -> identical box.
+        let post = compute_photo_display_size(480, 320, 420.0);
+        assert_eq!(pre, post);
     }
 }

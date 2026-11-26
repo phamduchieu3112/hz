@@ -1485,6 +1485,58 @@ pub(super) fn setup_custom_fonts(ctx: &egui::Context) {
     setup_custom_fonts_with_choice(ctx, "default");
 }
 
+pub(super) fn validate_font_bytes(bytes: &[u8]) -> bool {
+    if bytes.len() < 12 {
+        return false;
+    }
+    let tag = &bytes[..4];
+    let valid_magic = tag == [0, 1, 0, 0] || tag == b"true" || tag == b"OTTO" || tag == b"ttcf";
+    if !valid_magic {
+        return false;
+    }
+    let owned = bytes.to_vec();
+    crate::logger::with_suppressed_panic_log(|| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut defs = egui::FontDefinitions::default();
+            defs.font_data
+                .insert("probe".to_owned(), egui::FontData::from_owned(owned));
+            defs.families
+                .entry(egui::FontFamily::Proportional)
+                .or_default()
+                .insert(0, "probe".to_owned());
+            let probe_ctx = egui::Context::default();
+            probe_ctx.set_fonts(defs);
+            let _ = probe_ctx.run(egui::RawInput::default(), |ctx| {
+                ctx.fonts(|f| {
+                    let _ = f.glyph_width(&egui::FontId::proportional(14.0), 'A');
+                });
+            });
+        }))
+        .is_ok()
+    })
+}
+
+fn try_insert_validated_font(
+    fonts: &mut egui::FontDefinitions,
+    slot: &str,
+    path: &str,
+) -> bool {
+    let Ok(font_data) = std::fs::read(path) else {
+        return false;
+    };
+    if !validate_font_bytes(&font_data) {
+        crate::logger::log_error(
+            "gui::theme::build_fonts",
+            &format!("Bỏ qua font lỗi hoặc không hợp lệ: {path}"),
+        );
+        return false;
+    }
+    fonts
+        .font_data
+        .insert(slot.to_owned(), egui::FontData::from_owned(font_data));
+    true
+}
+
 pub(super) fn build_fonts(ctx: &egui::Context, font_choice: &str, with_cjk: bool) {
     let mut fonts = egui::FontDefinitions::default();
 
@@ -1519,11 +1571,7 @@ pub(super) fn build_fonts(ctx: &egui::Context, font_choice: &str, with_cjk: bool
                 "/usr/share/fonts/truetype/segoeui.ttf",
             ];
             for path in candidates {
-                if let Ok(font_data) = std::fs::read(path) {
-                    fonts.font_data.insert(
-                        "selected_font".to_owned(),
-                        egui::FontData::from_owned(font_data),
-                    );
+                if try_insert_validated_font(&mut fonts, "selected_font", path) {
                     selected_font_loaded = true;
                     break;
                 }
@@ -1538,11 +1586,7 @@ pub(super) fn build_fonts(ctx: &egui::Context, font_choice: &str, with_cjk: bool
                 "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
             ];
             for path in candidates {
-                if let Ok(font_data) = std::fs::read(path) {
-                    fonts.font_data.insert(
-                        "selected_font".to_owned(),
-                        egui::FontData::from_owned(font_data),
-                    );
+                if try_insert_validated_font(&mut fonts, "selected_font", path) {
                     selected_font_loaded = true;
                     break;
                 }
@@ -1554,11 +1598,7 @@ pub(super) fn build_fonts(ctx: &egui::Context, font_choice: &str, with_cjk: bool
                 "/System/Library/Fonts/Supplemental/Tahoma.ttf",
             ];
             for path in candidates {
-                if let Ok(font_data) = std::fs::read(path) {
-                    fonts.font_data.insert(
-                        "selected_font".to_owned(),
-                        egui::FontData::from_owned(font_data),
-                    );
+                if try_insert_validated_font(&mut fonts, "selected_font", path) {
                     selected_font_loaded = true;
                     break;
                 }
@@ -1583,11 +1623,7 @@ pub(super) fn build_fonts(ctx: &egui::Context, font_choice: &str, with_cjk: bool
             // Uses bundled_sans directly at priority index 0
         }
         _custom_path => {
-            if let Ok(font_data) = std::fs::read(font_choice.trim()) {
-                fonts.font_data.insert(
-                    "selected_font".to_owned(),
-                    egui::FontData::from_owned(font_data),
-                );
+            if try_insert_validated_font(&mut fonts, "selected_font", font_choice.trim()) {
                 selected_font_loaded = true;
             }
         }
@@ -1612,11 +1648,7 @@ pub(super) fn build_fonts(ctx: &egui::Context, font_choice: &str, with_cjk: bool
     ];
 
     for path in font_candidates {
-        if let Ok(font_data) = std::fs::read(path) {
-            fonts.font_data.insert(
-                "vietnamese_font".to_owned(),
-                egui::FontData::from_owned(font_data),
-            );
+        if try_insert_validated_font(&mut fonts, "vietnamese_font", path) {
             break;
         }
     }
@@ -1635,10 +1667,7 @@ pub(super) fn build_fonts(ctx: &egui::Context, font_choice: &str, with_cjk: bool
         "/usr/share/fonts/wqy-zenhei/wqy-zenhei.ttc",
     ];
     for path in cjk_candidates.into_iter().filter(|_| with_cjk) {
-        if let Ok(font_data) = std::fs::read(path) {
-            fonts
-                .font_data
-                .insert("cjk_font".to_owned(), egui::FontData::from_owned(font_data));
+        if try_insert_validated_font(&mut fonts, "cjk_font", path) {
             break;
         }
     }
@@ -1844,5 +1873,25 @@ mod tests {
         assert_eq!(light_style.visuals.extreme_bg_color, light.bg_input);
         assert_eq!(light_style.visuals.widgets.inactive.weak_bg_fill, light.bg_elevated);
         assert_eq!(light_style.visuals.panel_fill, light.bg_app);
+    }
+
+    #[test]
+    fn validate_font_bytes_rejects_corrupt_and_accepts_bundled_ttf() {
+        assert!(!validate_font_bytes(&[]));
+        assert!(!validate_font_bytes(b"not a font file"));
+        assert!(!validate_font_bytes(&[0, 1, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9]));
+        let bundled: &[u8] = include_bytes!("../assets/fonts/BeVietnamPro-Regular.ttf");
+        assert!(validate_font_bytes(bundled));
+
+        // Corrupt custom font path must fall back cleanly without panicking.
+        let dir = std::env::temp_dir().join(format!("hz_corrupt_font_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bad_path = dir.join("broken.ttf");
+        std::fs::write(&bad_path, b"\x00\x01\x00\x00corrupt-table-bytes").unwrap();
+        let ctx = egui::Context::default();
+        build_fonts(&ctx, bad_path.to_str().unwrap(), false);
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

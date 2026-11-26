@@ -1158,6 +1158,7 @@ impl ZaloGuiApp {
                                             Vec2::splat(44.0),
                                         );
                                         if let Some(tex) = self.sticker_textures.get(&icon_key) {
+                                            crate::gui::mark_texture_used(&icon_key);
                                             ui.painter().image(
                                                 tex.id(),
                                                 ic_rect,
@@ -1436,6 +1437,7 @@ impl ZaloGuiApp {
                         }
 
                         if let Some(tex) = self.sticker_textures.get(&key) {
+                            crate::gui::mark_texture_used(&key);
                             let img_rect = cell_rect.shrink(4.0);
                             ui.painter().image(
                                 tex.id(),
@@ -1724,6 +1726,7 @@ impl ZaloGuiApp {
                                             }
 
                                             if let Some(tex) = self.sticker_textures.get(&key) {
+                                                crate::gui::mark_texture_used(&key);
                                                 let [tw, th] = tex.size();
                                                 let tw_f = (tw.max(1)) as f32;
                                                 let th_f = (th.max(1)) as f32;
