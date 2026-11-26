@@ -7627,7 +7627,7 @@ impl ZaloGuiApp {
                         if !query.is_empty()
                             && ui
                                 .add(egui::Button::new(
-                                    RichText::new("✕").size(11.5).color(pal.text_muted),
+                                    RichText::new(lucide::X).size(11.5).color(pal.text_muted),
                                 ))
                                 .on_hover_text("Xoá tìm kiếm")
                                 .clicked()
@@ -9153,7 +9153,7 @@ impl ZaloGuiApp {
 
                                 // Close button [Esc]
                                 let close_dock_btn = egui::Button::new(
-                                    RichText::new("✕ Đóng")
+                                    RichText::new(format!("{} Đóng", lucide::X))
                                         .size(11.8)
                                         .color(pal.text_secondary),
                                 )

@@ -1627,6 +1627,8 @@ pub struct ParsedProtoQuote {
     pub cli_msg_id: u64,
     pub global_msg_id: String,
     pub msg: String,
+    pub cli_msg_type: i32,
+    pub attach: String,
 }
 
 #[derive(Debug, Default)]
@@ -1723,8 +1725,10 @@ fn parse_proto_quote(buf: &[u8]) -> Option<ParsedProtoQuote> {
             0 => {
                 let (val, next) = parse_vli(buf, offset)?;
                 offset = next;
-                if field_num == 5 {
-                    q.cli_msg_id = val;
+                match field_num {
+                    1 => q.cli_msg_type = val as i32,
+                    5 => q.cli_msg_id = val,
+                    _ => {}
                 }
             }
             2 => {
@@ -1741,6 +1745,7 @@ fn parse_proto_quote(buf: &[u8]) -> Option<ParsedProtoQuote> {
                     4 => q.from_d = s,
                     6 => q.global_msg_id = s,
                     7 => q.msg = s,
+                    8 => q.attach = s,
                     _ => {}
                 }
             }
@@ -2635,8 +2640,19 @@ fn decode_sync_v2_proto_message(
         if !q.from_d.is_empty() {
             raw_meta.insert("reply_to_sender".into(), serde_json::json!(q.from_d));
         }
-        if !q.msg.is_empty() {
-            raw_meta.insert("reply_to_text".into(), serde_json::json!(q.msg));
+        let parsed_attach: Option<serde_json::Value> = if !q.attach.trim().is_empty() {
+            serde_json::from_str(&q.attach).ok()
+        } else {
+            None
+        };
+        let q_cli_type = (q.cli_msg_type > 0).then_some(q.cli_msg_type as i64);
+        if let Some(preview) = crate::chat::format_quote_preview(
+            Some(&q.msg),
+            q_cli_type,
+            None,
+            parsed_attach.as_ref(),
+        ) {
+            raw_meta.insert("reply_to_text".into(), serde_json::json!(preview));
         }
     }
 
@@ -3219,5 +3235,60 @@ mod tests {
         reset_sync_v2_imported_count();
         assert!(!is_sync_v2_last_seen());
         assert_eq!(sync_v2_inflight_count(), 0);
+    }
+
+    #[test]
+    fn sync_v2_proto_quote_labels_captionless_and_captioned_image() {
+        let captionless = decode_sync_v2_proto_message(
+            ParsedProtoMsg {
+                sender_id: "1001".into(),
+                global_id: "q_img_1".into(),
+                msg_type: 1,
+                timestamp: 1_795_306_210_316,
+                content: "Mọi người xem ảnh trên nhé".into(),
+                quote: Some(ParsedProtoQuote {
+                    from_d: "Anh Khoa".into(),
+                    global_msg_id: "orig_img_1".into(),
+                    cli_msg_type: 32,
+                    msg: String::new(),
+                    attach: r#"{"thumb":"https://cdn.zalo.me/t.jpg"}"#.into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            "1001",
+            "me_99",
+            "Tôi",
+            "Anh Khoa",
+        );
+        let meta: serde_json::Value =
+            serde_json::from_str(&captionless.raw_json).expect("valid raw_json");
+        assert_eq!(meta["reply_to_text"], "[Hình ảnh]");
+        assert_eq!(meta["reply_to_sender"], "Anh Khoa");
+
+        let captioned = decode_sync_v2_proto_message(
+            ParsedProtoMsg {
+                sender_id: "1001".into(),
+                global_id: "q_img_2".into(),
+                msg_type: 1,
+                timestamp: 1_795_306_210_500,
+                content: "OK bạn".into(),
+                quote: Some(ParsedProtoQuote {
+                    from_d: "Anh Khoa".into(),
+                    global_msg_id: "orig_img_2".into(),
+                    cli_msg_type: 32,
+                    msg: "Hóa đơn".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            "1001",
+            "me_99",
+            "Tôi",
+            "Anh Khoa",
+        );
+        let meta2: serde_json::Value =
+            serde_json::from_str(&captioned.raw_json).expect("valid raw_json");
+        assert_eq!(meta2["reply_to_text"], "[Hình ảnh] Hóa đơn");
     }
 }

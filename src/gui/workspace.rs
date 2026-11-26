@@ -4279,7 +4279,7 @@ impl ZaloGuiApp {
                                                     if ui
                                                         .add(
                                                             egui::Button::new(
-                                                                RichText::new("✕")
+                                                                RichText::new(lucide::X)
                                                                     .size(10.5)
                                                                     .color(pal.text_muted),
                                                             )
@@ -7849,11 +7849,11 @@ impl ZaloGuiApp {
                                                     .color(pal.primary)
                                                     .strong(),
                                             );
-                                            let preview = if q.sticker_id.is_some() {
-                                                "[Nhãn dán]".to_string()
-                                            } else {
-                                                truncate_chars(&q.text, 100).into_owned()
-                                            };
+                                            let preview = truncate_chars(
+                                                &crate::chat::format_message_quote_preview(q),
+                                                100,
+                                            )
+                                            .into_owned();
                                             ui.label(
                                                 RichText::new(preview)
                                                     .size(12.0)
@@ -9697,7 +9697,7 @@ impl ZaloGuiApp {
                     if ui
                         .add(
                             egui::Button::new(
-                                RichText::new("✕").size(10.5).color(pal.text_muted),
+                                RichText::new(lucide::X).size(10.5).color(pal.text_muted),
                             )
                             .fill(Color32::TRANSPARENT)
                             .frame(false),
@@ -10015,7 +10015,9 @@ impl ZaloGuiApp {
                 && ui
                     .add(
                         egui::Button::new(
-                            RichText::new("✕ Xóa").size(11.0).color(pal.text_muted),
+                            RichText::new(format!("{} Xóa", lucide::X))
+                                .size(11.0)
+                                .color(pal.text_muted),
                         )
                         .fill(Color32::TRANSPARENT)
                         .frame(false),

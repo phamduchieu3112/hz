@@ -4518,6 +4518,7 @@ pub(super) fn render_chat_bubble(
         && !has_photo_caption
         && !is_anti_recalled_msg
         && msg.reply_to_text.is_none()
+        && msg.reply_to_id.is_none()
         && (msg.is_outgoing || !is_group);
 
     let sender_is_name = !msg.sender.is_empty()
@@ -4930,13 +4931,7 @@ pub(super) fn render_chat_bubble(
                     && !modal_open
                     && !has_interactive_card
                     && !vanished
-                    && ui.input(|i| {
-                        i.pointer.button_double_clicked(egui::PointerButton::Primary)
-                            && i.pointer.interact_pos().is_some_and(|p| {
-                                fr.response.rect.contains(p)
-                                    && ui.ctx().layer_id_at(p).is_none_or(|l| l == ui.layer_id())
-                            })
-                    })
+                    && bubble_double_clicked_for_reply(ui, fr.response.rect)
                 {
                     return Some(BubbleAction::Reply);
                 }
@@ -5126,13 +5121,7 @@ pub(super) fn render_chat_bubble(
                     && !modal_open
                     && !has_interactive_card
                     && !vanished
-                    && ui.input(|i| {
-                        i.pointer.button_double_clicked(egui::PointerButton::Primary)
-                            && i.pointer.interact_pos().is_some_and(|p| {
-                                fr.response.rect.contains(p)
-                                    && ui.ctx().layer_id_at(p).is_none_or(|l| l == ui.layer_id())
-                            })
-                    })
+                    && bubble_double_clicked_for_reply(ui, fr.response.rect)
                 {
                     return Some(BubbleAction::Reply);
                 }
@@ -5352,16 +5341,13 @@ pub(super) fn bubble_context_menu(
     let mut close_menu = false;
 
     let has_reactions = !msg.reaction_summaries.is_empty() || !msg.reactions.is_empty();
-    let sub_open: bool = ui
-        .ctx()
-        .data(|d| d.get_temp(translate_sub_key).unwrap_or(false));
     let screen = ui.ctx().screen_rect();
-    let menu_w = if has_reactions || sub_open {
+    let menu_w = if has_reactions {
         220.0_f32
     } else {
         196.0_f32
     };
-    let menu_h = if sub_open { 430.0_f32 } else { 300.0_f32 };
+    let menu_h = 300.0_f32;
     let pos = Pos2::new(
         menu_pos.x.clamp(
             screen.left() + 8.0,
@@ -5435,7 +5421,7 @@ pub(super) fn bubble_context_menu(
                         if has_reactions {
                             let clear_resp = ui.add(
                                 egui::Button::new(
-                                    RichText::new("✕").size(13.0).color(pal.text_muted),
+                                    RichText::new(lucide::X).size(13.0).color(pal.text_muted),
                                 )
                                 .fill(Color32::TRANSPARENT)
                                 .min_size(Vec2::splat(20.0))
@@ -5454,7 +5440,7 @@ pub(super) fn bubble_context_menu(
                     ui.separator();
                     if has_reactions
                         && !vanished
-                        && menu_item(ui, "✕", "Bỏ thả cảm xúc", pal.danger_text).clicked()
+                        && menu_item(ui, lucide::X, "Bỏ thả cảm xúc", pal.danger_text).clicked()
                     {
                         action = Some(BubbleAction::React(crate::chat::CLEAR_REACTION_CODE));
                         close_menu = true;
@@ -5525,9 +5511,9 @@ pub(super) fn bubble_context_menu(
                                 close_menu = true;
                             }
                             // Hover opens the source-language flyout beside the menu.
-                            if resp.hovered() {
+                            if resp.hovered() && !sub_open {
                                 ui.ctx().data_mut(|d| {
-                                    d.insert_temp(translate_sub_key, !sub_open);
+                                    d.insert_temp(translate_sub_key, true);
                                 });
                             }
                             translate_row = Some(resp.rect);
@@ -5779,7 +5765,7 @@ pub(super) fn bubble_context_menu(
             let fly_h = 9.0 * 31.0 + 12.0;
             let y = (row.top() - 6.0).min(screen.bottom() - fly_h - 8.0).max(screen.top() + 8.0);
             let shown = egui::Area::new(Id::new(("bubble_translate_flyout", idx, msg.ts, &msg.id)))
-                .order(egui::Order::Foreground)
+                .order(egui::Order::Tooltip)
                 .fixed_pos(Pos2::new(x, y))
                 .show(ui.ctx(), |ui| {
                     egui::Frame::none()
@@ -5843,6 +5829,24 @@ pub(super) fn bubble_context_menu(
     action
 }
 
+/// Checks whether the user primary-double-clicked inside `rect` on this UI layer.
+///
+/// Must extract pointer state from `ui.input(...)` *before* calling `ui.ctx().layer_id_at(p)`,
+/// because `Context::input` holds a write lock on `ContextImpl` while `layer_id_at` acquires
+/// a read lock on the same `RwLock` (calling one inside the other deadlocks the GUI thread).
+pub(super) fn bubble_double_clicked_for_reply(ui: &egui::Ui, rect: Rect) -> bool {
+    let dbl_pos = ui.input(|i| {
+        if i.pointer.button_double_clicked(egui::PointerButton::Primary) {
+            i.pointer.interact_pos()
+        } else {
+            None
+        }
+    });
+    dbl_pos.is_some_and(|p| {
+        rect.contains(p) && ui.ctx().layer_id_at(p).is_none_or(|l| l == ui.layer_id())
+    })
+}
+
 /// Quoted-message block shown at the top of a reply bubble.
 pub(super) fn render_quote_block(
     ui: &mut egui::Ui,
@@ -5851,7 +5855,18 @@ pub(super) fn render_quote_block(
     outgoing: bool,
     max_w: f32,
 ) -> Option<BubbleAction> {
-    let qt = msg.reply_to_text.as_ref()?;
+    let has_quote = msg.reply_to_text.is_some()
+        || msg.reply_to_id.is_some()
+        || msg.reply_to_sender.is_some();
+    if !has_quote {
+        return None;
+    }
+    let qt = msg
+        .reply_to_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("[Hình ảnh]");
     let (_text_col, meta_col) = if outgoing {
         (pal.bubble_out_text, pal.bubble_out_meta)
     } else {
@@ -6130,7 +6145,7 @@ pub(super) fn render_hover_reaction_bar(
                             .clicked()
                         {
                             let ctx_menu_key = Id::new("active_bubble_context_menu");
-                            let open_time_key = Id::new("active_bubble_context_menu_time");
+                            let open_time_key = Id::new("bubble_context_menu_open_time");
                             let current_time = ui.ctx().input(|i| i.time);
                             ui.ctx().data_mut(|d| {
                                 d.insert_temp(ctx_menu_key, (msg_key.clone(), menu_anchor, idx));
@@ -7462,6 +7477,95 @@ mod md_block_tests {
                 } else {
                     assert_eq!(active.as_deref(), Some("hover-test-1_1700000000"));
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn double_click_for_reply_does_not_deadlock_on_real_egui_context() {
+        let bubble_rect = Rect::from_min_size(Pos2::new(120.0, 100.0), Vec2::new(220.0, 48.0));
+        let click_pt = bubble_rect.center();
+
+        for occlude in [false, true] {
+            let ctx = egui::Context::default();
+            let mut matched = false;
+            // Two rapid primary clicks trigger egui's primary double-click state.
+            let frames = [
+                (
+                    0.10,
+                    vec![
+                        egui::Event::PointerMoved(click_pt),
+                        egui::Event::PointerButton {
+                            pos: click_pt,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                ),
+                (
+                    0.15,
+                    vec![egui::Event::PointerButton {
+                        pos: click_pt,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                ),
+                (
+                    0.20,
+                    vec![egui::Event::PointerButton {
+                        pos: click_pt,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                ),
+                (
+                    0.25,
+                    vec![egui::Event::PointerButton {
+                        pos: click_pt,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                ),
+            ];
+            for (time, events) in frames {
+                let _ = ctx.run(
+                    egui::RawInput {
+                        time: Some(time),
+                        screen_rect: Some(Rect::from_min_size(
+                            Pos2::ZERO,
+                            Vec2::new(600.0, 400.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            if bubble_double_clicked_for_reply(ui, bubble_rect) {
+                                matched = true;
+                            }
+                        });
+                        if occlude {
+                            egui::Area::new(Id::new("dbl_click_modal_cover"))
+                                .order(egui::Order::Foreground)
+                                .fixed_pos(Pos2::new(100.0, 80.0))
+                                .show(ctx, |ui| {
+                                    let _ = ui.allocate_exact_size(
+                                        Vec2::new(300.0, 200.0),
+                                        egui::Sense::click_and_drag(),
+                                    );
+                                });
+                        }
+                    },
+                );
+            }
+            if occlude {
+                assert!(!matched, "occluded double-click should not trigger reply");
+            } else {
+                assert!(matched, "unoccluded double-click should trigger reply without deadlocking");
             }
         }
     }

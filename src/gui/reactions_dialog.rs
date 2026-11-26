@@ -161,7 +161,7 @@ impl ZaloGuiApp {
                     if total > 0 {
                         let clear_btn = ui.add(
                             egui::Button::new(
-                                RichText::new("✕ Bỏ thả cảm xúc")
+                                RichText::new(format!("{} Bỏ thả cảm xúc", lucide::X))
                                     .size(12.0)
                                     .color(pal.danger_text),
                             ),

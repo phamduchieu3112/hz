@@ -5052,6 +5052,11 @@ pub(crate) async fn send_quote_message_with_client_id(
                 .trim_start_matches("group_")
                 .trim_start_matches('g')
                 .trim_start_matches('G');
+            let qmsg_text = if quoted.text.trim().is_empty() {
+                format_message_quote_preview(quoted)
+            } else {
+                quoted.text.clone()
+            };
             let (clean_text, text_props_opt) = extract_zalo_rtf_text_properties(text);
             let mut body = obj(&[
                 ("grid", json!(clean_grid)),
@@ -5062,7 +5067,7 @@ pub(crate) async fn send_quote_message_with_client_id(
                 ("qmsgId", json!(qmsg_id_num)),
                 ("qmsgCliId", json!(qmsg_cli_id)),
                 ("qmsgType", json!(1)),
-                ("qmsg", json!(quoted.text)),
+                ("qmsg", json!(qmsg_text)),
                 ("qmsgTs", json!(qmsg_ts)),
                 ("visibility", json!(0)),
                 ("ttl", json!(0)),
@@ -5096,6 +5101,11 @@ pub(crate) async fn send_quote_message_with_client_id(
             } else {
                 &s.domains.chat
             };
+            let qmsg_text = if quoted.text.trim().is_empty() {
+                format_message_quote_preview(quoted)
+            } else {
+                quoted.text.clone()
+            };
             let (clean_text, text_props_opt) = extract_zalo_rtf_text_properties(text);
             let mut body = obj(&[
                 ("toid", json!(to_id)),
@@ -5106,7 +5116,7 @@ pub(crate) async fn send_quote_message_with_client_id(
                 ("qmsgCliId", json!(qmsg_cli_id)),
                 ("qmsgType", json!(1)),
                 ("qmsgTs", json!(qmsg_ts)),
-                ("qmsg", json!(quoted.text)),
+                ("qmsg", json!(qmsg_text)),
                 ("imei", json!(s.imei)),
                 ("ttl", json!(0)),
                 ("zsource", json!(101)),
@@ -5147,6 +5157,111 @@ pub(crate) async fn send_quote_message_with_client_id(
                 send_message_with_client_id(s, to_id, text, now).await
             }
         }
+    }
+}
+
+/// Format a quoted-message preview label across realtime JSON, Sync V2 protobuf, and UI.
+///
+/// Ensures captionless media quotes render consistent tags (`[Hình ảnh]`, `[Video]`,
+/// `[Nhãn dán]`, `[Tập tin]`, `[Ghi âm]`) instead of blank quote boxes, while preserving
+/// user captions when present.
+pub fn format_quote_preview(
+    msg_text: Option<&str>,
+    cli_msg_type: Option<i64>,
+    msg_type: Option<&str>,
+    attach: Option<&Value>,
+) -> Option<String> {
+    let trimmed_text = msg_text.map(str::trim).filter(|s| !s.is_empty());
+    let attach_title = attach
+        .and_then(|a| pick_str(a, &["title", "description"]))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let mt = msg_type.unwrap_or("").to_ascii_lowercase();
+    let media_tag = match cli_msg_type {
+        Some(32) => Some("[Hình ảnh]"),
+        Some(44) => Some("[Video]"),
+        Some(36) => Some("[Nhãn dán]"),
+        Some(46) => Some("[Tập tin]"),
+        Some(31) => Some("[Ghi âm]"),
+        _ if mt.contains("photo") || mt.contains("image") => Some("[Hình ảnh]"),
+        _ if mt.contains("video") => Some("[Video]"),
+        _ if mt.contains("sticker") => Some("[Nhãn dán]"),
+        _ if mt.contains("file") => Some("[Tập tin]"),
+        _ if mt.contains("voice") => Some("[Ghi âm]"),
+        _ => attach.and_then(|a| {
+            let action = a
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let href = a
+                .get("href")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let thumb = a
+                .get("thumb")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            if a.get("catId").is_some() || action.contains("sticker") {
+                Some("[Nhãn dán]")
+            } else if action.contains("video") || href.ends_with(".mp4") || href.ends_with(".mov") {
+                Some("[Video]")
+            } else if action.contains("voice") || href.ends_with(".aac") || href.ends_with(".m4a") {
+                Some("[Ghi âm]")
+            } else if a.get("fileName").is_some() || action.contains("file") {
+                Some("[Tập tin]")
+            } else if !thumb.is_empty()
+                || href.contains("photo")
+                || href.ends_with(".jpg")
+                || href.ends_with(".jpeg")
+                || href.ends_with(".png")
+                || href.ends_with(".webp")
+            {
+                Some("[Hình ảnh]")
+            } else {
+                None
+            }
+        }),
+    };
+
+    let caption = trimmed_text.or(attach_title.as_deref());
+    match (media_tag, caption) {
+        (Some(tag), Some(cap)) => {
+            if cap.starts_with(tag) {
+                Some(cap.to_string())
+            } else {
+                Some(format!("{tag} {cap}"))
+            }
+        }
+        (Some(tag), None) => Some(tag.to_string()),
+        (None, Some(cap)) => Some(cap.to_string()),
+        (None, None) => None,
+    }
+}
+
+/// Format a concise reply-preview label for an existing `ChatMessage` (composer banner & outgoing quote).
+pub fn format_message_quote_preview(msg: &ChatMessage) -> String {
+    let trimmed = msg.text.trim();
+    if msg.sticker_id.is_some() {
+        return "[Nhãn dán]".to_string();
+    }
+    let tag = match msg.kind {
+        crate::message_model::MessageKind::Photo => Some("[Hình ảnh]"),
+        crate::message_model::MessageKind::Video => Some("[Video]"),
+        crate::message_model::MessageKind::Sticker => Some("[Nhãn dán]"),
+        crate::message_model::MessageKind::File => Some("[Tập tin]"),
+        crate::message_model::MessageKind::Voice => Some("[Ghi âm]"),
+        _ if msg.media_group.is_some() => Some("[Hình ảnh]"),
+        _ => None,
+    };
+    match tag {
+        Some(t) if trimmed.is_empty() => t.to_string(),
+        Some(t) if trimmed.starts_with(t) => trimmed.to_string(),
+        Some(t) => format!("{t} {trimmed}"),
+        None => trimmed.to_string(),
     }
 }
 
@@ -8215,11 +8330,28 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
         if let Some(q) = it.get("quote").filter(|v| v.is_object()) {
             let q_id = pick_str(q, &["cliMsgId", "globalMsgId", "msgId"]);
             let q_sender = pick_str(q, &["fromD", "dName", "ownerId", "fromUid", "uidFrom"]);
-            let q_text = pick_str(q, &["msg", "message", "content"]).or_else(|| {
+            let raw_q_text = pick_str(q, &["msg", "message", "content"]).or_else(|| {
                 q.get("msg")
                     .or_else(|| q.get("content"))
                     .and_then(extract_content_text)
             });
+            let q_cli_type = q
+                .get("cliMsgType")
+                .or_else(|| q.get("qmsgType"))
+                .or_else(|| q.get("type"))
+                .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
+            let q_msg_type = pick_str(q, &["msgType"]);
+            let parsed_attach: Option<Value> = q.get("attach").and_then(|v| match v {
+                Value::Object(_) => Some(v.clone()),
+                Value::String(s) if !s.trim().is_empty() => serde_json::from_str(s).ok(),
+                _ => None,
+            });
+            let q_text = format_quote_preview(
+                raw_q_text.as_deref(),
+                q_cli_type,
+                q_msg_type.as_deref(),
+                parsed_attach.as_ref(),
+            );
             (q_id, q_sender, q_text)
         } else {
             (None, None, None)
@@ -13783,5 +13915,50 @@ mod send_identity_tests {
             ..Default::default()
         };
         assert!(legacy_call.effective_oa_card().is_none());
+    }
+
+    #[test]
+    fn quote_preview_labels_captionless_and_captioned_media() {
+        // Captionless image quote via cliMsgType=32
+        assert_eq!(
+            format_quote_preview(Some(""), Some(32), None, None).as_deref(),
+            Some("[Hình ảnh]")
+        );
+        // Captioned image quote via cliMsgType=32
+        assert_eq!(
+            format_quote_preview(Some("Báo cáo hôm nay"), Some(32), None, None).as_deref(),
+            Some("[Hình ảnh] Báo cáo hôm nay")
+        );
+        // Video quote via cliMsgType=44
+        assert_eq!(
+            format_quote_preview(None, Some(44), None, None).as_deref(),
+            Some("[Video]")
+        );
+        // Captionless image quote via attach JSON thumb
+        let attach = json!({"thumb": "https://f16-zpcloud.zdn.vn/thumb.jpg", "href": "https://f16-zpcloud.zdn.vn/photo.jpg"});
+        assert_eq!(
+            format_quote_preview(None, None, None, Some(&attach)).as_deref(),
+            Some("[Hình ảnh]")
+        );
+        // Realtime JSON parse_chat_message with captionless quoted photo
+        let wire = json!({
+            "msgId": "9001",
+            "cliMsgId": "1700000001",
+            "uidFrom": "1001",
+            "dName": "Anh Khoa",
+            "msgType": "webchat",
+            "ts": "1700000001000",
+            "content": "@All mọi người hoàn thành trong hnay nha",
+            "quote": {
+                "cliMsgId": "1700000000",
+                "fromD": "Anh Khoa",
+                "cliMsgType": 32,
+                "msg": "",
+                "attach": "{\"thumb\":\"https://cdn.zalo.me/t.jpg\"}"
+            }
+        });
+        let parsed = parse_chat_message(&wire).expect("should parse quoted photo reply");
+        assert_eq!(parsed.reply_to_sender.as_deref(), Some("Anh Khoa"));
+        assert_eq!(parsed.reply_to_text.as_deref(), Some("[Hình ảnh]"));
     }
 }
