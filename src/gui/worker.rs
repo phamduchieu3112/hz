@@ -5290,7 +5290,10 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 };
 
                                 let mut roster = crate::chat::parse_group_roster_metadata(&info);
-                                if roster.has_more_member && !roster.members_restricted {
+                                let roster_incomplete = roster
+                                    .total_member
+                                    .is_some_and(|tot| (roster.member_uids.len() as u64) < tot);
+                                if !roster.members_restricted && (roster.has_more_member || roster_incomplete) {
                                     let extra = crate::chat::fetch_group_link_members_pages(&s, &group_id, 50).await;
                                     if !extra.is_empty() {
                                         let mut existing: std::collections::HashSet<String> =

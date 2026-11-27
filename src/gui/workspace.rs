@@ -7027,7 +7027,7 @@ impl ZaloGuiApp {
                     let composer_cursor_char =
                         egui::TextEdit::load_state(ui.ctx(), composer_id)
                             .and_then(|st| st.cursor.char_range())
-                            .map(|r| r.primary.index);
+                            .map(|r| r.primary.index.max(r.secondary.index));
                     let mention_head = match composer_cursor_char {
                         Some(ci) => {
                             let b = self
@@ -7049,7 +7049,7 @@ impl ZaloGuiApp {
                     let mut observed_group_members: Vec<crate::chat::SidebarMember> = Vec::new();
                     let mut mention_candidates: Vec<MentionCandidate> = Vec::new();
                     if let Some((_, ref query)) = active_mention_info {
-                        if &self.dismissed_mention_suggest_for != query {
+                        if self.dismissed_mention_suggest_for.as_deref() != Some(query.as_str()) {
                             if is_group {
                                 if self.should_fetch_group_members(&thread_id)
                                     && self.fetching_group_members.insert(thread_id.clone())
@@ -7152,6 +7152,8 @@ impl ZaloGuiApp {
                                 }
                             }
                         }
+                    } else {
+                        self.dismissed_mention_suggest_for = None;
                     }
 
                     let contextual_stickers = if posting_restricted { Vec::new() } else { self.resolve_contextual_sticker_suggestions(ctx) };
@@ -8759,7 +8761,23 @@ impl ZaloGuiApp {
                             let is_cmd_enter_mode = self.settings.send_message_key == "cmd_enter";
                             let composer_has_focus =
                                 ui.memory(|m| m.has_focus(composer_id));
-                            let (send_via_enter, insert_newline_via_enter) = ui.input(|i| {
+                            let mention_popup_active =
+                                !mention_candidates.is_empty() && composer_has_focus && !is_ime_busy;
+                            let (mention_key_up, mention_key_down, mention_key_esc, mention_key_accept) =
+                                if mention_popup_active {
+                                    ui.input(|i| {
+                                        (
+                                            i.key_pressed(Key::ArrowUp),
+                                            i.key_pressed(Key::ArrowDown),
+                                            i.key_pressed(Key::Escape),
+                                            i.key_pressed(Key::Tab)
+                                                || (i.key_pressed(Key::Enter) && !i.modifiers.shift),
+                                        )
+                                    })
+                                } else {
+                                    (false, false, false, false)
+                                };
+                            let (mut send_via_enter, mut insert_newline_via_enter) = ui.input(|i| {
                                 let ent = composer_has_focus
                                     && i.key_pressed(Key::Enter)
                                     && !is_ime_busy;
@@ -8770,7 +8788,39 @@ impl ZaloGuiApp {
                                     (ent && !i.modifiers.shift, ent && i.modifiers.shift)
                                 }
                             });
-                            if send_via_enter || insert_newline_via_enter {
+                            if mention_key_accept {
+                                send_via_enter = false;
+                                insert_newline_via_enter = false;
+                            }
+                            if mention_key_up
+                                || mention_key_down
+                                || mention_key_esc
+                                || mention_key_accept
+                            {
+                                ui.input_mut(|i| {
+                                    i.events.retain(|ev| {
+                                        !matches!(
+                                            ev,
+                                            egui::Event::Key {
+                                                key: Key::ArrowUp
+                                                    | Key::ArrowDown
+                                                    | Key::Tab
+                                                    | Key::Escape
+                                                    | Key::Enter,
+                                                pressed: true,
+                                                ..
+                                            }
+                                        ) && !matches!(
+                                            ev,
+                                            egui::Event::Text(t)
+                                                if t == "\t"
+                                                    || t == "\n"
+                                                    || t == "\r"
+                                                    || t == "\r\n"
+                                        )
+                                    });
+                                });
+                            } else if send_via_enter || insert_newline_via_enter {
                                 ui.input_mut(|i| {
                                     i.events.retain(|ev| {
                                         !matches!(
@@ -9327,6 +9377,12 @@ impl ZaloGuiApp {
                                             ui.ctx(),
                                             std::iter::once(self.input_message.as_str()),
                                         );
+                                        if self.settings.suggest_mentions
+                                            && extract_active_mention_query(&self.input_message)
+                                                .is_some()
+                                        {
+                                            ui.ctx().request_repaint();
+                                        }
                                     }
                                     if self.composer_focus_pending {
                                         response.request_focus();
@@ -9350,28 +9406,25 @@ impl ZaloGuiApp {
                                     });
 
                                     let mut chosen_mention: Option<MentionCandidate> = None;
-                                    if !mention_candidates.is_empty() && response.has_focus() {
+                                    if !mention_candidates.is_empty() && (response.has_focus() || mention_popup_active) {
                                         let len = mention_candidates.len();
                                         if self.composer_mention_selected >= len {
                                             self.composer_mention_selected = 0;
                                         }
-                                        if ui.input(|i| i.key_pressed(Key::ArrowUp)) {
+                                        if mention_key_up {
                                             self.composer_mention_selected =
                                                 (self.composer_mention_selected + len - 1) % len;
                                             mention_sel_changed_by_key = true;
-                                        } else if ui.input(|i| i.key_pressed(Key::ArrowDown)) {
+                                        } else if mention_key_down {
                                             self.composer_mention_selected =
                                                 (self.composer_mention_selected + 1) % len;
                                             mention_sel_changed_by_key = true;
-                                        } else if ui.input(|i| i.key_pressed(Key::Escape)) {
+                                        } else if mention_key_esc {
                                             if let Some((_, ref q)) = active_mention_info {
-                                                self.dismissed_mention_suggest_for = q.clone();
+                                                self.dismissed_mention_suggest_for = Some(q.clone());
                                             }
-                                        } else if ui.input(|i| i.key_pressed(Key::Tab))
-                                            || (send_via_enter
-                                                && !is_ime_busy
-                                                && (response.has_focus() || response.lost_focus()))
-                                        {
+                                            response.request_focus();
+                                        } else if mention_key_accept {
                                             if let Some(cand) =
                                                 mention_candidates.get(self.composer_mention_selected)
                                             {
@@ -9425,7 +9478,7 @@ impl ZaloGuiApp {
                                                 st.store(ui.ctx(), composer_id);
                                             }
                                             self.composer_mention_selected = 0;
-                                            self.dismissed_mention_suggest_for.clear();
+                                            self.dismissed_mention_suggest_for = None;
                                             response.request_focus();
                                         }
                                     }
@@ -9491,6 +9544,8 @@ impl ZaloGuiApp {
                                         self.input_message.clear();
                                         self.dismissed_sticker_suggest_for.clear();
                                         self.composer_sticker_selected = None;
+                                        self.dismissed_mention_suggest_for = None;
+                                        self.composer_mention_selected = 0;
                                         let pending_mentions =
                                             std::mem::take(&mut self.composer_pending_mentions);
                                         let mentions = if is_group {
@@ -9673,7 +9728,7 @@ impl ZaloGuiApp {
                                 st.store(ui.ctx(), composer_id);
                             }
                             self.composer_mention_selected = 0;
-                            self.dismissed_mention_suggest_for.clear();
+                            self.dismissed_mention_suggest_for = None;
                             self.composer_focus_pending = true;
                         }
                     }
@@ -11746,6 +11801,32 @@ mod quote_navigation_tests {
                 .expect("should replace active mention");
         assert_eq!(new_draft, "Nhắc @Anh Tuấn về báo cáo");
         assert_eq!(next_cursor, "Nhắc @Anh Tuấn".chars().count());
+
+        // Bare '@' and large 350-member community rosters trigger autocomplete immediately
+        assert_eq!(extract_active_mention_query("@"), Some((0, "")));
+        assert_eq!(extract_active_mention_query("Chào @"), Some((6, "")));
+
+        let large_roster: Vec<crate::chat::SidebarMember> = (1..=350)
+            .map(|i| crate::chat::SidebarMember {
+                id: format!("uid_{i}"),
+                name: format!("Thành viên {i}"),
+                avatar: None,
+                role: if i == 1 {
+                    "creator".to_string()
+                } else {
+                    "member".to_string()
+                },
+            })
+            .collect();
+        let candidates = build_group_mention_candidates(&large_roster, &[], "");
+        assert_eq!(candidates.len(), 351);
+        assert!(candidates[0].is_all);
+
+        let (replaced_bare, bare_cursor) =
+            replace_active_mention_in_text("@", Some(1), "Nguyễn Văn A")
+                .expect("should replace bare @");
+        assert_eq!(replaced_bare, "@Nguyễn Văn A ");
+        assert_eq!(bare_cursor, "@Nguyễn Văn A ".chars().count());
     }
 
     #[test]

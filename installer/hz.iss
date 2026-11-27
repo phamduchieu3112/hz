@@ -1,10 +1,10 @@
 ; Inno Setup 6 script for Hz (Hiếu's Zalo)
 ; Compiles to: dist\Hz-Setup-v<MyAppVersion>.exe
 ; Optional preprocessor overrides:
-;   ISCC /DMyAppVersion=0.1.4 /DFfmpegPath="C:\path\to\ffmpeg.exe" installer\hz.iss
+;   ISCC /DMyAppVersion=0.1.5 /DFfmpegPath="C:\path\to\ffmpeg.exe" installer\hz.iss
 
 #ifndef MyAppVersion
-  #define MyAppVersion "0.1.4"
+  #define MyAppVersion "0.1.5"
 #endif
 
 #define MyAppName "Hz"

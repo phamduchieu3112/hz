@@ -1693,7 +1693,7 @@ pub struct ZaloGuiApp {
     last_composer_edit_at: std::time::Instant,
     composer_sticker_selected: Option<usize>,
     composer_mention_selected: usize,
-    dismissed_mention_suggest_for: String,
+    dismissed_mention_suggest_for: Option<String>,
     composer_pending_mentions: Vec<crate::chat::OutgoingMention>,
     composer_focus_pending: bool,
     /// Composer attachment queue (paste, drop, pickers, screenshots), capped at
@@ -2111,7 +2111,7 @@ impl ZaloGuiApp {
             last_composer_edit_at: std::time::Instant::now(),
             composer_sticker_selected: None,
             composer_mention_selected: 0,
-            dismissed_mention_suggest_for: String::new(),
+            dismissed_mention_suggest_for: None,
             composer_pending_mentions: Vec::new(),
             composer_focus_pending: false,
             pending_attachments: Vec::new(),
@@ -2579,6 +2579,8 @@ impl ZaloGuiApp {
         }
         self.save_current_draft();
         self.composer_pending_mentions.clear();
+        self.dismissed_mention_suggest_for = None;
+        self.composer_mention_selected = 0;
         self.pinned_banner_index = 0;
         self.selected_thread_index = new_index;
         self.load_draft_for(&new_tid);
